@@ -1,6 +1,8 @@
 import asyncio
 import psutil
 import iroh
+import torch
+import json
 from fastapi import FastAPI
 from iroh.iroh_ffi import uniffi_set_event_loop
 from pathlib import Path
@@ -14,6 +16,9 @@ ec2_peer_id = None
 seen_peers = []
 pipeline_file = Path("pipeline.txt")
 
+TRIGGER_KEY = "job_trigger"
+FINAL_RESULT_KEY = "final_result"
+
 @app.on_event("startup")
 async def startup():
     global node, doc, ticket, ec2_peer_id
@@ -25,12 +30,10 @@ async def startup():
     options.enable_docs = True
     node = await iroh.Iroh.memory_with_options(options)
 
-    # Create shared doc and get ticket
     doc = await node.docs().create()
     ticket = await doc.share(iroh.ShareMode.WRITE, iroh.AddrInfoOptions.RELAY_AND_ADDRESSES)
     ec2_peer_id = await node.net().node_id()
 
-    # Send EC2 metrics to doc (optional)
     author = await node.authors().create()
     key = ec2_peer_id.encode()
     cpu = psutil.cpu_percent(interval=1)
@@ -43,9 +46,7 @@ async def startup():
     except Exception as e:
         print(f"❌ Failed to send EC2 metrics: {e}")
 
-    # Join doc for read access
     doc = await node.docs().join(ticket)
-
     print("✅ EC2 Iroh node started")
     print("📎 SHARE THIS TICKET WITH ALL INTERNAL MACHINES:\n")
     print(str(ticket) + "\n")
@@ -64,7 +65,19 @@ async def health():
                 content = await node.blobs().read_to_bytes(entry.content_hash())
 
                 if key == ec2_peer_id:
-                    continue  # Skip EC2 itself
+                    continue
+                
+                RESERVED_KEYS = {"job_trigger", "final_result"}
+
+                if key in RESERVED_KEYS or key == ec2_peer_id:
+                    continue
+
+                if key not in seen_peers:
+                    seen_peers.append(key)
+                    print(f"🆕 New machine detected: {key}")
+                    with open(pipeline_file, "a") as f:
+                        f.write(key + "\n")
+
 
                 if key not in seen_peers:
                     seen_peers.append(key)
@@ -93,15 +106,24 @@ async def health():
 
 @app.get("/ticket")
 async def get_ticket():
-    return {"ticket": ticket}
+    return {"ticket": str(ticket)}
 
 @app.post("/start_job")
 async def start_job():
     global doc, node
     author = await node.authors().create()
-    content = b"Process this payload"
-    await doc.set_bytes(author, b"job_trigger", content)
-    return {"status": "triggered"}
+
+    # Define U matrix (the input)
+    U = torch.tensor([[1., 2.], [3., 4.]])
+
+    try:
+        payload = json.dumps(U.tolist()).encode()
+        await doc.set_bytes(author, TRIGGER_KEY.encode(), payload)
+        print("🚀 Sent job payload to first machine")
+        return {"status": "triggered"}
+    except Exception as e:
+        print(f"❌ Failed to send job trigger: {e}")
+        return {"status": "error", "detail": str(e)}
 
 @app.get("/result")
 async def get_final_result():
@@ -109,12 +131,15 @@ async def get_final_result():
         query = iroh.Query.all(None)
         entries = await doc.get_many(query)
 
-        for entry in reversed(entries):  # Look from latest to oldest
-            if entry.key().decode() == "final_result":
+        for entry in reversed(entries):
+            if entry.key().decode() == FINAL_RESULT_KEY:
                 content = await node.blobs().read_to_bytes(entry.content_hash())
-                return {"status": "success", "result": content.decode()}
+                tensor = torch.tensor(json.loads(content.decode()))
+                return {
+                    "status": "success",
+                    "result": tensor.tolist()
+                }
 
-        return {"status": "waiting", "detail": "No final result found yet."}
-
+        return {"status": "waiting", "detail": "No final result yet."}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
