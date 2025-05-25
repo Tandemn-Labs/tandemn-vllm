@@ -4,22 +4,40 @@ import iroh
 import tempfile
 import os
 import socket
+import torch
+import numpy as np
+import json
 from pathlib import Path
 from iroh.iroh_ffi import uniffi_set_event_loop
 
-SHARED_TICKET = "docaaacai6tzy2ictq7jsezznwysh62goidbnux47r2gjga7pfqh6q36g5bagffi6stycitrpx4t2zmyzo6rnfza7kgeinjbozy5uvni6xoholwoajdnb2hi4dthixs65ltmuys2mjoojswyylzfzuxe33ifzxgk5dxn5zgwlrpamaavqca7lf5sayaqj7p6sfs5mbabat675emxwid"
+SHARED_TICKET = "docaaacajuwrxbzowdxfy2l3gakhubkd37v7weccmhylr2jdgkabt4fkkq6aeeck4iy2gtqqthfto26v7rfvlm2iye7sxlvtg6gqv4mqc5vaodj2ajdnb2hi4dthixs65ltmuys2mjoojswyylzfzuxe33ifzxgk5dxn5zgwlrpamaavqca7kfncayaqj7p6sgmvqbabat675eivuid"
 PIPELINE_FILE = Path("pipeline.txt")
 TRIGGER_KEY = "job_trigger"
 FINAL_RESULT_KEY = "final_result"
 
-async def send_blob(doc, author, peer_id: str, data: bytes):
+MATRIX_MAP = {
+    0: torch.tensor([[2., 0.], [1., 2.]]),  # A
+    1: torch.tensor([[0., 1.], [1., 0.]]),  # B
+    2: torch.tensor([[1., 1.], [0., 1.]]),  # C
+}
+
+def load_pipeline():
+    if not PIPELINE_FILE.exists():
+        print(f"❌ pipeline.txt not found at {PIPELINE_FILE.resolve()}")
+        return []
+    with open(PIPELINE_FILE, "r") as f:
+        lines = [line.strip() for line in f if line.strip()]
+        return list(dict.fromkeys(lines))  # remove duplicates while preserving order
+
+async def send_blob(doc, author, peer_id: str, data: torch.Tensor):
     try:
-        await doc.set_bytes(author, peer_id.encode(), data)
-        print(f"\U0001f4e4 Sent to {peer_id}: {data.decode()}")
+        encoded = json.dumps(data.tolist()).encode()
+        await doc.set_bytes(author, peer_id.encode(), encoded)
+        print(f"📤 Sent to {peer_id}: {data}")
     except Exception as e:
         print(f"❌ Failed to send to {peer_id}: {e}")
 
-async def receive_blob(node, doc, peer_id: str):
+async def receive_blob(doc, peer_id: str, node):
     seen = set()
     while True:
         try:
@@ -33,13 +51,13 @@ async def receive_blob(node, doc, peer_id: str):
                     continue
                 seen.add(hash)
                 content = await node.blobs().read_to_bytes(hash)
-                print(f"\U0001f4e5 Received for {peer_id}: {content.decode()}")
-                return content
+                tensor = torch.tensor(json.loads(content.decode()))
+                return tensor
         except Exception as e:
             print(f"❌ Polling error for {peer_id}: {e}")
         await asyncio.sleep(2)
 
-async def wait_for_trigger(node, doc):
+async def wait_for_trigger(doc, node):
     seen = set()
     while True:
         try:
@@ -53,8 +71,8 @@ async def wait_for_trigger(node, doc):
                     continue
                 seen.add(hash)
                 content = await node.blobs().read_to_bytes(hash)
-                print(f"🆕 Trigger received: {content.decode()}")
-                return content
+                tensor = torch.tensor(json.loads(content.decode()))
+                return tensor
         except Exception as e:
             print(f"❌ Error while waiting for trigger: {e}")
         await asyncio.sleep(2)
@@ -70,24 +88,18 @@ async def upload_metrics(doc, author, peer_id):
     except Exception as e:
         print(f"❌ Failed to upload metrics: {e}")
 
-def load_pipeline():
-    if not PIPELINE_FILE.exists():
-        print(f"❌ pipeline.txt not found at {PIPELINE_FILE.resolve()}")
-        return []
-
-    with open(PIPELINE_FILE, "r") as f:
-        return [line.strip() for line in f.readlines() if line.strip()]
-
-async def handle_job(node, doc, author, peer_id, next_peer, is_last):
-    while True:
-        data = await receive_blob(node, doc, peer_id)
-        processed = f"{peer_id[:6]} processed → {data.decode()}".encode()
-        if is_last:
-            await doc.set_bytes(author, FINAL_RESULT_KEY.encode(), processed)
-            print(f"✅ {peer_id[:6]} pushed result to EC2")
-        else:
-            await send_blob(doc, author, next_peer, processed)
-            print(f"➡️ {peer_id[:6]} forwarded to {next_peer[:6]}")
+async def process_once(doc, author, peer_id, next_peer, is_first, is_last, local_matrix, node):
+    if is_first:
+        tensor = await wait_for_trigger(doc, node)
+    else:
+        tensor = await receive_blob(doc, peer_id, node)
+    result = local_matrix @ tensor
+    if is_last:
+        await doc.set_bytes(author, FINAL_RESULT_KEY.encode(), json.dumps(result.tolist()).encode())
+        print(f"✅ {peer_id[:6]} pushed result to EC2")
+    else:
+        await send_blob(doc, author, next_peer, result)
+        print(f"➡️ {peer_id[:6]} forwarded to {next_peer[:6]}")
 
 async def main():
     uniffi_set_event_loop(asyncio.get_running_loop())
@@ -101,9 +113,8 @@ async def main():
     peer_id = await node.net().node_id()
     print(f"🤖 Running as peer: {peer_id}")
 
-    doc = await node.docs().join(iroh.DocTicket(str(SHARED_TICKET).strip()))
+    doc = await node.docs().join(iroh.DocTicket(SHARED_TICKET.strip()))
     author = await node.authors().create()
-
     await upload_metrics(doc, author, peer_id)
 
     print("⏳ Waiting for pipeline.txt to include me...")
@@ -113,21 +124,21 @@ async def main():
             break
         await asyncio.sleep(2)
 
-    index = pipeline.index(peer_id)
+    unique_pipeline = list(dict.fromkeys(pipeline))
+    index = unique_pipeline.index(peer_id)
     is_first = index == 0
-    is_last = index == len(pipeline) - 1
-    next_peer = pipeline[index + 1] if not is_last else None
+    is_last = index == len(unique_pipeline) - 1
+    next_peer = unique_pipeline[index + 1] if not is_last else None
+    local_matrix = MATRIX_MAP.get(index)
+    if local_matrix is None:
+        print(f"❌ No matrix found for pipeline index {index}")
+        return
 
-    print(f"✅ Pipeline position: {index} | First: {is_first} | Last: {is_last}")
+    print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
 
-    if is_first:
-        while True:
-            job = await wait_for_trigger(node, doc)
-            result = f"{peer_id[:6]} started job: {job.decode()}".encode()
-            await send_blob(doc, author, next_peer, result)
-            print(f"🚀 Sent job to {next_peer[:6]}")
-    else:
-        await handle_job(node, doc, author, peer_id, next_peer, is_last)
+    while True:
+        await process_once(doc, author, peer_id, next_peer, is_first, is_last, local_matrix, node)
+        await asyncio.sleep(2)
 
 if __name__ == "__main__":
     asyncio.run(main())
