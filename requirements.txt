@@ -1,5 +1,10 @@
-fastapi==0.111.0
-uvicorn==0.29.0
-psutil==5.9.8
-iroh==0.31.0
-torch==2.0.1
+fastapi==0.104.1
+uvicorn==0.24.0
+motor==3.3.1
+pynvml==11.5.0
+psutil==5.9.6
+torch==2.1.1
+iroh==0.1.0
+aiohttp==3.9.1
+pydantic==2.5.2
+python-dotenv==1.0.0 
