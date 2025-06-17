@@ -1,7 +1,7 @@
 import json
 import aiohttp
 from typing import Dict, Any
-from config.settings import HUGGINGFACE_TOKEN, DEFAULT_CONFIG_FILENAME
+from src.config.settings import HUGGINGFACE_TOKEN, DEFAULT_CONFIG_FILENAME
 
 async def download_config(model_id: str, hf_token: str = None, filename: str = DEFAULT_CONFIG_FILENAME) -> Dict[str, Any]:
     """

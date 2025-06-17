@@ -6,21 +6,21 @@ from fastapi import FastAPI, HTTPException
 from iroh.iroh_ffi import uniffi_set_event_loop
 from pydantic import BaseModel
 
-from config.settings import (
+from src.config.settings import (
     SERVER_HOST,
     SERVER_PORT,
     DEFAULT_QBITS,
     DEFAULT_CONFIG_FILENAME
 )
-from utils.db_utils import (
+from src.utils.db_utils import (
     setup_collections,
     get_active_peers,
     update_peer_metrics,
     cleanup_inactive_peers,
     get_peer_metrics
 )
-from utils.gpu_utils import get_system_metrics, format_metrics_for_db
-from utils.model_utils import download_config, estimate_parameters, estimate_vram
+from src.utils.gpu_utils import get_system_metrics, format_metrics_for_db
+from src.utils.model_utils import download_config, estimate_parameters, estimate_vram
 
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandem Server")

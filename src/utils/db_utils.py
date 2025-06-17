@@ -2,7 +2,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import motor.motor_asyncio
 import os
-from config.settings import MONGODB_URI, MONGODB_DB_NAME, PEER_CLEANUP_THRESHOLD
+from src.config.settings import MONGODB_URI, MONGODB_DB_NAME, PEER_CLEANUP_THRESHOLD
 
 # MongoDB connection
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)

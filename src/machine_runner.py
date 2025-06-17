@@ -7,18 +7,18 @@ import torch
 import iroh
 from iroh.iroh_ffi import uniffi_set_event_loop
 
-from config.settings import (
+from src.config.settings import (
     SERVER_HOST,
     SERVER_PORT,
     GPU_METRICS_INTERVAL
 )
-from utils.db_utils import (
+from src.utils.db_utils import (
     register_peer,
     deregister_peer,
     get_active_peers,
     update_peer_metrics
 )
-from utils.gpu_utils import (
+from src.utils.gpu_utils import (
     get_system_metrics,
     format_metrics_for_db
 )
