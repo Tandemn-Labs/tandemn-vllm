@@ -5,6 +5,7 @@ import os
 import json
 import torch
 import iroh
+import httpx
 from iroh.iroh_ffi import uniffi_set_event_loop
 
 from src.config.settings import (
@@ -23,9 +24,6 @@ from src.utils.gpu_utils import (
     format_metrics_for_db
 )
 
-# Shared ticket for all machines to join the same Iroh document
-SHARED_TICKET = "docaaacb3jtxaxzwrmdb37cc3dvs2rcs3dipyixneft4kyug5vu4titkg7raf7vjk6n25wipwt4yyosiq3pkxwlgu5mjyzp54fibdsjz7vor6hrqajdnb2hi4dthixs65ltmuys2mjoojswyylzfzuxe33ifzxgk5dxn5zgwlrpamaaik3c5lnpcayavqiqaaoqwebabla7fgb5bmic"
-
 # Constants for document keys
 TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
 FINAL_RESULT_KEY = "final_result"  # Key used to store the final computation result
@@ -36,6 +34,30 @@ MATRIX_MAP = {
     1: torch.tensor([[0., 1.], [1., 0.]]),  # Matrix B (second machine)
     2: torch.tensor([[1., 1.], [0., 1.]]),  # Matrix C (third machine)
 }
+
+async def get_shared_ticket():
+    """
+    Fetch the shared ticket from the server.
+    
+    Returns:
+        str: The shared ticket for joining the Iroh document
+        
+    Raises:
+        Exception: If unable to fetch the ticket from the server
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get('http://localhost:8000/ticket')
+            response.raise_for_status()
+            ticket = response.text.strip()
+            print(f"✅ Fetched shared ticket from server")
+            return ticket
+    except httpx.RequestError as e:
+        raise Exception(f"Failed to connect to server: {e}")
+    except httpx.HTTPStatusError as e:
+        raise Exception(f"Server returned error {e.response.status_code}: {e.response.text}")
+    except Exception as e:
+        raise Exception(f"Unexpected error fetching ticket: {e}")
 
 async def send_blob(doc, author, peer_id: str, data: torch.Tensor):
     """
@@ -162,8 +184,15 @@ async def main():
     await register_peer(peer_id, hostname)
     print(f"✅ Registered in MongoDB as {peer_id}")
 
+    # Fetch the shared ticket from the server
+    try:
+        shared_ticket = await get_shared_ticket()
+    except Exception as e:
+        print(f"❌ Failed to get shared ticket: {e}")
+        return
+
     # Join the shared document and create an author for writing
-    doc = await node.docs().join(iroh.DocTicket(SHARED_TICKET.strip()))
+    doc = await node.docs().join(iroh.DocTicket(shared_ticket))
     author = await node.authors().create()
     
     # Upload initial system metrics
