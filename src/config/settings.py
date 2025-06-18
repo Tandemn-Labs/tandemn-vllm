@@ -20,7 +20,8 @@ DEFAULT_CONFIG_FILENAME = os.getenv("DEFAULT_CONFIG_FILENAME", "config.json")
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
 
 # Peer cleanup settings
-PEER_CLEANUP_THRESHOLD = int(os.getenv("PEER_CLEANUP_THRESHOLD", "24"))  # hours
+PEER_CLEANUP_THRESHOLD = int(os.getenv("PEER_CLEANUP_THRESHOLD", "1"))  # hours -> 1 hour instead of 24
 
 # GPU metrics settings
 GPU_METRICS_INTERVAL = int(os.getenv("GPU_METRICS_INTERVAL", "60"))  # seconds 
+

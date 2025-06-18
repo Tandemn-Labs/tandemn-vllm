@@ -169,6 +169,62 @@ async def process_once(doc, author, peer_id: str, next_peer: str, is_first: bool
     except Exception as e:
         print(f"❌ Error in computation: {e}")
 
+async def upload_metrics(doc, author, peer_id: str):
+    """Upload system metrics to the document and database."""
+    try:
+        metrics = get_system_metrics()
+        formatted_metrics = format_metrics_for_db(metrics)
+        
+        # Create a heartbeat key with timestamp for freshness
+        heartbeat_key = f"heartbeat_{peer_id}_{int(asyncio.get_event_loop().time() * 1000)}"
+        gpu_info = formatted_metrics.get("gpu_info", [])
+        total_free_vram = formatted_metrics.get("total_free_vram_gb", 0.0)
+        
+        # Compact metrics for Iroh document
+        compact_metrics = {
+            "cpu": metrics.cpu_percent,
+            "ram": metrics.ram_percent,
+            "free_vram": total_free_vram,
+            "gpu_count": len(gpu_info),
+            "timestamp": formatted_metrics["timestamp"].isoformat() if hasattr(formatted_metrics["timestamp"], "isoformat") else str(formatted_metrics["timestamp"])
+        }
+        value = json.dumps(compact_metrics).encode()
+        
+        # Store in Iroh document with timestamped key
+        await doc.set_bytes(author, heartbeat_key.encode(), value)
+        
+        # Store full metrics in database
+        await update_peer_metrics(peer_id, formatted_metrics)
+        
+        # Brief status for every heartbeat  
+        print(f"💓 Heartbeat {peer_id}: CPU {metrics.cpu_percent:.1f}%, VRAM {total_free_vram:.1f}GB")
+    except Exception as e:
+        print(f"❌ Failed to upload metrics: {e}")
+
+async def continuous_heartbeat(doc, author, peer_id: str, interval_ms: int = 1000):
+    """
+    Continuously send heartbeat with metrics to the server.
+    
+    Args:
+        doc: Iroh document
+        author: Iroh author for writing  
+        peer_id: This peer's ID
+        interval_ms: Heartbeat interval in milliseconds (default: 1000ms = 1 second)
+    """
+    print(f"💓 Starting continuous heartbeat every {interval_ms}ms")
+    
+    while True:
+        try:
+            await upload_metrics(doc, author, peer_id)
+            await asyncio.sleep(interval_ms / 1000.0)  # Convert ms to seconds
+        except asyncio.CancelledError:
+            print(f"💓 Heartbeat cancelled for {peer_id}")
+            break
+        except Exception as e:
+            print(f"❌ Heartbeat error for {peer_id}: {e}")
+            # Continue heartbeat even if one upload fails
+            await asyncio.sleep(1)  # Wait 1 second before retry
+
 async def main():
     """Main function to run the distributed computation node"""
     # Set up the asyncio event loop for Iroh
@@ -203,6 +259,12 @@ async def main():
     # Upload initial system metrics
     await upload_metrics(doc, author, peer_id)
 
+    # Start continuous heartbeat as background task
+    heartbeat_interval_ms = int(os.getenv("HEARTBEAT_INTERVAL_MS", "1000"))  # Default 1 second
+    heartbeat_task = asyncio.create_task(
+        continuous_heartbeat(doc, author, peer_id, heartbeat_interval_ms)
+    )
+
     try:
         # Wait until this peer is included in the pipeline configuration
         print("⏳ Waiting to be included in the pipeline...")
@@ -232,6 +294,13 @@ async def main():
     except Exception as e:
         print(f"❌ Error in main loop: {e}")
     finally:
+        # Cancel heartbeat task
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        
         # Deregister peer when shutting down
         await deregister_peer(peer_id)
         print(f"👋 Deregistered {peer_id} from pipeline")
