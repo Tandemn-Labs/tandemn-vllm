@@ -20,7 +20,13 @@ from src.utils.db_utils import (
     get_peer_metrics
 )
 from src.utils.gpu_utils import get_system_metrics, format_metrics_for_db
-from src.utils.model_utils import download_config, estimate_parameters, estimate_vram
+from src.utils.model_utils import (
+    download_config,
+    estimate_parameters,
+    estimate_vram,
+    calculate_max_layers_for_peer,
+    distribute_layers_across_peers
+)
 
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandem Server")
@@ -46,7 +52,7 @@ async def startup():
     """Initialize the Iroh node and document on server startup"""
     global node, doc, ticket, server_peer_id
 
-    print("🚀 Starting Iroh Tandem server...")
+    print("🚀 Starting Iroh Tandemn server...")
     # Configure async event loop for Iroh
     uniffi_set_event_loop(asyncio.get_running_loop())
 
@@ -303,3 +309,169 @@ async def get_final_result():
         return {"status": "waiting", "detail": "No final result yet."}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+
+@app.post("/calculate_peer_layers")
+async def calculate_peer_layers(request: ModelEstimationRequest, peer_id: str, available_vram_gb: float):
+    """
+    Calculate how many layers can fit in a specific peer's available VRAM.
+    
+    Args:
+        request: ModelEstimationRequest containing model_id, hf_token, and qbits
+        peer_id: ID of the peer to calculate for
+        available_vram_gb: Available VRAM in GB for this peer
+        
+    Returns:
+        Detailed calculation of how many layers can fit in the peer
+    """
+    try:
+        # Download model configuration
+        config = await download_config(
+            request.model_id,
+            request.hf_token,
+            request.filename
+        )
+        
+        # Calculate layer capacity for this peer
+        layer_calculation = calculate_max_layers_for_peer(
+            config, 
+            available_vram_gb, 
+            request.qbits
+        )
+        
+        return {
+            "status": "success",
+            "peer_id": peer_id,
+            "model_id": request.model_id,
+            "quantization": f"{request.qbits}-bit",
+            "calculation": layer_calculation
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to calculate layers for peer {peer_id}: {str(e)}"
+        )
+
+@app.post("/distribute_model_layers")
+async def distribute_model_layers(request: ModelEstimationRequest):
+    """
+    Create an optimal distribution plan for model layers across all available GPU peers.
+    
+    Args:
+        request: ModelEstimationRequest containing model_id, hf_token, and qbits
+        
+    Returns:
+        Optimal distribution plan showing how to split the model across peers
+    """
+    try:
+        # Download model configuration
+        config = await download_config(
+            request.model_id,
+            request.hf_token,
+            request.filename
+        )
+        
+        # Get active peers and their VRAM availability
+        active_peers = await get_active_peers()
+        peers_vram = {}
+        
+        for peer_id in active_peers:
+            try:
+                # Get latest metrics for this peer
+                metrics_history = await get_peer_metrics(peer_id, time_window=60)
+                if not metrics_history:
+                    continue
+                    
+                latest_metrics = metrics_history[0]["metrics"]
+                
+                # Check if GPU metrics are available
+                if "total_free_vram_gb" in latest_metrics:
+                    peers_vram[peer_id] = latest_metrics["total_free_vram_gb"]
+                    
+            except Exception as e:
+                print(f"❌ Error processing peer {peer_id}: {e}")
+        
+        if not peers_vram:
+            raise HTTPException(
+                status_code=400,
+                detail="No peers with available VRAM found"
+            )
+        
+        # Create distribution plan
+        distribution_plan = distribute_layers_across_peers(
+            config,
+            peers_vram,
+            request.qbits
+        )
+        
+        return {
+            "status": "success",
+            "model_id": request.model_id,
+            "quantization": f"{request.qbits}-bit",
+            "distribution_plan": distribution_plan
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create distribution plan: {str(e)}"
+        )
+
+@app.get("/peer_layer_capacity/{peer_id}")
+async def get_peer_layer_capacity(peer_id: str, model_id: str, qbits: int = DEFAULT_QBITS):
+    """
+    Get the current layer capacity for a specific peer based on its latest metrics.
+    
+    Args:
+        peer_id: ID of the peer to check
+        model_id: Model to calculate capacity for
+        qbits: Quantization bits (default from settings)
+        
+    Returns:
+        Layer capacity information for the peer
+    """
+    try:
+        # Get peer's latest metrics
+        metrics_history = await get_peer_metrics(peer_id, time_window=60)
+        if not metrics_history:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No recent metrics found for peer {peer_id}"
+            )
+        
+        latest_metrics = metrics_history[0]["metrics"]
+        
+        if "total_free_vram_gb" not in latest_metrics:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No VRAM information available for peer {peer_id}"
+            )
+        
+        available_vram = latest_metrics["total_free_vram_gb"]
+        
+        # Download model configuration (using default HF token)
+        config = await download_config(model_id)
+        
+        # Calculate layer capacity
+        layer_calculation = calculate_max_layers_for_peer(
+            config, 
+            available_vram, 
+            qbits
+        )
+        
+        return {
+            "status": "success",
+            "peer_id": peer_id,
+            "model_id": model_id,
+            "quantization": f"{qbits}-bit",
+            "current_metrics": latest_metrics,
+            "layer_capacity": layer_calculation
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get layer capacity for peer {peer_id}: {str(e)}"
+        )

@@ -11,7 +11,7 @@ SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 
 # MongoDB settings
-MONGODB_URI = os.getenv("MONGODB_URI",  "mongodb+srv://choprahetarth:45AJpXuKlK90Xc5s@cluster0.jcnnsrz.mongodb.net/hirebot.hirebot_user?retryWrites=true&w=majority")
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://choprahetarth:helloworld@demo-day.tjaxr2t.mongodb.net/?retryWrites=true&w=majority&appName=demo-day")
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "iroh_tandemn")
 
 # Model settings

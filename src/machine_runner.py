@@ -49,13 +49,18 @@ async def get_shared_ticket():
         async with httpx.AsyncClient() as client:
             response = await client.get('http://localhost:8000/ticket')
             response.raise_for_status()
-            ticket = response.text.strip()
+            ticket_data = response.json()
+            ticket = ticket_data["ticket"]
             print(f"✅ Fetched shared ticket from server")
             return ticket
     except httpx.RequestError as e:
         raise Exception(f"Failed to connect to server: {e}")
     except httpx.HTTPStatusError as e:
         raise Exception(f"Server returned error {e.response.status_code}: {e.response.text}")
+    except json.JSONDecodeError as e:
+        raise Exception(f"Invalid ticket format received: {e}")
+    except KeyError as e:
+        raise Exception(f"Missing 'ticket' field in server response")
     except Exception as e:
         raise Exception(f"Unexpected error fetching ticket: {e}")
 
@@ -203,7 +208,6 @@ async def main():
         print("⏳ Waiting to be included in the pipeline...")
         while True:
             pipeline = await get_active_peers()
-            print(pipeline)
             if peer_id in pipeline:
                 break
             await asyncio.sleep(2)
