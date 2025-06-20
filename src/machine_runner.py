@@ -270,6 +270,7 @@ async def main():
         print("⏳ Waiting to be included in the pipeline...")
         while True:
             pipeline = await get_active_peers()
+            print(pipeline)
             if peer_id in pipeline:
                 break
             await asyncio.sleep(2)

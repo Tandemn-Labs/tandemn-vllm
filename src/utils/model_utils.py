@@ -1,5 +1,8 @@
 import json
 import aiohttp
+import os
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Dict, Any, Tuple
 from src.config.settings import HUGGINGFACE_TOKEN, DEFAULT_CONFIG_FILENAME
 
@@ -273,3 +276,98 @@ def distribute_layers_across_peers(
         "utilized_peers": len(distribution),
         "total_available_vram_gb": round(total_available_vram, 3)
     }
+
+def shard_model_for_peers(
+    model_id: str,
+    distribution_plan: dict,
+    output_dir: str,
+    model_layers_key: str = "model.layers",
+    config_layers_key: str = "num_hidden_layers",
+    hf_token: str = None
+) -> dict:
+    """
+    Shard a model based on the peer distribution plan and save locally.
+    
+    Args:
+        model_id: HuggingFace model ID
+        distribution_plan: Output from distribute_model_layers() containing peer assignments
+        output_dir: Local directory to save shards
+        model_layers_key: Key path to model layers (default: "model.layers") 
+        config_layers_key: Key for number of layers in config (default: "num_hidden_layers")
+        
+    Returns:
+        Dict mapping peer IDs to their shard paths
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load the full model and tokenizer
+    # Use token if provided, otherwise falls back to environment variable
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, 
+        torch_dtype="auto",
+        token=hf_token or HUGGINGFACE_TOKEN
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        token=hf_token or HUGGINGFACE_TOKEN
+    )
+    
+    # Get transformer blocks
+    transformer_blocks = rgetattr(model, model_layers_key)
+    
+    # Track layer assignments
+    current_layer = 0
+    shard_paths = {}
+    
+    # Create shard for each peer
+    for peer_id, peer_info in distribution_plan["distribution"].items():
+        num_layers = peer_info["assigned_layers"]
+        handles_embeddings = peer_info["handles_embeddings"]
+        
+        # Create new model instance for this shard
+        shard = AutoModelForCausalLM.from_pretrained(
+            model_id, 
+            torch_dtype="auto",
+            token=hf_token or HUGGINGFACE_TOKEN
+        )
+        
+        # Assign layers for this shard
+        end_layer = current_layer + num_layers
+        rsetattr(shard, model_layers_key, 
+                nn.ModuleList(transformer_blocks[current_layer:end_layer]))
+        
+        # Update config
+        shard.config.num_hidden_layers = num_layers
+        shard.config.shard_info = {
+            "peer_id": peer_id,
+            "start_layer": current_layer,
+            "end_layer": end_layer,
+            "handles_embeddings": handles_embeddings
+        }
+        
+        # Save shard
+        shard_dir = os.path.join(output_dir, f"shard_{peer_id}")
+        shard.save_pretrained(shard_dir)
+        tokenizer.save_pretrained(shard_dir)
+        
+        shard_paths[peer_id] = shard_dir
+        current_layer = end_layer
+        
+    return shard_paths
+
+def rgetattr(obj, attr_path):
+    """Recursively get nested attributes"""
+    attrs = attr_path.split('.')
+    current = obj
+    for attr in attrs:
+        current = getattr(current, attr)
+    return current
+
+def rsetattr(obj, attr_path, value):
+    """Recursively set nested attributes"""
+    attrs = attr_path.split('.')
+    current = obj
+    for attr in attrs[:-1]:
+        current = getattr(current, attr)
+    setattr(current, attrs[-1], value)
