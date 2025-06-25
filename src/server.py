@@ -2,9 +2,13 @@ import asyncio
 import iroh
 import torch
 import json
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from iroh.iroh_ffi import uniffi_set_event_loop
 from pydantic import BaseModel
+from typing import Optional
+import uuid
+import time
+from datetime import datetime
 
 from src.config.settings import (
     SERVER_HOST,
@@ -29,6 +33,7 @@ from src.utils.model_utils import (
     calculate_max_layers_for_peer,
     distribute_layers_across_peers
 )
+from src.utils.sharding_utils import shard_model_by_layers
 
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandemn Server")
@@ -39,6 +44,9 @@ doc = None   # Iroh document instance
 ticket = None  # Document sharing ticket
 server_peer_id = None  # Unique identifier for this server instance
 
+# Task tracking for background operations
+background_tasks = {}  # Dict to track running background tasks
+
 # Constants for document keys
 TRIGGER_KEY = "job_trigger"  # Key for job initiation
 FINAL_RESULT_KEY = "final_result"  # Key for final computation result
@@ -48,6 +56,12 @@ class ModelEstimationRequest(BaseModel):
     hf_token: str
     qbits: int = DEFAULT_QBITS
     filename: str = DEFAULT_CONFIG_FILENAME
+
+class ModelShardingRequest(BaseModel):
+    model_id: str
+    hf_token: str
+    model_layers_key: str = "model.layers"
+    cache_dir: Optional[str] = None
 
 
 
@@ -486,4 +500,156 @@ async def get_peer_layer_capacity(peer_id: str, model_id: str, qbits: int = DEFA
             status_code=500,
             detail=f"Failed to get layer capacity for peer {peer_id}: {str(e)}"
         )
+
+def run_sharding_task(task_id: str, request: ModelShardingRequest):
+    """Background task function to run model sharding."""
+    try:
+        # Update task status
+        background_tasks[task_id]["status"] = "running"
+        background_tasks[task_id]["started_at"] = datetime.now().isoformat()
+        
+        # Extract model name for directory naming
+        model_name_safe = request.model_id.replace("/", "_").replace("\\", "_")
+        output_dir = f"./shards/{model_name_safe}"
+        
+        print(f"🔪 Starting background layer sharding for {request.model_id}")
+        print(f"📁 Output directory: {output_dir}")
+        
+        # Call the sharding function
+        result = shard_model_by_layers(
+            model_name=request.model_id,
+            output_dir=output_dir,
+            hf_token=request.hf_token,
+            cache_dir=request.cache_dir,
+            model_layers_key=request.model_layers_key
+        )
+        
+        # Update task with successful result
+        background_tasks[task_id].update({
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+            "result": {
+                "model_id": request.model_id,
+                "output_directory": result["output_dir"],
+                "total_components": result["total_components"],
+                "metadata": result["metadata"],
+                "message": f"Successfully created {result['total_components']} layer components"
+            }
+        })
+        
+        print(f"✅ Background sharding completed for {request.model_id}")
+        
+    except Exception as e:
+        # Update task with error
+        background_tasks[task_id].update({
+            "status": "failed",
+            "completed_at": datetime.now().isoformat(),
+            "error": str(e)
+        })
+        print(f"❌ Background sharding failed for {request.model_id}: {e}")
+
+@app.post("/create_layer_shards")
+async def create_layer_shards(request: ModelShardingRequest, background_tasks_runner: BackgroundTasks):
+    """
+    Start layer sharding for a model in the background.
+    
+    Args:
+        request: ModelShardingRequest containing model_id, hf_token, and optional parameters
+        background_tasks_runner: FastAPI background tasks runner
+        
+    Returns:
+        Task ID for tracking the sharding progress
+    """
+    # Generate unique task ID
+    task_id = str(uuid.uuid4())
+    
+    # Initialize task tracking
+    background_tasks[task_id] = {
+        "task_id": task_id,
+        "model_id": request.model_id,
+        "status": "queued",
+        "created_at": datetime.now().isoformat(),
+        "started_at": None,
+        "completed_at": None,
+        "result": None,
+        "error": None
+    }
+    
+    # Start background task
+    background_tasks_runner.add_task(run_sharding_task, task_id, request)
+    
+    print(f"🚀 Queued layer sharding task {task_id} for {request.model_id}")
+    
+    return {
+        "status": "queued",
+        "task_id": task_id,
+        "model_id": request.model_id,
+        "message": "Layer sharding task started in background. Use /task_status/{task_id} to check progress."
+    }
+
+@app.get("/task_status/{task_id}")
+async def get_task_status(task_id: str):
+    """
+    Get the status of a background sharding task.
+    
+    Args:
+        task_id: The task ID returned from create_layer_shards
+        
+    Returns:
+        Current status and details of the task
+    """
+    if task_id not in background_tasks:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task {task_id} not found"
+        )
+    
+    task = background_tasks[task_id]
+    
+    # Calculate duration if task is running or completed
+    duration = None
+    if task["started_at"]:
+        start_time = datetime.fromisoformat(task["started_at"])
+        end_time = datetime.fromisoformat(task["completed_at"]) if task["completed_at"] else datetime.now()
+        duration = str(end_time - start_time)
+    
+    response = {
+        "task_id": task_id,
+        "model_id": task["model_id"],
+        "status": task["status"],
+        "created_at": task["created_at"],
+        "started_at": task["started_at"],
+        "completed_at": task["completed_at"],
+        "duration": duration
+    }
+    
+    if task["status"] == "completed" and task["result"]:
+        response["result"] = task["result"]
+    elif task["status"] == "failed" and task["error"]:
+        response["error"] = task["error"]
+    
+    return response
+
+@app.get("/tasks")
+async def list_all_tasks():
+    """
+    List all background tasks and their current status.
+    
+    Returns:
+        List of all tasks with their status
+    """
+    tasks_summary = []
+    for task_id, task in background_tasks.items():
+        tasks_summary.append({
+            "task_id": task_id,
+            "model_id": task["model_id"],
+            "status": task["status"],
+            "created_at": task["created_at"],
+            "completed_at": task["completed_at"]
+        })
+    
+    return {
+        "total_tasks": len(tasks_summary),
+        "tasks": sorted(tasks_summary, key=lambda x: x["created_at"], reverse=True)
+    }
 

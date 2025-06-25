@@ -11,6 +11,10 @@ pytest-asyncio==0.21.1
 httpx==0.25.1
 pytest-cov==4.1.0
 # torch==2.1.1
-iroh==0.1.0
+iroh==0.35.0
 aiohttp==3.9.1 
 pynvml==11.5.0
+safetensors==0.4.1
+transformers==4.36.2
+torch
+accelerate
