@@ -599,11 +599,11 @@ async def get_task_status(task_id: str):
         Current status and details of the task
     """
     if task_id not in background_tasks:
-        raise HTTPException(
+            raise HTTPException(
             status_code=404,
             detail=f"Task {task_id} not found"
-        )
-    
+            )
+
     task = background_tasks[task_id]
     
     # Calculate duration if task is running or completed
@@ -647,8 +647,8 @@ async def list_all_tasks():
             "created_at": task["created_at"],
             "completed_at": task["completed_at"]
         })
-    
-    return {
+
+        return {
         "total_tasks": len(tasks_summary),
         "tasks": sorted(tasks_summary, key=lambda x: x["created_at"], reverse=True)
     }
