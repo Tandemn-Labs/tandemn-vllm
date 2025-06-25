@@ -27,8 +27,7 @@ from src.utils.model_utils import (
     estimate_parameters,
     estimate_vram,
     calculate_max_layers_for_peer,
-    distribute_layers_across_peers,
-    shard_model_for_peers
+    distribute_layers_across_peers
 )
 
 # Initialize FastAPI application
@@ -50,13 +49,7 @@ class ModelEstimationRequest(BaseModel):
     qbits: int = DEFAULT_QBITS
     filename: str = DEFAULT_CONFIG_FILENAME
 
-class ModelShardingRequest(BaseModel):
-    model_id: str
-    output_dir: str
-    qbits: int = DEFAULT_QBITS
-    hf_token: str = None  # Will use environment variable if not provided
-    model_layers_key: str = "model.layers"
-    config_layers_key: str = "num_hidden_layers"
+
 
 @app.on_event("startup")
 async def startup():
@@ -494,126 +487,3 @@ async def get_peer_layer_capacity(peer_id: str, model_id: str, qbits: int = DEFA
             detail=f"Failed to get layer capacity for peer {peer_id}: {str(e)}"
         )
 
-@app.post("/shard_model")
-async def shard_model(request: ModelShardingRequest):
-    """
-    Create an optimal distribution plan and shard a model across available peers.
-    
-    Args:
-        request: ModelShardingRequest containing model_id, output_dir, and other parameters
-        
-    Returns:
-        Information about the created shards including their paths and distribution plan
-    """
-    try:
-        print(f"🔪 Starting model sharding for {request.model_id}")
-        print(f"📁 Output directory: {request.output_dir}")
-
-        # Get active peers and their metrics
-        active_peers = await get_active_peers()
-        if not active_peers:
-            raise HTTPException(
-                status_code=400,
-                detail="No active peers available for sharding"
-            )
-
-        # Get VRAM availability for all active peers
-        peers_vram = {}
-        for peer_id in active_peers:
-            try:
-                # Get latest metrics for this peer
-                metrics_history = await get_peer_metrics(peer_id, time_window=60)
-                if not metrics_history:
-                    continue
-                    
-                latest_metrics = metrics_history[0]["metrics"]
-                
-                # Check if GPU metrics are available
-                if "total_free_vram_gb" in latest_metrics:
-                    peers_vram[peer_id] = latest_metrics["total_free_vram_gb"]
-                    
-            except Exception as e:
-                print(f"❌ Error processing peer {peer_id}: {e}")
-
-        if not peers_vram:
-            raise HTTPException(
-                status_code=400,
-                detail="No peers with available VRAM found"
-            )
-
-        # Download model configuration
-        config = await download_config(request.model_id, request.hf_token)
-
-        # Create optimal distribution plan
-        distribution_plan = distribute_layers_across_peers(
-            config=config,
-            peers_vram=peers_vram,
-            q_bits=request.qbits
-        )
-
-        if not distribution_plan or "distribution" not in distribution_plan:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to create distribution plan"
-            )
-
-        distribution = distribution_plan["distribution"]
-        if not distribution:
-            raise HTTPException(
-                status_code=400,
-                detail="No peer assignments generated in distribution plan"
-            )
-
-        # Create shards using the utility function
-        shard_paths = shard_model_for_peers(
-            model_id=request.model_id,
-            distribution_plan=distribution_plan,
-            output_dir=request.output_dir,
-            model_layers_key=request.model_layers_key,
-            config_layers_key=request.config_layers_key,
-            hf_token=request.hf_token
-        )
-
-        # Prepare detailed response
-        shard_info = {}
-        total_shards = 0
-        total_layers_assigned = 0
-
-        for peer_id, shard_path in shard_paths.items():
-            peer_distribution = distribution[peer_id]
-            assigned_layers = peer_distribution["assigned_layers"]
-            handles_embeddings = peer_distribution["handles_embeddings"]
-
-            shard_info[peer_id] = {
-                "shard_path": shard_path,
-                "assigned_layers": assigned_layers,
-                "handles_embeddings": handles_embeddings,
-                "available_vram_gb": peer_distribution["available_vram_gb"],
-                "estimated_vram_usage": peer_distribution["estimated_vram_usage"],
-                "vram_utilization_percent": peer_distribution["vram_utilization_percent"]
-            }
-
-            total_shards += 1
-            total_layers_assigned += assigned_layers
-
-        print(f"✅ Successfully created {total_shards} shards with {total_layers_assigned} total layers")
-
-        return {
-            "status": "success",
-            "model_id": request.model_id,
-            "output_dir": request.output_dir,
-            "total_shards": total_shards,
-            "total_layers_assigned": total_layers_assigned,
-            "model_info": distribution_plan.get("model_info", {}),
-            "shard_details": shard_info,
-            "distribution_plan": distribution_plan
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Model sharding failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to shard model: {str(e)}"
-        )
