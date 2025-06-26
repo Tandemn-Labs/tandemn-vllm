@@ -847,8 +847,8 @@ async def deploy_model(request: ModelDeploymentRequest):
                 metrics_history = await get_peer_metrics(peer_id, time_window=60)
                 if metrics_history:
                     latest_metrics = metrics_history[0]["metrics"]
-                    if "total_free_vram_gb" in latest_metrics:
-                        peers_vram[peer_id] = latest_metrics["total_free_vram_gb"]
+                if "total_free_vram_gb" in latest_metrics:
+                    peers_vram[peer_id] = latest_metrics["total_free_vram_gb"]
             except Exception as e:
                 print(f"❌ Error getting metrics for peer {peer_id}: {e}")
 
