@@ -7,6 +7,14 @@ import torch
 import iroh
 import httpx
 from iroh.iroh_ffi import uniffi_set_event_loop
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+import time
+import aiofiles
+
+# FORCE vLLM v0 mode (required for selective layer loading)
+os.environ["VLLM_USE_V1"] = "0"
+print("🔧 FORCED vLLM v0 mode (VLLM_USE_V1=0) for selective layer loading compatibility")
 
 from src.config.settings import (
     SERVER_HOST,
@@ -24,6 +32,10 @@ from src.utils.gpu_utils import (
     format_metrics_for_db
 )
 
+# Global variables for deployed model
+deployed_model = None
+deployment_status = "idle"  # idle, downloading, loading, ready, failed
+
 # Constants for document keys
 TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
 FINAL_RESULT_KEY = "final_result"  # Key used to store the final computation result
@@ -34,6 +46,275 @@ MATRIX_MAP = {
     1: torch.tensor([[0., 1.], [1., 0.]]),  # Matrix B (second machine)
     2: torch.tensor([[1., 1.], [0., 1.]]),  # Matrix C (third machine)
 }
+
+# ============================================================================
+# SELECTIVE LAYER LOADING IMPLEMENTATION  
+# ============================================================================
+
+def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
+    """Create vLLM model with only assigned layers loaded by monkey-patching make_layers."""
+    
+    # STEP 1: Monkey-patch vLLM's make_layers function (Prime Intellect's key insight)
+    def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
+        """Custom make_layers that creates real layers only for assigned indices."""
+        from vllm.model_executor.models.utils import PPMissingLayer, maybe_offload_to_cpu
+        
+        start_layer = min(assigned_layers) if assigned_layers else 0
+        end_layer = max(assigned_layers) + 1 if assigned_layers else 0
+        
+        modules = []
+        for i in range(num_hidden_layers):
+            if i in assigned_layers:
+                # Create real layer
+                layer = layer_fn(prefix=f"{prefix}.{i}")
+                modules.append(maybe_offload_to_cpu(layer))
+                print(f"  Created REAL layer {i}")
+            else:
+                # Create passthrough layer (Prime Intellect's memory optimization)
+                modules.append(PPMissingLayer())
+                print(f"  Created PPMissingLayer for layer {i}")
+        
+        return start_layer, end_layer, torch.nn.ModuleList(modules)
+    
+    # Apply the monkey patch
+    import vllm.model_executor.models.utils as model_utils
+    original_make_layers = model_utils.make_layers
+    model_utils.make_layers = _selective_make_layers
+    
+    try:
+        # STEP 2: Create vLLM model (will use our patched make_layers)
+        from vllm import LLM, SamplingParams
+        
+        llm = LLM(
+            model=model_dir,
+            tensor_parallel_size=1,
+            enforce_eager=True,  # Required for custom layer loading
+            max_model_len=128,   # Small for demo
+            disable_log_stats=True,
+            skip_tokenizer_init=False,
+            gpu_memory_utilization=0.3,  # Use much less memory
+            use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
+        )
+        
+        print(f"✅ Successfully created vLLM model with selective layers!")
+        print(f"   Our monkey-patch created real layers for: {assigned_layers}")
+        print(f"   All other layers are PPMissingLayer (passthrough)")
+        
+        return llm
+        
+    finally:
+        # Restore original function
+        model_utils.make_layers = original_make_layers
+
+# ============================================================================
+# FILE DOWNLOAD AND DEPLOYMENT LOGIC
+# ============================================================================
+
+async def download_file(url: str, local_path: Path, chunk_size: int = 16*1024*1024) -> bool:  # 16MB chunks for maximum speed
+    """Download a file from server with progress tracking."""
+    try:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Skip download if file already exists and has content
+        if local_path.exists() and local_path.stat().st_size > 0:
+            # Optional: Verify file size matches server (HEAD request)
+            try:
+                async with httpx.AsyncClient() as client:
+                    head_response = await client.head(url)
+                    if head_response.status_code == 200:
+                        remote_size = int(head_response.headers.get("content-length", 0))
+                        local_size = local_path.stat().st_size
+                        
+                        if local_size == remote_size:
+                            print(f"✅ File already exists with correct size, skipping: {local_path.name} ({local_size:,} bytes)")
+                            return True
+                        else:
+                            print(f"⚠️ File exists but size mismatch - redownloading: local={local_size:,}, remote={remote_size:,}")
+                    else:
+                        print(f"⚠️ Could not verify remote file size (HEAD {head_response.status_code}), downloading anyway")
+            except Exception as e:
+                print(f"⚠️ HEAD request failed: {e}, proceeding with download")
+                # If HEAD fails, just check local file exists and has content
+                print(f"✅ File exists locally, assuming valid: {local_path.name} ({local_path.stat().st_size:,} bytes)")
+                return True
+        
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                
+                total_size = int(response.headers.get("content-length", 0))
+                downloaded = 0
+                
+                async with aiofiles.open(local_path, "wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size):
+                        await f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Progress logging (every 100MB or if total < 100MB for minimal I/O overhead)
+                        if total_size > 0 and (downloaded % (100 * 1024 * 1024) == 0 or downloaded == total_size):
+                            progress = (downloaded / total_size) * 100
+                            print(f"   📥 Downloading {local_path.name}: {progress:.1f}% ({downloaded:,}/{total_size:,} bytes)")
+        
+        print(f"✅ Downloaded {local_path.name} ({downloaded:,} bytes)")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to download {url}: {e}")
+        return False
+
+async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
+    """Deploy model based on deployment instructions received from server."""
+    global deployed_model, deployment_status
+    
+    # Check if model is already successfully deployed
+    if deployment_status == "ready" and deployed_model is not None:
+        print(f"✅ Model already successfully deployed, skipping new deployment")
+        return True
+    
+    # Prevent multiple concurrent deployments
+    if deployment_status in ["downloading", "loading"]:
+        print(f"⚠️ Deployment already in progress ({deployment_status}), skipping...")
+        return False
+    
+    try:
+        deployment_status = "downloading"
+        print(f"🚀 Starting model deployment...")
+        print(f"   Model: {instructions['model_name']}")
+        print(f"   Assigned layers: {instructions['assigned_layers']}")
+        print(f"   Is first peer: {instructions['is_first_peer']}")
+        print(f"   Is last peer: {instructions['is_last_peer']}")
+        print(f"   Required files: {len(instructions['required_files'])}")
+        
+        # Create local model directory
+        model_dir = Path(f"./deployed_models/{instructions['model_name']}")
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Download required files
+        base_url = instructions["server_download_url"]
+        successful_downloads = 0
+        total_files = len(instructions["required_files"])
+        
+        for file_path in instructions["required_files"]:
+            file_url = f"{base_url}/{file_path}"
+            local_file_path = model_dir / file_path
+            
+            print(f"📥 Downloading {file_path}...")
+            if await download_file(file_url, local_file_path):
+                successful_downloads += 1
+            else:
+                print(f"❌ Failed to download {file_path}")
+        
+        if successful_downloads != total_files:
+            print(f"❌ Only {successful_downloads}/{total_files} files downloaded successfully")
+            deployment_status = "failed"
+            return False
+        
+        print(f"✅ All {total_files} files downloaded successfully")
+        
+        # Load the model with selective layers
+        deployment_status = "loading"
+        print(f"🔧 Loading model with selective layers...")
+        
+        # Use config directory for vLLM initialization
+        config_dir = model_dir / "config"
+        if not config_dir.exists():
+            print(f"❌ Config directory not found: {config_dir}")
+            deployment_status = "failed"
+            return False
+        
+        deployed_model = create_dynamic_vllm_model(
+            model_dir=str(config_dir),
+            assigned_layers=instructions["assigned_layers"]
+        )
+        
+        deployment_status = "ready"
+        print(f"✅ Model deployment completed successfully!")
+        print(f"   Peer role: {'First' if instructions['is_first_peer'] else 'Last' if instructions['is_last_peer'] else 'Middle'}")
+        print(f"   Loaded layers: {instructions['assigned_layers']}")
+        print(f"   Memory optimization: ~{100 * (22 - len(instructions['assigned_layers'])) / 22:.1f}% VRAM savings")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Model deployment failed: {e}")
+        deployment_status = "failed"
+        return False
+
+async def handle_deployment_instruction(doc, node, instruction_data: bytes):
+    """Handle deployment instruction received via Iroh."""
+    try:
+        instruction = json.loads(instruction_data.decode())
+        
+        if instruction.get("action") == "deploy_model":
+            instructions = instruction.get("instructions", {})
+            print(f"📨 Received deployment instruction for {instructions.get('model_name', 'unknown')}")
+            
+            # Deploy model in background (non-blocking)
+            asyncio.create_task(deploy_model_from_instructions(instructions))
+            
+        else:
+            print(f"⚠️  Unknown instruction action: {instruction.get('action')}")
+            
+    except Exception as e:
+        print(f"❌ Error handling deployment instruction: {e}")
+
+async def monitor_deployment_instructions(doc, node, peer_id: str):
+    """Monitor for deployment instructions sent to this peer."""
+    seen_hashes = set()
+    
+    while True:
+        try:
+            # Look for deployment instructions addressed to this peer
+            entries = await doc.get_many(iroh.Query.all(None))
+            
+            for entry in entries:
+                key = entry.key().decode()
+                hash_value = entry.content_hash()
+                
+                # Skip if we've already processed this entry
+                if hash_value in seen_hashes:
+                    continue
+                
+                # Check if this is a deployment instruction for us
+                if key.startswith(f"deploy_instruction_{peer_id}_"):
+                    seen_hashes.add(hash_value)
+                    content = await node.blobs().read_to_bytes(hash_value)
+                    
+                    # Add timestamp check to ignore old instructions
+                    try:
+                        # Extract timestamp from key: deploy_instruction_{peer_id}_{timestamp}
+                        timestamp_str = key.split("_")[-1]
+                        instruction_time = int(timestamp_str)
+                        current_time = int(time.time())
+                        
+                        # Ignore instructions older than 30 seconds
+                        if current_time - instruction_time > 30:
+                            print(f"⏰ Ignoring old deployment instruction from {instruction_time}")
+                            continue
+                    except (ValueError, IndexError):
+                        # If timestamp parsing fails, process the instruction anyway
+                        pass
+                    
+                    await handle_deployment_instruction(doc, node, content)
+            
+        except Exception as e:
+            print(f"❌ Error monitoring deployment instructions: {e}")
+        
+        await asyncio.sleep(2)  # Check every 2 seconds
+
+def get_model_status() -> Dict[str, Any]:
+    """Get current model deployment status."""
+    global deployed_model, deployment_status
+    
+    return {
+        "status": deployment_status,
+        "model_loaded": deployed_model is not None,
+        "ready_for_inference": deployment_status == "ready" and deployed_model is not None
+    }
+
+# ============================================================================
+# EXISTING FUNCTIONALITY (Matrix computation, heartbeat, etc.)
+# ============================================================================
 
 async def get_shared_ticket():
     """
@@ -112,23 +393,7 @@ async def receive_blob(doc, peer_id: str, node):
             print(f"❌ Polling error for {peer_id}: {e}")
         await asyncio.sleep(2)  # Poll every 2 seconds
 
-async def upload_metrics(doc, author, peer_id: str):
-    """Upload system metrics to the document and database."""
-    try:
-        metrics = get_system_metrics()
-        formatted_metrics = format_metrics_for_db(metrics)
-        value = f"CPU: {metrics.cpu_percent}%\nRAM: {metrics.ram_percent}%".encode()
-        
-        # Store in document
-        await doc.set_bytes(author, peer_id.encode(), value)
-        
-        # Store in database
-        await update_peer_metrics(peer_id, formatted_metrics)
-        print(f"✅ Uploaded metrics for {peer_id}")
-    except Exception as e:
-        print(f"❌ Failed to upload metrics: {e}")
-
-async def process_once(doc, author, peer_id: str, next_peer: str, is_first: bool, is_last: bool, local_matrix: torch.Tensor, node):
+async def process_once(doc, author, peer_id: str, next_peer: Optional[str], is_first: bool, is_last: bool, local_matrix: torch.Tensor, node):
     """
     Process one computation job in the pipeline.
     
@@ -161,10 +426,12 @@ async def process_once(doc, author, peer_id: str, next_peer: str, is_first: bool
             # Last machine stores final result
             await send_blob(doc, author, FINAL_RESULT_KEY, result)
             print("✅ Stored final result")
-        else:
+        elif next_peer:
             # Pass result to next machine
             await send_blob(doc, author, next_peer, result)
             print(f"📤 Sent result to {next_peer}")
+        else:
+            print("⚠️ No next peer specified, cannot send result")
             
     except Exception as e:
         print(f"❌ Error in computation: {e}")
@@ -264,6 +531,11 @@ async def main():
     heartbeat_task = asyncio.create_task(
         continuous_heartbeat(doc, author, peer_id, heartbeat_interval_ms)
     )
+    
+    # Start deployment instruction monitoring as background task
+    deployment_task = asyncio.create_task(
+        monitor_deployment_instructions(doc, node, peer_id)
+    )
 
     try:
         # Wait until this peer is included in the pipeline configuration
@@ -295,10 +567,17 @@ async def main():
     except Exception as e:
         print(f"❌ Error in main loop: {e}")
     finally:
-        # Cancel heartbeat task
+        # Cancel background tasks
         heartbeat_task.cancel()
+        deployment_task.cancel()
+        
         try:
             await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+            
+        try:
+            await deployment_task
         except asyncio.CancelledError:
             pass
         
