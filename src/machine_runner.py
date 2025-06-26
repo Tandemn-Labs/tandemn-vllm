@@ -367,7 +367,7 @@ async def get_shared_ticket():
         Exception: If unable to fetch the ticket from the server
     """
     try:
-        server_url = f"http://{SERVER_HOST if SERVER_HOST != '0.0.0.0' else 'localhost'}:{SERVER_PORT}"
+        server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
         async with httpx.AsyncClient() as client:
             response = await client.get(f'{server_url}/ticket')
             response.raise_for_status()
