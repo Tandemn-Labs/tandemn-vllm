@@ -36,6 +36,11 @@ from src.utils.gpu_utils import (
 deployed_model = None
 deployment_status = "idle"  # idle, downloading, loading, ready, failed
 
+# Global Iroh objects for completion reporting
+current_doc = None
+current_node = None 
+current_peer_id = None
+
 # Constants for document keys
 TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
 FINAL_RESULT_KEY = "final_result"  # Key used to store the final computation result
@@ -233,12 +238,47 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         print(f"   Loaded layers: {instructions['assigned_layers']}")
         print(f"   Memory optimization: ~{100 * (22 - len(instructions['assigned_layers'])) / 22:.1f}% VRAM savings")
         
+        # Report completion to server
+        await report_deployment_completion(instructions['model_name'], success=True)
+        
         return True
         
     except Exception as e:
         print(f"❌ Model deployment failed: {e}")
         deployment_status = "failed"
+        
+        # Report failure to server  
+        try:
+            await report_deployment_completion(instructions['model_name'], success=False)
+        except:
+            pass  # Don't fail on reporting failure
+        
         return False
+
+async def report_deployment_completion(model_name: str, success: bool):
+    """Report deployment completion status to server via Iroh."""
+    try:
+        # Access global Iroh objects (these will be set in main())
+        global current_doc, current_node, current_peer_id
+        
+        if not all([current_doc, current_node, current_peer_id]):
+            print("⚠️ Cannot report completion - Iroh not initialized")
+            return
+            
+        author = await current_node.authors().create()
+        completion_key = f"deployment_complete_{current_peer_id}_{int(time.time())}"
+        completion_data = json.dumps({
+            "peer_id": current_peer_id,
+            "model_name": model_name,
+            "success": success,
+            "timestamp": int(time.time())
+        }).encode()
+        
+        await current_doc.set_bytes(author, completion_key.encode(), completion_data)
+        print(f"📤 Reported deployment {'success' if success else 'failure'} to server")
+        
+    except Exception as e:
+        print(f"❌ Failed to report deployment completion: {e}")
 
 async def handle_deployment_instruction(doc, node, instruction_data: bytes):
     """Handle deployment instruction received via Iroh."""
@@ -526,6 +566,8 @@ async def continuous_heartbeat(doc, author, peer_id: str, node, interval_ms: int
 
 async def main():
     """Main function to run the distributed computation node"""
+    global current_doc, current_node, current_peer_id
+    
     # Set up the asyncio event loop for Iroh
     uniffi_set_event_loop(asyncio.get_running_loop())
 
@@ -539,6 +581,10 @@ async def main():
     node = await iroh.Iroh.memory_with_options(options)
     peer_id = await node.net().node_id()
     print(f"🤖 Running as peer: {peer_id}")
+    
+    # Set globals for completion reporting
+    current_node = node
+    current_peer_id = peer_id
 
     # Register this peer in MongoDB
     await register_peer(peer_id, hostname)
@@ -554,6 +600,9 @@ async def main():
     # Join the shared document and create an author for writing
     doc = await node.docs().join(iroh.DocTicket(shared_ticket))
     author = await node.authors().create()
+    
+    # Set global doc for completion reporting
+    current_doc = doc
     
     # Upload initial system metrics
     await upload_metrics(doc, author, peer_id)

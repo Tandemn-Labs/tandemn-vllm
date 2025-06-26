@@ -98,6 +98,25 @@ async def monitor_and_acknowledge_heartbeats():
                             
                     except Exception as e:
                         print(f"❌ Error processing heartbeat {key}: {e}")
+                
+                # Look for deployment completion messages from peers
+                elif key.startswith("deployment_complete_") and hash_value not in seen_heartbeats:
+                    try:
+                        seen_heartbeats.add(hash_value)  # Mark as processed FIRST
+                        content = await node.blobs().read_to_bytes(hash_value)
+                        completion_data = json.loads(content.decode())
+                        
+                        model_name = completion_data.get("model_name")
+                        peer_id = completion_data.get("peer_id")
+                        success = completion_data.get("success", False)
+                        
+                        if model_name and peer_id and model_name in active_deployments:
+                            status = "completed" if success else "failed"
+                            active_deployments[model_name]["completion_status"][peer_id] = status
+                            print(f"📝 Peer {peer_id} deployment {status} for {model_name}")
+                            
+                    except Exception as e:
+                        print(f"❌ Error processing deployment completion {key}: {e}")
             
         except Exception as e:
             print(f"❌ Error in heartbeat monitor: {e}")
@@ -932,7 +951,11 @@ async def deploy_model(request: ModelDeploymentRequest):
         
         # Keep deployment as in_progress - peers will update status when done
         # DON'T mark as completed here - instructions were just sent, not completed!
-        active_deployments[request.model_name]["instructions_sent_at"] = time.time()
+        active_deployments[request.model_name].update({
+            "instructions_sent_at": time.time(),
+            "deployment_map": {peer_id: info["assigned_layers"] for peer_id, info in deployment_instructions.items()},
+            "completion_status": {peer_id: "pending" for peer_id in deployment_instructions.keys()}
+        })
 
         return {
             "status": "deployment_initiated",
@@ -954,4 +977,29 @@ async def deploy_model(request: ModelDeploymentRequest):
             del active_deployments[request.model_name]
         print(f"❌ Deployment failed: {e}")
         raise HTTPException(status_code=500, detail=f"Deployment failed: {str(e)}")
+
+@app.get("/deployment_status/{model_name}")
+async def get_deployment_status(model_name: str):
+    """
+    Get the current deployment status showing which layers are deployed where.
+    
+    Args:
+        model_name: Name of the deployed model
+        
+    Returns:
+        Current deployment status and layer distribution
+    """
+    if model_name not in active_deployments:
+        raise HTTPException(status_code=404, detail=f"No deployment found for model {model_name}")
+    
+    deployment = active_deployments[model_name]
+    return {
+        "status": "success",
+        "model_name": model_name,
+        "deployment_status": deployment.get("status", "unknown"),
+        "layer_distribution": deployment.get("deployment_map", {}),
+        "peer_completion_status": deployment.get("completion_status", {}),
+        "started_at": deployment.get("started_at"),
+        "instructions_sent_at": deployment.get("instructions_sent_at")
+    }
 
