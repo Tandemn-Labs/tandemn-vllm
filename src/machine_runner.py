@@ -468,22 +468,54 @@ async def upload_metrics(doc, author, peer_id: str):
     except Exception as e:
         print(f"❌ Failed to upload metrics: {e}")
 
-async def continuous_heartbeat(doc, author, peer_id: str, interval_ms: int = 1000):
+async def continuous_heartbeat(doc, author, peer_id: str, node, interval_ms: int = 1000):
     """
-    Continuously send heartbeat with metrics to the server.
+    Continuously send heartbeat with metrics to the server and monitor for acknowledgments.
+    Stops sending if server doesn't acknowledge within timeout.
     
     Args:
         doc: Iroh document
         author: Iroh author for writing  
         peer_id: This peer's ID
+        node: Iroh node for reading acknowledgments
         interval_ms: Heartbeat interval in milliseconds (default: 1000ms = 1 second)
     """
-    print(f"💓 Starting continuous heartbeat every {interval_ms}ms")
+    print(f"💓 Starting bidirectional heartbeat every {interval_ms}ms")
+    
+    last_ack_time = time.time()
+    server_timeout = 30  # Stop heartbeats if no server ack for 30 seconds
+    grace_period = 10   # Give server 10 seconds to start acknowledging
+    seen_acks = set()
     
     while True:
         try:
+            # Send heartbeat
             await upload_metrics(doc, author, peer_id)
+            current_time = time.time()
+            
+            # Check for server acknowledgments
+            try:
+                entries = await doc.get_many(iroh.Query.all(None))
+                for entry in entries:
+                    key = entry.key().decode()
+                    hash_value = entry.content_hash()
+                    
+                    # Look for acknowledgments from server
+                    if key.startswith(f"heartbeat_ack_{peer_id}_") and hash_value not in seen_acks:
+                        seen_acks.add(hash_value)
+                        last_ack_time = current_time
+                        print(f"💓 Server acknowledged heartbeat")
+                        break
+            except Exception as e:
+                print(f"⚠️ Error checking server acknowledgments: {e}")
+            
+            # Check if server is responsive (after grace period)
+            if current_time - last_ack_time > server_timeout and current_time - last_ack_time > grace_period:
+                print(f"💔 Server unresponsive for {server_timeout}s, stopping heartbeats")
+                break
+            
             await asyncio.sleep(interval_ms / 1000.0)  # Convert ms to seconds
+            
         except asyncio.CancelledError:
             print(f"💓 Heartbeat cancelled for {peer_id}")
             break
@@ -529,7 +561,7 @@ async def main():
     # Start continuous heartbeat as background task
     heartbeat_interval_ms = int(os.getenv("HEARTBEAT_INTERVAL_MS", "1000"))  # Default 1 second
     heartbeat_task = asyncio.create_task(
-        continuous_heartbeat(doc, author, peer_id, heartbeat_interval_ms)
+        continuous_heartbeat(doc, author, peer_id, node, heartbeat_interval_ms)
     )
     
     # Start deployment instruction monitoring as background task

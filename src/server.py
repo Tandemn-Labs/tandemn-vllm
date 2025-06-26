@@ -56,6 +56,54 @@ active_deployments = {}  # Track ongoing deployments by model_name
 TRIGGER_KEY = "job_trigger"  # Key for job initiation
 FINAL_RESULT_KEY = "final_result"  # Key for final computation result
 
+async def monitor_and_acknowledge_heartbeats():
+    """Monitor peer heartbeats and send acknowledgments back to keep the connection alive."""
+    global doc, node
+    
+    print("💓 Starting heartbeat acknowledgment monitor...")
+    seen_heartbeats = set()
+    
+    while True:
+        try:
+            author = await node.authors().create()
+            entries = await doc.get_many(iroh.Query.all(None))
+            
+            for entry in entries:
+                key = entry.key().decode()
+                hash_value = entry.content_hash()
+                
+                # Skip if we've already processed this heartbeat
+                if hash_value in seen_heartbeats:
+                    continue
+                
+                # Look for heartbeat messages from peers
+                if key.startswith("heartbeat_") and not key.startswith("heartbeat_ack_"):
+                    # Extract peer_id from heartbeat key: heartbeat_{peer_id}_{timestamp}
+                    try:
+                        parts = key.split("_")
+                        if len(parts) >= 3:
+                            peer_id = parts[1]
+                            timestamp = parts[2]
+                            
+                            # Send acknowledgment back to peer
+                            ack_key = f"heartbeat_ack_{peer_id}_{timestamp}"
+                            ack_value = json.dumps({
+                                "server_id": server_peer_id,
+                                "ack_timestamp": int(time.time() * 1000),
+                                "status": "alive"
+                            }).encode()
+                            
+                            await doc.set_bytes(author, ack_key.encode(), ack_value)
+                            seen_heartbeats.add(hash_value)
+                            
+                    except Exception as e:
+                        print(f"❌ Error processing heartbeat {key}: {e}")
+            
+        except Exception as e:
+            print(f"❌ Error in heartbeat monitor: {e}")
+        
+        await asyncio.sleep(2)  # Check every 2 seconds
+
 class ModelEstimationRequest(BaseModel):
     model_id: str
     hf_token: str
@@ -124,6 +172,9 @@ async def startup():
     print("✅ Iroh node started")
     print("📎 SHARE THIS TICKET WITH ALL INTERNAL MACHINES:\n")
     print(str(ticket) + "\n")
+    
+    # Start heartbeat acknowledgment monitor
+    asyncio.create_task(monitor_and_acknowledge_heartbeats())
 
 @app.get("/health")
 async def health():
@@ -781,12 +832,12 @@ async def deploy_model(request: ModelDeploymentRequest):
                         peers_vram[peer_id] = latest_metrics["total_free_vram_gb"]
             except Exception as e:
                 print(f"❌ Error getting metrics for peer {peer_id}: {e}")
-        
+
         if not peers_vram:
             raise HTTPException(status_code=400, detail="No peers with VRAM information available")
         
         print(f"👥 Found {len(peers_vram)} peers with VRAM data")
-        
+
         # 3. Create distribution plan using existing logic
         # Create a dummy config for distribution planning
         config = {
@@ -803,13 +854,13 @@ async def deploy_model(request: ModelDeploymentRequest):
             peers_vram=peers_vram,
             q_bits=16  # Default quantization
         )
-        
+
         if not distribution_plan["can_fit_model"]:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail=f"Model cannot fit in available VRAM. Need {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB, have {distribution_plan['total_available_vram_gb']:.1f}GB"
             )
-        
+
         # 4. Create optimized deployment instructions for each peer
         deployment_instructions = {}
         peer_list = list(distribution_plan["distribution"].keys())
@@ -822,7 +873,7 @@ async def deploy_model(request: ModelDeploymentRequest):
                 sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i]),
                 sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i+1])
             ))
-            
+
             # Determine required files based on peer position
             required_files = []
             
@@ -882,7 +933,7 @@ async def deploy_model(request: ModelDeploymentRequest):
         # Keep deployment as in_progress - peers will update status when done
         # DON'T mark as completed here - instructions were just sent, not completed!
         active_deployments[request.model_name]["instructions_sent_at"] = time.time()
-        
+
         return {
             "status": "deployment_initiated",
             "model_name": request.model_name,
@@ -891,7 +942,7 @@ async def deploy_model(request: ModelDeploymentRequest):
             "deployment_instructions": deployment_instructions,
             "message": f"Deployment instructions sent to {len(deployment_instructions)} peers. Peers will download required files and load model."
         }
-        
+
     except HTTPException:
         # Clean up deployment tracking on error
         if request.model_name in active_deployments:
