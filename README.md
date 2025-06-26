@@ -1,4 +1,4 @@
-# Iroh Tandem
+# Iroh Tandemn
 
 A distributed computing system that enables collaborative model training and inference across multiple machines using Iroh for peer-to-peer communication.
 
