@@ -35,7 +35,7 @@ from src.utils.model_utils import (
     calculate_max_layers_for_peer,
     distribute_layers_across_peers
 )
-from src.utils.sharding_utils import shard_model_by_layers
+from src.utils.sharding_utils import shard_model_by_layers, shard_model_by_layers_safetensors
 
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandemn Server")
@@ -133,6 +133,11 @@ class ModelShardingRequest(BaseModel):
     model_id: str
     hf_token: str
     model_layers_key: str = "model.layers"
+    cache_dir: Optional[str] = None
+
+class ModelShardingSafetensorsRequest(BaseModel):
+    model_id: str
+    hf_token: str
     cache_dir: Optional[str] = None
 
 class ModelDeploymentRequest(BaseModel):
@@ -627,6 +632,52 @@ def run_sharding_task(task_id: str, request: ModelShardingRequest):
         })
         print(f"❌ Background sharding failed for {request.model_id}: {e}")
 
+def run_sharding_safetensors_task(task_id: str, request: ModelShardingSafetensorsRequest):
+    """Background task function to run safetensors-based model sharding."""
+    try:
+        # Update task status
+        background_tasks[task_id]["status"] = "running"
+        background_tasks[task_id]["started_at"] = datetime.now().isoformat()
+        
+        # Extract model name for directory naming
+        model_name_safe = request.model_id.replace("/", "_").replace("\\", "_")
+        output_dir = f"./shards/{model_name_safe}"
+        
+        print(f"🔪 Starting background safetensors-based layer sharding for {request.model_id}")
+        print(f"📁 Output directory: {output_dir}")
+        
+        # Call the safetensors-based sharding function
+        result = shard_model_by_layers_safetensors(
+            model_name=request.model_id,
+            output_dir=output_dir,
+            hf_token=request.hf_token,
+            cache_dir=request.cache_dir
+        )
+        
+        # Update task with successful result
+        background_tasks[task_id].update({
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+            "result": {
+                "model_id": request.model_id,
+                "output_directory": result["output_dir"],
+                "total_components": result["total_components"],
+                "metadata": result["metadata"],
+                "message": f"Successfully created {result['total_components']} layer components using safetensors processing"
+            }
+        })
+        
+        print(f"✅ Background safetensors-based sharding completed for {request.model_id}")
+        
+    except Exception as e:
+        # Update task with error
+        background_tasks[task_id].update({
+            "status": "failed",
+            "completed_at": datetime.now().isoformat(),
+            "error": str(e)
+        })
+        print(f"❌ Background safetensors-based sharding failed for {request.model_id}: {e}")
+
 @app.post("/create_layer_shards")
 async def create_layer_shards(request: ModelShardingRequest, background_tasks_runner: BackgroundTasks):
     """
@@ -664,6 +715,48 @@ async def create_layer_shards(request: ModelShardingRequest, background_tasks_ru
         "task_id": task_id,
         "model_id": request.model_id,
         "message": "Layer sharding task started in background. Use /task_status/{task_id} to check progress."
+    }
+
+@app.post("/create_layer_shards_safetensors")
+async def create_layer_shards_safetensors(request: ModelShardingSafetensorsRequest, background_tasks_runner: BackgroundTasks):
+    """
+    Start safetensors-based layer sharding for a model in the background.
+    This approach processes safetensors files directly without loading the entire model into memory.
+    
+    Args:
+        request: ModelShardingSafetensorsRequest containing model_id, hf_token, and optional parameters
+        background_tasks_runner: FastAPI background tasks runner
+        
+    Returns:
+        Task ID for tracking the sharding progress
+    """
+    # Generate unique task ID
+    task_id = str(uuid.uuid4())
+    
+    # Initialize task tracking
+    background_tasks[task_id] = {
+        "task_id": task_id,
+        "model_id": request.model_id,
+        "status": "queued",
+        "created_at": datetime.now().isoformat(),
+        "started_at": None,
+        "completed_at": None,
+        "result": None,
+        "error": None,
+        "method": "safetensors"  # Mark this as safetensors-based
+    }
+    
+    # Start background task
+    background_tasks_runner.add_task(run_sharding_safetensors_task, task_id, request)
+    
+    print(f"🚀 Queued safetensors-based layer sharding task {task_id} for {request.model_id}")
+    
+    return {
+        "status": "queued",
+        "task_id": task_id,
+        "model_id": request.model_id,
+        "method": "safetensors",
+        "message": "Safetensors-based layer sharding task started in background. Use /task_status/{task_id} to check progress."
     }
 
 @app.get("/task_status/{task_id}")
