@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import time
 import aiofiles
+from colorama import Fore, Style, init as colorama_init
 
 # FORCE vLLM v0 mode (required for selective layer loading)
 os.environ["VLLM_USE_V1"] = "0"
@@ -29,7 +30,8 @@ from src.utils.db_utils import (
 )
 from src.utils.gpu_utils import (
     get_system_metrics,
-    format_metrics_for_db
+    format_metrics_for_db,
+    get_total_free_vram
 )
 
 # Global variables for deployed model
@@ -497,96 +499,45 @@ async def process_once(doc, author, peer_id: str, next_peer: Optional[str], is_f
     except Exception as e:
         print(f"❌ Error in computation: {e}")
 
-async def upload_metrics(doc, author, peer_id: str):
-    """Upload system metrics to the document and database."""
-    try:
-        metrics = get_system_metrics()
-        formatted_metrics = format_metrics_for_db(metrics)
-        
-        # Use simple heartbeat key without timestamp - each peer overwrites their own key
-        heartbeat_key = f"heartbeat_{peer_id}"
-        gpu_info = formatted_metrics.get("gpu_info", [])
-        total_free_vram = formatted_metrics.get("total_free_vram_gb", 0.0)
-        
-        # Compact metrics for Iroh document
-        compact_metrics = {
-            "cpu": metrics.cpu_percent,
-            "ram": metrics.ram_percent,
-            "free_vram": total_free_vram,
-            "gpu_count": len(gpu_info),
-            "timestamp": formatted_metrics["timestamp"].isoformat() if hasattr(formatted_metrics["timestamp"], "isoformat") else str(formatted_metrics["timestamp"])
-        }
-        value = json.dumps(compact_metrics).encode()
-        
-        # Store in Iroh document - this will overwrite the previous entry for this peer
-        await doc.set_bytes(author, heartbeat_key.encode(), value)
-        
-        # Store full metrics in database
-        await update_peer_metrics(peer_id, formatted_metrics)
-        
-        # Brief status for every heartbeat  
-        print(f"💓 Heartbeat {peer_id}: CPU {metrics.cpu_percent:.1f}%, VRAM {total_free_vram:.1f}GB")
-    except Exception as e:
-        print(f"❌ Failed to upload metrics: {e}")
+colorama_init(autoreset=True)
+COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
+PEER_COLOR = COLORS[int(socket.gethostname().__hash__()) % len(COLORS)]  # deterministic per host
 
-async def continuous_heartbeat(doc, author, peer_id: str, node, interval_ms: int = 1000):
-    """
-    Continuously send heartbeat with metrics to the server and monitor for acknowledgments.
-    Stops sending if server doesn't acknowledge within timeout.
-    
-    Args:
-        doc: Iroh document
-        author: Iroh author for writing  
-        peer_id: This peer's ID
-        node: Iroh node for reading acknowledgments
-        interval_ms: Heartbeat interval in milliseconds (default: 1000ms = 1 second)
-    """
-    print(f"💓 Starting bidirectional heartbeat every {interval_ms}ms")
-    
-    last_ack_time = None  # Track when we last saw an acknowledgment
-    server_timeout = 30  # Stop heartbeats if no server ack for 30 seconds
-    ack_key_to_check = f"heartbeat_ack_{peer_id}"
-    last_ack_content = None  # Track last seen ack content to detect changes
-    
-    while True:
-        try:
-            # Send heartbeat
-            await upload_metrics(doc, author, peer_id)
-            current_time = time.time()
-            
-            # Check for server acknowledgment (simplified approach)
+async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
+    """Send heartbeat to central server over HTTP and exit if server stops responding."""
+    consecutive_failures = 0
+    max_failures = 5  # ~5 seconds tolerance
+    server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
+
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        while True:
             try:
-                # Look for our specific ack key by scanning entries and filtering
-                entries = await doc.get_many(iroh.Query.all(None))
-                
-                for entry in entries:
-                    key = entry.key().decode()
-                    if key == ack_key_to_check:
-                        # Server has acknowledged - we found the ack key
-                        last_ack_time = current_time  # Update time whenever ack exists
-                        
-                        # Optional: Check content for debugging (can be removed later)
-                        content = await node.blobs().read_to_bytes(entry.content_hash())
-                        print(f"💓 Server acknowledged heartbeat: {content.decode()}")
-                        break  # Found our ack, no need to continue
-                        
+                metrics = get_system_metrics()
+                total_free_vram = get_total_free_vram()
+                payload = {
+                    "peer_id": peer_id,
+                    "cpu": metrics.cpu_percent,
+                    "ram": metrics.ram_percent,
+                    "free_vram": total_free_vram,
+                    "gpu_count": len(metrics.gpu_info),
+                    "timestamp": int(time.time())
+                }
+                r = await client.post(server_url, json=payload)
+                if r.status_code == 200:
+                    consecutive_failures = 0  # Reset on success
+                    print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
+                else:
+                    consecutive_failures += 1
+                    print(f"{PEER_COLOR}⚠️ Heartbeat HTTP {r.status_code}{Style.RESET_ALL}")
             except Exception as e:
-                print(f"⚠️ Error checking server acknowledgments: {e}")
-            
-            # Check if server is responsive (only after we've seen at least one ack)
-            if last_ack_time is not None and current_time - last_ack_time > server_timeout:
-                print(f"💔 Server unresponsive for {server_timeout}s, stopping heartbeats")
-                break
-            
-            await asyncio.sleep(interval_ms / 1000.0)  # Convert ms to seconds
-            
-        except asyncio.CancelledError:
-            print(f"💓 Heartbeat cancelled for {peer_id}")
-            break
-        except Exception as e:
-            print(f"❌ Heartbeat error for {peer_id}: {e}")
-            # Continue heartbeat even if one upload fails
-            await asyncio.sleep(1)  # Wait 1 second before retry
+                consecutive_failures += 1
+                print(f"{PEER_COLOR}⚠️ Heartbeat error: {e}{Style.RESET_ALL}")
+
+            if consecutive_failures >= max_failures:
+                print(f"{PEER_COLOR}💔 Lost contact with server, shutting down peer{Style.RESET_ALL}")
+                os._exit(1)
+
+            await asyncio.sleep(interval_s)
 
 async def main():
     """Main function to run the distributed computation node"""
@@ -628,14 +579,8 @@ async def main():
     # Set global doc for completion reporting
     current_doc = doc
     
-    # Upload initial system metrics
-    await upload_metrics(doc, author, peer_id)
-
-    # Start continuous heartbeat as background task
-    heartbeat_interval_ms = int(os.getenv("HEARTBEAT_INTERVAL_MS", "1000"))  # Default 1 second
-    heartbeat_task = asyncio.create_task(
-        continuous_heartbeat(doc, author, peer_id, node, heartbeat_interval_ms)
-    )
+    # Start HTTP heartbeat loop (1 Hz by default)
+    heartbeat_task = asyncio.create_task(http_heartbeat_loop(peer_id))
     
     # Start deployment instruction monitoring as background task
     deployment_task = asyncio.create_task(

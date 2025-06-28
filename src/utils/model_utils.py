@@ -136,6 +136,7 @@ def estimate_layer_vram(config: Dict[str, Any], q_bits: int) -> Tuple[float, flo
     embedding_vram_gb = (embed_params * bytes_per_param * overhead_factor) / (1024**3)
     vram_per_layer_gb = (layer_params * bytes_per_param * overhead_factor) / (1024**3)
     total_vram_gb = embedding_vram_gb + (num_hidden_layers * vram_per_layer_gb)
+    print(f"vram_per_layer_gb: {vram_per_layer_gb}, embedding_vram_gb: {embedding_vram_gb}, total_vram_gb: {total_vram_gb}")
     
     return vram_per_layer_gb, embedding_vram_gb, total_vram_gb
 

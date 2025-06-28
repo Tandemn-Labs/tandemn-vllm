@@ -56,6 +56,15 @@ active_deployments = {}  # Track ongoing deployments by model_name
 TRIGGER_KEY = "job_trigger"  # Key for job initiation
 FINAL_RESULT_KEY = "final_result"  # Key for final computation result
 
+class HeartbeatRequest(BaseModel):
+    """Schema for heartbeat POSTs from peers."""
+    peer_id: str
+    cpu: float
+    ram: float
+    free_vram: float
+    gpu_count: int
+    timestamp: int
+
 async def monitor_and_acknowledge_heartbeats():
     """Monitor peer heartbeats and send acknowledgments back to keep the connection alive."""
     global doc, node
@@ -204,8 +213,8 @@ async def startup():
     print("📎 SHARE THIS TICKET WITH ALL INTERNAL MACHINES:\n")
     print(str(ticket) + "\n")
     
-    # Start heartbeat acknowledgment monitor
-    asyncio.create_task(monitor_and_acknowledge_heartbeats())
+    # NOTE: Heartbeats are now handled via HTTP /heartbeat endpoint, so the
+    # Iroh-based acknowledgment monitor is no longer needed.
 
 @app.get("/health")
 async def health():
@@ -973,6 +982,7 @@ async def deploy_model(request: ModelDeploymentRequest):
             peers_vram=peers_vram,
             q_bits=16  # Default quantization
         )
+        print(distribution_plan)
 
         if not distribution_plan["can_fit_model"]:
             raise HTTPException(
@@ -1102,4 +1112,29 @@ async def get_deployment_status(model_name: str):
         "started_at": deployment.get("started_at"),
         "instructions_sent_at": deployment.get("instructions_sent_at")
     }
+
+@app.post("/heartbeat")
+async def heartbeat_endpoint(hb: HeartbeatRequest):
+    """Receive heartbeat from a peer and store metrics in MongoDB."""
+    try:
+        # Compact metrics object similar to previous format
+        formatted_metrics = {
+            "cpu_percent": hb.cpu,
+            "ram_percent": hb.ram,
+            "total_free_vram_gb": hb.free_vram,
+            "gpu_count": hb.gpu_count,
+            "timestamp": datetime.fromtimestamp(hb.timestamp)
+        }
+        # Update MongoDB (time-series) using existing helper
+        await update_peer_metrics(hb.peer_id, formatted_metrics)
+        # Mark peer active + last_seen
+        await _db[PEERS_COLLECTION].update_one(
+            {"_id": hb.peer_id},
+            {"$set": {"is_active": True, "last_seen": datetime.utcnow() }},
+            upsert=True
+        )
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"❌ Heartbeat processing failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
