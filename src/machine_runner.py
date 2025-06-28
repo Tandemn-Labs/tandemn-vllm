@@ -523,10 +523,10 @@ async def continuous_heartbeat(doc, author, peer_id: str, node, interval_ms: int
     """
     print(f"💓 Starting bidirectional heartbeat every {interval_ms}ms")
     
-    last_ack_time = time.time()
+    last_ack_time = None  # Track when we last saw an acknowledgment
     server_timeout = 30  # Stop heartbeats if no server ack for 30 seconds
-    grace_period = 10   # Give server 10 seconds to start acknowledging
-    seen_acks = set()
+    ack_key_to_check = f"heartbeat_ack_{peer_id}"
+    last_ack_content = None  # Track last seen ack content to detect changes
     
     while True:
         try:
@@ -534,24 +534,27 @@ async def continuous_heartbeat(doc, author, peer_id: str, node, interval_ms: int
             await upload_metrics(doc, author, peer_id)
             current_time = time.time()
             
-            # Check for server acknowledgments
+            # Check for server acknowledgment (simplified approach)
             try:
+                # Look for our specific ack key by scanning entries and filtering
                 entries = await doc.get_many(iroh.Query.all(None))
+                
                 for entry in entries:
                     key = entry.key().decode()
-                    hash_value = entry.content_hash()
-                    
-                    # Look for acknowledgments from server (simplified format)
-                    if key.startswith(f"heartbeat_ack_{peer_id}") and hash_value not in seen_acks:
-                        seen_acks.add(hash_value)
-                        last_ack_time = current_time
-                        print(f"💓 Server acknowledged heartbeat")
-                        break
+                    if key == ack_key_to_check:
+                        # Server has acknowledged - we found the ack key
+                        last_ack_time = current_time  # Update time whenever ack exists
+                        
+                        # Optional: Check content for debugging (can be removed later)
+                        content = await node.blobs().read_to_bytes(entry.content_hash())
+                        print(f"💓 Server acknowledged heartbeat: {content.decode()}")
+                        break  # Found our ack, no need to continue
+                        
             except Exception as e:
                 print(f"⚠️ Error checking server acknowledgments: {e}")
             
-            # Check if server is responsive (after grace period)
-            if current_time - last_ack_time > server_timeout and current_time - last_ack_time > grace_period:
+            # Check if server is responsive (only after we've seen at least one ack)
+            if last_ack_time is not None and current_time - last_ack_time > server_timeout:
                 print(f"💔 Server unresponsive for {server_timeout}s, stopping heartbeats")
                 break
             

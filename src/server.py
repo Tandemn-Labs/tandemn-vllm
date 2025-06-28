@@ -61,20 +61,23 @@ async def monitor_and_acknowledge_heartbeats():
     global doc, node
     
     print("💓 Starting heartbeat acknowledgment monitor...")
-    seen_heartbeats = set()
+    processed_peers = set()  # Track by peer_id instead of hash to prevent duplicates
+    last_cleanup = time.time()
     
     author = await node.authors().create()
     while True:
         try:
             entries = await doc.get_many(iroh.Query.all(None))
+            current_time = time.time()
             
+            # Periodic cleanup to prevent memory leaks
+            # if current_time - last_cleanup > 60:  # Clean up every minute
+            #     processed_peers.clear()
+            #     last_cleanup = current_time
+            #     print("🧹 Cleaned up processed peers set")
+            # print(entries)
             for entry in entries:
                 key = entry.key().decode()
-                hash_value = entry.content_hash()
-                
-                # Skip if we've already processed this heartbeat
-                if hash_value in seen_heartbeats:
-                    continue
                 
                 # Look for heartbeat messages from peers (simplified format: heartbeat_{peer_id})
                 if key.startswith("heartbeat_") and not key.startswith("heartbeat_ack_"):
@@ -84,24 +87,29 @@ async def monitor_and_acknowledge_heartbeats():
                         if len(parts) >= 2:
                             peer_id = parts[1]
                             
-                            # Send acknowledgment back to peer (simplified format)
+                            # # Skip if we already processed this peer recently
+                            # if peer_id in processed_peers:
+                            #     continue
+                            
+                            # Send acknowledgment back to peer (simplified format with static content)
                             ack_key = f"heartbeat_ack_{peer_id}"
                             ack_value = json.dumps({
                                 "server_id": server_peer_id,
-                                "ack_timestamp": int(time.time() * 1000),
                                 "status": "alive"
+                                # Removed changing ack_timestamp to prevent entry bloat
                             }).encode()
                             
                             await doc.set_bytes(author, ack_key.encode(), ack_value)
-                            seen_heartbeats.add(hash_value)
+                            processed_peers.add(peer_id)
+                            print(f"💓 Acknowledged heartbeat from {peer_id}")
                             
                     except Exception as e:
                         print(f"❌ Error processing heartbeat {key}: {e}")
                 
                 # Look for deployment completion messages from peers
-                elif key.startswith("deployment_complete_") and hash_value not in seen_heartbeats:
+                elif key.startswith("deployment_complete_"):
                     try:
-                        seen_heartbeats.add(hash_value)  # Mark as processed FIRST
+                        hash_value = entry.content_hash()
                         content = await node.blobs().read_to_bytes(hash_value)
                         completion_data = json.loads(content.decode())
                         
