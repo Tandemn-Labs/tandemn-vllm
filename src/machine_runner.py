@@ -41,16 +41,11 @@ current_doc = None
 current_node = None 
 current_peer_id = None
 
-# Constants for document keys
-TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
-FINAL_RESULT_KEY = "final_result"  # Key used to store the final computation result
+# Constants for document keys (preserved for future pipeline parallel inference)
+TRIGGER_KEY = "job_trigger"  # Key for triggering pipeline operations
+FINAL_RESULT_KEY = "final_result"  # Key for final pipeline results
 
-# Predefined matrices for each position in the pipeline
-MATRIX_MAP = {
-    0: torch.tensor([[2., 0.], [1., 2.]]),  # Matrix A (first machine)
-    1: torch.tensor([[0., 1.], [1., 0.]]),  # Matrix B (second machine)
-    2: torch.tensor([[1., 1.], [0., 1.]]),  # Matrix C (third machine)
-}
+# Matrix computation removed - keeping blob communication for future pipeline parallel inference
 
 # ============================================================================
 # SELECTIVE LAYER LOADING IMPLEMENTATION  
@@ -434,48 +429,19 @@ async def receive_blob(doc, peer_id: str, node):
             print(f"❌ Polling error for {peer_id}: {e}")
         await asyncio.sleep(2)  # Poll every 2 seconds
 
-async def process_once(doc, author, peer_id: str, next_peer: Optional[str], is_first: bool, is_last: bool, local_matrix: torch.Tensor, node):
-    """
-    Process one computation job in the pipeline.
-    
-    Args:
-        doc: Iroh document
-        author: Iroh author for writing
-        peer_id: This peer's ID
-        next_peer: ID of the next peer in the pipeline
-        is_first: Whether this is the first machine in the pipeline
-        is_last: Whether this is the last machine in the pipeline
-        local_matrix: The matrix assigned to this peer
-        node: Iroh node
-    """
-    try:
-        if is_first:
-            # First machine waits for job trigger
-            trigger = await receive_blob(doc, TRIGGER_KEY, node)
-            print(f"📥 Received trigger: {trigger}")
-            input_matrix = trigger
-        else:
-            # Other machines wait for input from previous machine
-            input_matrix = await receive_blob(doc, peer_id, node)
-            print(f"📥 Received input: {input_matrix}")
-        
-        # Perform matrix multiplication
-        result = torch.matmul(input_matrix, local_matrix)
-        print(f"🔢 Computed result: {result}")
-        
-        if is_last:
-            # Last machine stores final result
-            await send_blob(doc, author, FINAL_RESULT_KEY, result)
-            print("✅ Stored final result")
-        elif next_peer:
-            # Pass result to next machine
-            await send_blob(doc, author, next_peer, result)
-            print(f"📤 Sent result to {next_peer}")
-        else:
-            print("⚠️ No next peer specified, cannot send result")
-            
-    except Exception as e:
-        print(f"❌ Error in computation: {e}")
+# ============================================================================
+# PIPELINE PARALLEL COMMUNICATION (for future hidden state passing)
+# ============================================================================
+
+async def send_hidden_states(doc, author, target_peer: str, hidden_states: torch.Tensor):
+    """Send hidden states to next peer in pipeline (for future pipeline parallel inference)."""
+    return await send_blob(doc, author, target_peer, hidden_states)
+
+async def receive_hidden_states(doc, peer_id: str, node):
+    """Receive hidden states from previous peer in pipeline (for future pipeline parallel inference)."""
+    return await receive_blob(doc, peer_id, node)
+
+# Matrix computation removed - blob communication functions preserved for future pipeline parallel inference
 
 async def upload_metrics(doc, author, peer_id: str):
     """Upload system metrics to the document and database."""
@@ -620,31 +586,13 @@ async def main():
     )
 
     try:
-        # Wait until this peer is included in the pipeline configuration
-        print("⏳ Waiting to be included in the pipeline...")
+        # Peer is now ready for deployment instructions
+        # Matrix computation system removed - peers now wait for model deployment
+        print("✅ Peer ready for model deployment instructions")
+        
+        # Keep peer alive and responsive to deployment instructions
         while True:
-            pipeline = await get_active_peers()
-            print(pipeline)
-            if peer_id in pipeline:
-                break
-            await asyncio.sleep(2)
-
-        # Determine this peer's position and role in the pipeline
-        index = pipeline.index(peer_id)
-        is_first = index == 0
-        is_last = index == len(pipeline) - 1
-        next_peer = pipeline[index + 1] if not is_last else None
-        local_matrix = MATRIX_MAP.get(index)
-        if local_matrix is None:
-            print(f"❌ No matrix found for pipeline index {index}")
-            return
-
-        print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
-
-        # Main processing loop - continuously process computation jobs
-        while True:
-            await process_once(doc, author, peer_id, next_peer, is_first, is_last, local_matrix, node)
-            await asyncio.sleep(2)  # Small delay between processing cycles
+            await asyncio.sleep(5)  # Heartbeat and deployment monitoring run in background
 
     except Exception as e:
         print(f"❌ Error in main loop: {e}")

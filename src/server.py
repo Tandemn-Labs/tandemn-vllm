@@ -52,9 +52,9 @@ background_tasks = {}  # Dict to track running background tasks
 # Deployment tracking to prevent infinite loops
 active_deployments = {}  # Track ongoing deployments by model_name
 
-# Constants for document keys
-TRIGGER_KEY = "job_trigger"  # Key for job initiation
-FINAL_RESULT_KEY = "final_result"  # Key for final computation result
+# Constants for document keys (preserved for future pipeline parallel inference)
+TRIGGER_KEY = "job_trigger"  # Key for triggering pipeline operations  
+FINAL_RESULT_KEY = "final_result"  # Key for final pipeline results
 
 async def monitor_and_acknowledge_heartbeats():
     """Monitor peer heartbeats and send acknowledgments back to keep the connection alive."""
@@ -379,45 +379,7 @@ async def identify_peers(request: ModelEstimationRequest):
             detail=f"Failed to identify suitable peers: {str(e)}"
         )
 
-@app.post("/start_job")
-async def start_job():
-    """Endpoint to initiate a distributed computation job"""
-    global doc, node
-    author = await node.authors().create()
-
-    # Define input matrix for computation
-    U = torch.tensor([[1., 2.], [3., 4.]])
-
-    try:
-        # Send job payload to the first machine in the pipeline
-        payload = json.dumps(U.tolist()).encode()
-        await doc.set_bytes(author, TRIGGER_KEY.encode(), payload)
-        print("🚀 Sent job payload to first machine")
-        return {"status": "triggered"}
-    except Exception as e:
-        print(f"❌ Failed to send job trigger: {e}")
-        return {"status": "error", "detail": str(e)}
-
-@app.get("/result")
-async def get_final_result():
-    """Endpoint to retrieve the final computation result"""
-    try:
-        # Query all entries and look for the final result
-        query = iroh.Query.all(None)
-        entries = await doc.get_many(query)
-
-        for entry in reversed(entries):
-            if entry.key().decode() == FINAL_RESULT_KEY:
-                content = await node.blobs().read_to_bytes(entry.content_hash())
-                tensor = torch.tensor(json.loads(content.decode()))
-                return {
-                    "status": "success",
-                    "result": tensor.tolist()
-                }
-
-        return {"status": "waiting", "detail": "No final result yet."}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+# Matrix computation endpoints removed - keeping blob communication infrastructure for future pipeline parallel inference
 
 @app.post("/calculate_peer_layers")
 async def calculate_peer_layers(request: ModelEstimationRequest, peer_id: str, available_vram_gb: float):
