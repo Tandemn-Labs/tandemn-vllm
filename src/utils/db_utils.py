@@ -149,19 +149,19 @@ async def update_peer_metrics(peer_id: str, metrics: Dict[str, Any]):
     last_metrics = peer.get("last_metrics") if peer else None
     
     # Check if metrics have changed significantly
-    if has_significant_change(metrics, last_metrics):
-        # Insert new metrics document
-        await db[METRICS_COLLECTION].insert_one({
-            "peer_id": peer_id,
-            "timestamp": datetime.utcnow(),
-            "metrics": metrics
-        })
-        
-        # Update last metrics in peers collection
-        await db[PEERS_COLLECTION].update_one(
-            {"peer_id": peer_id},
-            {"$set": {"last_metrics": metrics}}
-        )
+    # if has_significant_change(metrics, last_metrics):
+    # Insert new metrics document
+    await db[METRICS_COLLECTION].insert_one({
+        "peer_id": peer_id,
+        "timestamp": datetime.utcnow(),
+        "metrics": metrics
+    })
+    
+    # Update last metrics in peers collection
+    await db[PEERS_COLLECTION].update_one(
+        {"peer_id": peer_id},
+        {"$set": {"last_metrics": metrics}}
+    )
 
 async def get_peer_metrics(peer_id: str, time_window: int = 300) -> List[Dict[str, Any]]:
     """

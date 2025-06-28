@@ -483,8 +483,8 @@ async def upload_metrics(doc, author, peer_id: str):
         metrics = get_system_metrics()
         formatted_metrics = format_metrics_for_db(metrics)
         
-        # Create a heartbeat key with timestamp for freshness
-        heartbeat_key = f"heartbeat_{peer_id}_{int(asyncio.get_event_loop().time() * 1000)}"
+        # Use simple heartbeat key without timestamp - each peer overwrites their own key
+        heartbeat_key = f"heartbeat_{peer_id}"
         gpu_info = formatted_metrics.get("gpu_info", [])
         total_free_vram = formatted_metrics.get("total_free_vram_gb", 0.0)
         
@@ -498,7 +498,7 @@ async def upload_metrics(doc, author, peer_id: str):
         }
         value = json.dumps(compact_metrics).encode()
         
-        # Store in Iroh document with timestamped key
+        # Store in Iroh document - this will overwrite the previous entry for this peer
         await doc.set_bytes(author, heartbeat_key.encode(), value)
         
         # Store full metrics in database
@@ -541,8 +541,8 @@ async def continuous_heartbeat(doc, author, peer_id: str, node, interval_ms: int
                     key = entry.key().decode()
                     hash_value = entry.content_hash()
                     
-                    # Look for acknowledgments from server
-                    if key.startswith(f"heartbeat_ack_{peer_id}_") and hash_value not in seen_acks:
+                    # Look for acknowledgments from server (simplified format)
+                    if key.startswith(f"heartbeat_ack_{peer_id}") and hash_value not in seen_acks:
                         seen_acks.add(hash_value)
                         last_ack_time = current_time
                         print(f"💓 Server acknowledged heartbeat")

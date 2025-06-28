@@ -63,9 +63,9 @@ async def monitor_and_acknowledge_heartbeats():
     print("💓 Starting heartbeat acknowledgment monitor...")
     seen_heartbeats = set()
     
+    author = await node.authors().create()
     while True:
         try:
-            author = await node.authors().create()
             entries = await doc.get_many(iroh.Query.all(None))
             
             for entry in entries:
@@ -76,17 +76,16 @@ async def monitor_and_acknowledge_heartbeats():
                 if hash_value in seen_heartbeats:
                     continue
                 
-                # Look for heartbeat messages from peers
+                # Look for heartbeat messages from peers (simplified format: heartbeat_{peer_id})
                 if key.startswith("heartbeat_") and not key.startswith("heartbeat_ack_"):
-                    # Extract peer_id from heartbeat key: heartbeat_{peer_id}_{timestamp}
+                    # Extract peer_id from heartbeat key: heartbeat_{peer_id}
                     try:
                         parts = key.split("_")
-                        if len(parts) >= 3:
+                        if len(parts) >= 2:
                             peer_id = parts[1]
-                            timestamp = parts[2]
                             
-                            # Send acknowledgment back to peer
-                            ack_key = f"heartbeat_ack_{peer_id}_{timestamp}"
+                            # Send acknowledgment back to peer (simplified format)
+                            ack_key = f"heartbeat_ack_{peer_id}"
                             ack_value = json.dumps({
                                 "server_id": server_peer_id,
                                 "ack_timestamp": int(time.time() * 1000),
@@ -177,19 +176,19 @@ async def startup():
     server_peer_id = await node.net().node_id()
 
     # Record initial system metrics
-    author = await node.authors().create()
-    key = server_peer_id.encode()
-    metrics = get_system_metrics()
-    formatted_metrics = format_metrics_for_db(metrics)
-    value = f"CPU: {metrics.cpu_percent}%\nRAM: {metrics.ram_percent}%".encode()
+    # author = await node.authors().create()
+    # key = server_peer_id.encode()
+    # metrics = get_system_metrics()
+    # formatted_metrics = format_metrics_for_db(metrics)
+    # value = f"CPU: {metrics.cpu_percent}%\nRAM: {metrics.ram_percent}%".encode()
 
-    try:
-        # Store system metrics in the document and MongoDB
-        await doc.set_bytes(author, key, value)
-        await update_peer_metrics(server_peer_id, formatted_metrics)
-        print(f"✅ Server metrics stored with key {server_peer_id}")
-    except Exception as e:
-        print(f"❌ Failed to send server metrics: {e}")
+    # try:
+    #     # Store system metrics in the document and MongoDB
+    #     await doc.set_bytes(author, key, value)
+    #     await update_peer_metrics(server_peer_id, formatted_metrics)
+    #     print(f"✅ Server metrics stored with key {server_peer_id}")
+    # except Exception as e:
+    #     print(f"❌ Failed to send server metrics: {e}")
 
     # Join the document to enable updates
     doc = await node.docs().join(ticket)
@@ -939,7 +938,7 @@ async def deploy_model(request: ModelDeploymentRequest):
             try:
                 metrics_history = await get_peer_metrics(peer_id, time_window=60)
                 if metrics_history:
-                latest_metrics = metrics_history[0]["metrics"]
+                    latest_metrics = metrics_history[0]["metrics"]
                 if "total_free_vram_gb" in latest_metrics:
                     peers_vram[peer_id] = latest_metrics["total_free_vram_gb"]
             except Exception as e:
