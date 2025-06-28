@@ -168,6 +168,8 @@ def get_model_safetensors_files(model_name: str, hf_token: Optional[str] = None)
         return safetensors_files
     except Exception as e:
         print(f"Error listing files for {model_name}: {e}")
+        # Note: list_repo_files doesn't support trust_remote_code parameter
+        # This is only needed for model/config loading, not file listing
         return []
 
 def extract_layer_weights_from_safetensors(
@@ -442,12 +444,14 @@ def shard_model_by_layers_safetensors(
     config = AutoConfig.from_pretrained(
         model_name, 
         cache_dir=cache_dir,
-        token=hf_token
+        token=hf_token,
+        trust_remote_code=True  # Allow custom model code
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, 
         cache_dir=cache_dir,
-        token=hf_token
+        token=hf_token,
+        trust_remote_code=True  # Allow custom tokenizer code
     )
     
     # Save config and tokenizer
@@ -598,17 +602,20 @@ def shard_model_by_layers(
         torch_dtype=torch.float16,
         device_map="cpu",  # Keep on CPU to avoid GPU memory issues
         token=hf_token,
-        low_cpu_mem_usage=True
+        low_cpu_mem_usage=True,
+        trust_remote_code=True  # Allow custom model code
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, 
         cache_dir=cache_dir,
-        token=hf_token
+        token=hf_token,
+        trust_remote_code=True  # Allow custom tokenizer code
     )
     config = AutoConfig.from_pretrained(
         model_name, 
         cache_dir=cache_dir,
-        token=hf_token
+        token=hf_token,
+        trust_remote_code=True  # Allow custom config code
     )
     
     # Create output directory
