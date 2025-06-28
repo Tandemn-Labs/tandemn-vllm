@@ -166,12 +166,12 @@ async def startup():
     await setup_collections()
     print("✅ MongoDB collections configured")
 
-    # Reset peer activity status on fresh server start
-    reset_result = await _db[PEERS_COLLECTION].update_many({}, {"$set": {"is_active": False}})
-    if reset_result.modified_count > 0:
-        print(f"🔄 Reset {reset_result.modified_count} peer(s) to inactive state")
+    # Clear all peer records on fresh server start to prevent stale data
+    delete_result = await _db[PEERS_COLLECTION].delete_many({})
+    if delete_result.deleted_count > 0:
+        print(f"🧹 Cleared {delete_result.deleted_count} stale peer record(s) from previous sessions")
     else:
-        print("🔄 No previously active peers found to reset")
+        print("🧹 No previous peer records found to clear")
 
     # Initialize Iroh node with document support
     options = iroh.NodeOptions()
