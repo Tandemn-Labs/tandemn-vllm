@@ -171,9 +171,11 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
     """Deploy model based on deployment instructions received from server."""
     global deployed_model, deployment_status
     
+    model_name = instructions.get('model_name', 'unknown')
+    
     # Check if model is already successfully deployed
     if deployment_status == "ready" and deployed_model is not None:
-        print(f"✅ Model already successfully deployed, skipping new deployment")
+        print(f"✅ Model {model_name} already successfully deployed, skipping new deployment")
         return True
     
     # Prevent multiple concurrent deployments
@@ -181,10 +183,25 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         print(f"⚠️ Deployment already in progress ({deployment_status}), skipping...")
         return False
     
+    # Track deployment attempts to prevent infinite retries
+    global deployment_attempts
+    if not hasattr(deploy_model_from_instructions, 'deployment_attempts'):
+        deploy_model_from_instructions.deployment_attempts = {}
+    
+    attempt_key = f"{model_name}_{hash(str(instructions['assigned_layers']))}"
+    current_attempts = deploy_model_from_instructions.deployment_attempts.get(attempt_key, 0)
+    
+    if current_attempts >= 3:
+        print(f"❌ Maximum deployment attempts (3) reached for {model_name}, giving up")
+        deployment_status = "failed"
+        return False
+    
+    deploy_model_from_instructions.deployment_attempts[attempt_key] = current_attempts + 1
+    print(f"🚀 Starting model deployment (attempt {current_attempts + 1}/3)...")
+
     try:
         deployment_status = "downloading"
-        print(f"🚀 Starting model deployment...")
-        print(f"   Model: {instructions['model_name']}")
+        print(f"   Model: {model_name}")
         print(f"   Assigned layers: {instructions['assigned_layers']}")
         print(f"   Is first peer: {instructions['is_first_peer']}")
         print(f"   Is last peer: {instructions['is_last_peer']}")
@@ -236,7 +253,10 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         print(f"✅ Model deployment completed successfully!")
         print(f"   Peer role: {'First' if instructions['is_first_peer'] else 'Last' if instructions['is_last_peer'] else 'Middle'}")
         print(f"   Loaded layers: {instructions['assigned_layers']}")
-        print(f"   Memory optimization: ~{100 * (22 - len(instructions['assigned_layers'])) / 22:.1f}% VRAM savings")
+        print(f"   Memory optimization: ~{100 * (28 - len(instructions['assigned_layers'])) / 28:.1f}% VRAM savings")
+        
+        # Clear attempts counter on success
+        deploy_model_from_instructions.deployment_attempts[attempt_key] = 0
         
         # Report completion to server
         await report_deployment_completion(instructions['model_name'], success=True)
