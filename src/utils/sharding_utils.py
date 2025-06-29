@@ -126,21 +126,23 @@ def create_dummy_model_file(config_dir: str):
     # Model norm
     dummy_weights["model.norm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
     
-    # Just ONE dummy transformer layer (minimal weights) - much smaller!
-    layer_prefix = "model.layers.0"
-    
-    # Attention
-    dummy_weights[f"{layer_prefix}.self_attn.qkv_proj.weight"] = torch.zeros(hidden_size * 3, hidden_size, dtype=torch.float16)
-    dummy_weights[f"{layer_prefix}.self_attn.o_proj.weight"] = torch.zeros(hidden_size, hidden_size, dtype=torch.float16)
-    
-    # MLP  
+    # Create dummy weights for ALL layers (not just layer 0)
     intermediate_size = config.get("intermediate_size", hidden_size * 4)
-    dummy_weights[f"{layer_prefix}.mlp.gate_up_proj.weight"] = torch.zeros(intermediate_size * 2, hidden_size, dtype=torch.float16)
-    dummy_weights[f"{layer_prefix}.mlp.down_proj.weight"] = torch.zeros(hidden_size, intermediate_size, dtype=torch.float16)
     
-    # Layer norms
-    dummy_weights[f"{layer_prefix}.input_layernorm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
-    dummy_weights[f"{layer_prefix}.post_attention_layernorm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
+    for layer_idx in range(num_layers):
+        layer_prefix = f"model.layers.{layer_idx}"
+        
+        # Attention
+        dummy_weights[f"{layer_prefix}.self_attn.qkv_proj.weight"] = torch.zeros(hidden_size * 3, hidden_size, dtype=torch.float16)
+        dummy_weights[f"{layer_prefix}.self_attn.o_proj.weight"] = torch.zeros(hidden_size, hidden_size, dtype=torch.float16)
+        
+        # MLP  
+        dummy_weights[f"{layer_prefix}.mlp.gate_up_proj.weight"] = torch.zeros(intermediate_size * 2, hidden_size, dtype=torch.float16)
+        dummy_weights[f"{layer_prefix}.mlp.down_proj.weight"] = torch.zeros(hidden_size, intermediate_size, dtype=torch.float16)
+        
+        # Layer norms
+        dummy_weights[f"{layer_prefix}.input_layernorm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
+        dummy_weights[f"{layer_prefix}.post_attention_layernorm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
     
     # Save dummy model
     model_path = config_path / "model.safetensors"

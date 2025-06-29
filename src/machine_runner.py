@@ -99,7 +99,7 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
             max_model_len=128,   # Small for demo
             disable_log_stats=True,
             skip_tokenizer_init=False,
-            gpu_memory_utilization=0.3,  # Use much less memory
+            gpu_memory_utilization=0.8,  # Use much less memory
             use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
         )
         
