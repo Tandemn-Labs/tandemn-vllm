@@ -11,6 +11,7 @@ import uuid
 import time
 from datetime import datetime
 from pathlib import Path
+from colorama import Fore, Style, init as colorama_init  # ADD
 
 from src.config.settings import (
     SERVER_HOST,
@@ -55,6 +56,15 @@ active_deployments = {}  # Track ongoing deployments by model_name
 # Constants for document keys
 TRIGGER_KEY = "job_trigger"  # Key for job initiation
 FINAL_RESULT_KEY = "final_result"  # Key for final computation result
+
+colorama_init(autoreset=True)
+COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
+peer_color_map = {}
+
+def _get_peer_color(peer_id: str):
+    if peer_id not in peer_color_map:
+        peer_color_map[peer_id] = COLORS[len(peer_color_map) % len(COLORS)]
+    return peer_color_map[peer_id]
 
 class HeartbeatRequest(BaseModel):
     """Schema for heartbeat POSTs from peers."""
@@ -1114,9 +1124,10 @@ async def get_deployment_status(model_name: str):
     }
 
 @app.post("/heartbeat")
-async def heartbeat_endpoint(hb: HeartbeatRequest):
+async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
     """Receive heartbeat from a peer and store metrics in MongoDB."""
     try:
+        peer_ip = request.client.host if request.client else "unknown"
         # Compact metrics object similar to previous format
         formatted_metrics = {
             "cpu_percent": hb.cpu,
@@ -1127,12 +1138,15 @@ async def heartbeat_endpoint(hb: HeartbeatRequest):
         }
         # Update MongoDB (time-series) using existing helper
         await update_peer_metrics(hb.peer_id, formatted_metrics)
-        # Mark peer active + last_seen
+        # Upsert peer record
         await _db[PEERS_COLLECTION].update_one(
-            {"_id": hb.peer_id},
-            {"$set": {"is_active": True, "last_seen": datetime.utcnow() }},
+            {"peer_id": hb.peer_id},
+            {"$set": {"peer_id": hb.peer_id, "ip": peer_ip, "is_active": True, "last_seen": datetime.utcnow()}},
             upsert=True
         )
+        # Colored log
+        color = _get_peer_color(hb.peer_id)
+        print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.free_vram:.1f} GB {Style.RESET_ALL}")
         return {"status": "ok"}
     except Exception as e:
         print(f"❌ Heartbeat processing failed: {e}")
