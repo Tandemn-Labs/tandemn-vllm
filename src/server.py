@@ -76,79 +76,79 @@ class HeartbeatRequest(BaseModel):
     total_free_vram_gb: Optional[float] = None
     timestamp: int
 
-async def monitor_and_acknowledge_heartbeats():
-    """Monitor peer heartbeats and send acknowledgments back to keep the connection alive."""
-    global doc, node
+# async def monitor_and_acknowledge_heartbeats():
+#     """Monitor peer heartbeats and send acknowledgments back to keep the connection alive."""
+#     global doc, node
     
-    print("💓 Starting heartbeat acknowledgment monitor...")
-    processed_peers = set()  # Track by peer_id instead of hash to prevent duplicates
-    last_cleanup = time.time()
+#     print("💓 Starting heartbeat acknowledgment monitor...")
+#     processed_peers = set()  # Track by peer_id instead of hash to prevent duplicates
+#     last_cleanup = time.time()
     
-    author = await node.authors().create()
-    while True:
-        try:
-            entries = await doc.get_many(iroh.Query.all(None))
-            current_time = time.time()
+#     author = await node.authors().create()
+#     while True:
+#         try:
+#             entries = await doc.get_many(iroh.Query.all(None))
+#             current_time = time.time()
             
-            # Periodic cleanup to prevent memory leaks
-            # if current_time - last_cleanup > 60:  # Clean up every minute
-            #     processed_peers.clear()
-            #     last_cleanup = current_time
-            #     print("🧹 Cleaned up processed peers set")
-            # print(entries)
-            for entry in entries:
-                key = entry.key().decode()
+#             # Periodic cleanup to prevent memory leaks
+#             # if current_time - last_cleanup > 60:  # Clean up every minute
+#             #     processed_peers.clear()
+#             #     last_cleanup = current_time
+#             #     print("🧹 Cleaned up processed peers set")
+#             # print(entries)
+#             for entry in entries:
+#                 key = entry.key().decode()
                 
-                # Look for heartbeat messages from peers (simplified format: heartbeat_{peer_id})
-                if key.startswith("heartbeat_") and not key.startswith("heartbeat_ack_"):
-                    # Extract peer_id from heartbeat key: heartbeat_{peer_id}
-                    try:
-                        parts = key.split("_")
-                        if len(parts) >= 2:
-                            peer_id = parts[1]
+#                 # Look for heartbeat messages from peers (simplified format: heartbeat_{peer_id})
+#                 if key.startswith("heartbeat_") and not key.startswith("heartbeat_ack_"):
+#                     # Extract peer_id from heartbeat key: heartbeat_{peer_id}
+#                     try:
+#                         parts = key.split("_")
+#                         if len(parts) >= 2:
+#                             peer_id = parts[1]
                             
-                            # # Skip if we already processed this peer recently
-                            # if peer_id in processed_peers:
-                            #     continue
+#                             # # Skip if we already processed this peer recently
+#                             # if peer_id in processed_peers:
+#                             #     continue
                             
-                            # Send acknowledgment back to peer (simplified format with static content)
-                            ack_key = f"heartbeat_ack_{peer_id}"
-                            ack_value = json.dumps({
-                                "server_id": server_peer_id,
-                                "status": "alive"
-                                # Removed changing ack_timestamp to prevent entry bloat
-                            }).encode()
+#                             # Send acknowledgment back to peer (simplified format with static content)
+#                             ack_key = f"heartbeat_ack_{peer_id}"
+#                             ack_value = json.dumps({
+#                                 "server_id": server_peer_id,
+#                                 "status": "alive"
+#                                 # Removed changing ack_timestamp to prevent entry bloat
+#                             }).encode()
                             
-                            await doc.set_bytes(author, ack_key.encode(), ack_value)
-                            processed_peers.add(peer_id)
-                            print(f"💓 Acknowledged heartbeat from {peer_id}")
+#                             await doc.set_bytes(author, ack_key.encode(), ack_value)
+#                             processed_peers.add(peer_id)
+#                             print(f"💓 Acknowledged heartbeat from {peer_id}")
                             
-                    except Exception as e:
-                        print(f"❌ Error processing heartbeat {key}: {e}")
+#                     except Exception as e:
+#                         print(f"❌ Error processing heartbeat {key}: {e}")
                 
-                # Look for deployment completion messages from peers
-                elif key.startswith("deployment_complete_"):
-                    try:
-                        hash_value = entry.content_hash()
-                        content = await node.blobs().read_to_bytes(hash_value)
-                        completion_data = json.loads(content.decode())
+#                 # Look for deployment completion messages from peers
+#                 elif key.startswith("deployment_complete_"):
+#                     try:
+#                         hash_value = entry.content_hash()
+#                         content = await node.blobs().read_to_bytes(hash_value)
+#                         completion_data = json.loads(content.decode())
                         
-                        model_name = completion_data.get("model_name")
-                        peer_id = completion_data.get("peer_id")
-                        success = completion_data.get("success", False)
+#                         model_name = completion_data.get("model_name")
+#                         peer_id = completion_data.get("peer_id")
+#                         success = completion_data.get("success", False)
                         
-                        if model_name and peer_id and model_name in active_deployments:
-                            status = "completed" if success else "failed"
-                            active_deployments[model_name]["completion_status"][peer_id] = status
-                            print(f"📝 Peer {peer_id} deployment {status} for {model_name}")
+#                         if model_name and peer_id and model_name in active_deployments:
+#                             status = "completed" if success else "failed"
+#                             active_deployments[model_name]["completion_status"][peer_id] = status
+#                             print(f"📝 Peer {peer_id} deployment {status} for {model_name}")
                             
-                    except Exception as e:
-                        print(f"❌ Error processing deployment completion {key}: {e}")
+#                     except Exception as e:
+#                         print(f"❌ Error processing deployment completion {key}: {e}")
             
-        except Exception as e:
-            print(f"❌ Error in heartbeat monitor: {e}")
+#         except Exception as e:
+#             print(f"❌ Error in heartbeat monitor: {e}")
         
-        await asyncio.sleep(2)  # Check every 2 seconds
+#         await asyncio.sleep(2)  # Check every 2 seconds
 
 class ModelEstimationRequest(BaseModel):
     model_id: str

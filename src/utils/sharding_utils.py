@@ -319,6 +319,7 @@ def extract_lm_head_weights_from_safetensors(
 ) -> Dict[str, torch.Tensor]:
     """
     Extract LM head weights directly from safetensors files.
+    Handles tied weights by falling back to embed_tokens.weight if lm_head.weight is not found.
     
     Args:
         model_name: HuggingFace model name
@@ -351,11 +352,19 @@ def extract_lm_head_weights_from_safetensors(
             # Load the safetensors file
             weights = load_file(local_path)
             
-            # Extract LM head weights
+            # Try to extract LM head weights
             lm_head_key = "lm_head.weight"
+            embed_key = "model.embed_tokens.weight"
+            
             if lm_head_key in weights:
                 lm_head_weights["lm_head.weight"] = weights[lm_head_key]
+                print("Found explicit lm_head.weight")
                 break  # Found LM head, no need to check other files
+            elif embed_key in weights:
+                # Handle tied weights - use embed_tokens as lm_head
+                lm_head_weights["lm_head.weight"] = weights[embed_key]
+                print("Using tied weights: model.embed_tokens.weight as lm_head.weight")
+                break  # Found embedding, can use as LM head
                 
         except Exception as e:
             print(f"Warning: Error processing {file_path}: {e}")
