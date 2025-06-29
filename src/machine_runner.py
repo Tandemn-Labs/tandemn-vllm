@@ -513,12 +513,11 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
         while True:
             try:
                 metrics = get_system_metrics()
-                total_free_vram = get_total_free_vram()
+                metrics_dict = format_metrics_for_db(metrics)
+                total_free_vram = metrics_dict["total_free_vram_gb"]
                 payload = {
                     "peer_id": peer_id,
-                    "cpu": metrics.cpu_percent,
-                    "ram": metrics.ram_percent,
-                    "free_vram": total_free_vram,
+                    **{k: v for k, v in metrics_dict.items() if k != "timestamp"},
                     "gpu_count": len(metrics.gpu_info),
                     "timestamp": int(time.time())
                 }

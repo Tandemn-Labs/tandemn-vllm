@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, Response
 from iroh.iroh_ffi import uniffi_set_event_loop
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import uuid
 import time
 from datetime import datetime
@@ -71,8 +71,9 @@ class HeartbeatRequest(BaseModel):
     peer_id: str
     cpu: float
     ram: float
-    free_vram: float
     gpu_count: int
+    gpu_info: Optional[List[Dict[str, Any]]] = None
+    total_free_vram_gb: Optional[float] = None
     timestamp: int
 
 async def monitor_and_acknowledge_heartbeats():
@@ -1132,8 +1133,9 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         formatted_metrics = {
             "cpu_percent": hb.cpu,
             "ram_percent": hb.ram,
-            "total_free_vram_gb": hb.free_vram,
+            "total_free_vram_gb": hb.total_free_vram_gb,
             "gpu_count": hb.gpu_count,
+            "gpu_info": hb.gpu_info or [],
             "timestamp": datetime.fromtimestamp(hb.timestamp)
         }
         # Update MongoDB (time-series) using existing helper
@@ -1146,7 +1148,7 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         )
         # Colored log
         color = _get_peer_color(hb.peer_id)
-        print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.free_vram:.1f} GB {Style.RESET_ALL}")
+        print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
         return {"status": "ok"}
     except Exception as e:
         print(f"❌ Heartbeat processing failed: {e}")
