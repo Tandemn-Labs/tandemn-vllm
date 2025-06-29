@@ -101,6 +101,7 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
             skip_tokenizer_init=False,
             gpu_memory_utilization=0.8,  # Use much less memory
             use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
+            load_format="dummy"     # ← this is the magic flag
         )
         
         print(f"✅ Successfully created vLLM model with selective layers!")
