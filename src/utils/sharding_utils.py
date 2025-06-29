@@ -94,63 +94,63 @@ def save_embedding_weights_vllm_format(embed_layer: nn.Module, output_path: str)
     }
     save_file(layer_state_dict, output_path)
 
-def create_dummy_model_file(config_dir: str):
-    """
-    Create a minimal dummy model.safetensors that vLLM can find.
-    Our custom loader will override these anyway.
+# def create_dummy_model_file(config_dir: str):
+#     """
+#     Create a minimal dummy model.safetensors that vLLM can find.
+#     Our custom loader will override these anyway.
     
-    Args:
-        config_dir: Path to the config directory where the dummy model should be saved
-    """
-    config_path = Path(config_dir)
+#     Args:
+#         config_dir: Path to the config directory where the dummy model should be saved
+#     """
+#     config_path = Path(config_dir)
     
-    # Load config to get model dimensions
-    with open(config_path / "config.json", "r") as f:
-        config = json.load(f)
+#     # Load config to get model dimensions
+#     with open(config_path / "config.json", "r") as f:
+#         config = json.load(f)
     
-    vocab_size = config["vocab_size"]
-    hidden_size = config["hidden_size"]
-    num_layers = config["num_hidden_layers"]
+#     vocab_size = config["vocab_size"]
+#     hidden_size = config["hidden_size"]
+#     num_layers = config["num_hidden_layers"]
     
-    print(f"Creating minimal dummy model file for {num_layers} layer model...")
+#     print(f"Creating minimal dummy model file for {num_layers} layer model...")
     
-    # Create minimal dummy weights (will be overridden by our loader)
-    dummy_weights = {}
+#     # Create minimal dummy weights (will be overridden by our loader)
+#     dummy_weights = {}
     
-    # Embedding
-    dummy_weights["model.embed_tokens.weight"] = torch.zeros(vocab_size, hidden_size, dtype=torch.float16)
+#     # Embedding
+#     dummy_weights["model.embed_tokens.weight"] = torch.zeros(vocab_size, hidden_size, dtype=torch.float16)
     
-    # LM head  
-    dummy_weights["lm_head.weight"] = torch.zeros(vocab_size, hidden_size, dtype=torch.float16)
+#     # LM head  
+#     dummy_weights["lm_head.weight"] = torch.zeros(vocab_size, hidden_size, dtype=torch.float16)
     
-    # Model norm
-    dummy_weights["model.norm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
+#     # Model norm
+#     dummy_weights["model.norm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
     
-    # Create dummy weights for ALL layers (not just layer 0)
-    intermediate_size = config.get("intermediate_size", hidden_size * 4)
+#     # Create dummy weights for ALL layers (not just layer 0)
+#     intermediate_size = config.get("intermediate_size", hidden_size * 4)
     
-    for layer_idx in range(num_layers):
-        layer_prefix = f"model.layers.{layer_idx}"
+#     for layer_idx in range(num_layers):
+#         layer_prefix = f"model.layers.{layer_idx}"
         
-        # Attention
-        dummy_weights[f"{layer_prefix}.self_attn.qkv_proj.weight"] = torch.zeros(hidden_size * 3, hidden_size, dtype=torch.float16)
-        dummy_weights[f"{layer_prefix}.self_attn.o_proj.weight"] = torch.zeros(hidden_size, hidden_size, dtype=torch.float16)
+#         # Attention
+#         dummy_weights[f"{layer_prefix}.self_attn.qkv_proj.weight"] = torch.zeros(hidden_size * 3, hidden_size, dtype=torch.float16)
+#         dummy_weights[f"{layer_prefix}.self_attn.o_proj.weight"] = torch.zeros(hidden_size, hidden_size, dtype=torch.float16)
         
-        # MLP  
-        dummy_weights[f"{layer_prefix}.mlp.gate_up_proj.weight"] = torch.zeros(intermediate_size * 2, hidden_size, dtype=torch.float16)
-        dummy_weights[f"{layer_prefix}.mlp.down_proj.weight"] = torch.zeros(hidden_size, intermediate_size, dtype=torch.float16)
+#         # MLP  
+#         dummy_weights[f"{layer_prefix}.mlp.gate_up_proj.weight"] = torch.zeros(intermediate_size * 2, hidden_size, dtype=torch.float16)
+#         dummy_weights[f"{layer_prefix}.mlp.down_proj.weight"] = torch.zeros(hidden_size, intermediate_size, dtype=torch.float16)
         
-        # Layer norms
-        dummy_weights[f"{layer_prefix}.input_layernorm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
-        dummy_weights[f"{layer_prefix}.post_attention_layernorm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
+#         # Layer norms
+#         dummy_weights[f"{layer_prefix}.input_layernorm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
+#         dummy_weights[f"{layer_prefix}.post_attention_layernorm.weight"] = torch.ones(hidden_size, dtype=torch.float16)
     
-    # Save dummy model
-    model_path = config_path / "model.safetensors"
-    save_file(dummy_weights, str(model_path))
+#     # Save dummy model
+#     model_path = config_path / "model.safetensors"
+#     save_file(dummy_weights, str(model_path))
     
-    print(f"Created minimal dummy model.safetensors with {len(dummy_weights)} weights")
-    print(f"Saved to: {model_path}")
-    print("NOTE: These are dummy weights that will be overridden by selective loader")
+#     print(f"Created minimal dummy model.safetensors with {len(dummy_weights)} weights")
+#     print(f"Saved to: {model_path}")
+#     print("NOTE: These are dummy weights that will be overridden by selective loader")
 
 def get_model_safetensors_files(model_name: str, hf_token: Optional[str] = None) -> List[str]:
     """
@@ -471,7 +471,7 @@ def shard_model_by_layers_safetensors(
     tokenizer.save_pretrained(config_dir)
     
     # Create minimal dummy model.safetensors for vLLM compatibility
-    create_dummy_model_file(str(config_dir))
+    # create_dummy_model_file(str(config_dir))
     
     # Create a metadata file
     metadata = {
