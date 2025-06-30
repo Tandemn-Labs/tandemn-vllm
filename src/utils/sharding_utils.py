@@ -583,149 +583,149 @@ def shard_model_by_layers_safetensors(
         "total_components": len(metadata["layer_components"])
     }
 
-def shard_model_by_layers(
-    model_name: str,
-    output_dir: str,
-    hf_token: Optional[str] = None,
-    cache_dir: Optional[str] = None,
-    model_layers_key: str = "model.layers"
-) -> Dict[str, Any]:
-    """
-    Shard a model by individual layers for vLLM compatibility.
+# def shard_model_by_layers(
+#     model_name: str,
+#     output_dir: str,
+#     hf_token: Optional[str] = None,
+#     cache_dir: Optional[str] = None,
+#     model_layers_key: str = "model.layers"
+# ) -> Dict[str, Any]:
+#     """
+#     Shard a model by individual layers for vLLM compatibility.
     
-    Args:
-        model_name: HuggingFace model name or path
-        output_dir: Directory to save sharded layers
-        hf_token: HuggingFace API token
-        cache_dir: Cache directory for model downloads
-        model_layers_key: Path to model layers in the model structure
+#     Args:
+#         model_name: HuggingFace model name or path
+#         output_dir: Directory to save sharded layers
+#         hf_token: HuggingFace API token
+#         cache_dir: Cache directory for model downloads
+#         model_layers_key: Path to model layers in the model structure
         
-    Returns:
-        Dictionary with sharding metadata and results
-    """
+#     Returns:
+#         Dictionary with sharding metadata and results
+#     """
     
-    print(f"Loading model {model_name}...")
+#     print(f"Loading model {model_name}...")
     
-    # Load model and tokenizer
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        cache_dir=cache_dir, 
-        torch_dtype=torch.float16,
-        device_map="cpu",  # Keep on CPU to avoid GPU memory issues
-        token=hf_token,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True  # Allow custom model code
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, 
-        cache_dir=cache_dir,
-        token=hf_token,
-        trust_remote_code=True  # Allow custom tokenizer code
-    )
-    config = AutoConfig.from_pretrained(
-        model_name, 
-        cache_dir=cache_dir,
-        token=hf_token,
-        trust_remote_code=True  # Allow custom config code
-    )
+#     # Load model and tokenizer
+#     model = AutoModelForCausalLM.from_pretrained(
+#         model_name, 
+#         cache_dir=cache_dir, 
+#         torch_dtype=torch.float16,
+#         device_map="cpu",  # Keep on CPU to avoid GPU memory issues
+#         token=hf_token,
+#         low_cpu_mem_usage=True,
+#         trust_remote_code=True  # Allow custom model code
+#     )
+#     tokenizer = AutoTokenizer.from_pretrained(
+#         model_name, 
+#         cache_dir=cache_dir,
+#         token=hf_token,
+#         trust_remote_code=True  # Allow custom tokenizer code
+#     )
+#     config = AutoConfig.from_pretrained(
+#         model_name, 
+#         cache_dir=cache_dir,
+#         token=hf_token,
+#         trust_remote_code=True  # Allow custom config code
+#     )
     
-    # Create output directory
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+#     # Create output directory
+#     output_path = Path(output_dir)
+#     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Save config and tokenizer (needed for all layers)
-    config_dir = output_path / "config"
-    config.save_pretrained(config_dir)
-    tokenizer.save_pretrained(config_dir)
+#     # Save config and tokenizer (needed for all layers)
+#     config_dir = output_path / "config"
+#     config.save_pretrained(config_dir)
+#     tokenizer.save_pretrained(config_dir)
     
-    # Create dummy model.safetensors for vLLM compatibility
-    create_dummy_model_file(str(config_dir))
+#     # Create dummy model.safetensors for vLLM compatibility
+#     create_dummy_model_file(str(config_dir))
     
-    # Create a metadata file
-    metadata = {
-        "model_name": model_name,
-        "model_type": config.model_type,
-        "num_layers": getattr(config, "num_hidden_layers", getattr(config, "n_layer", None)),
-        "hidden_size": getattr(config, "hidden_size", getattr(config, "n_embd", None)),
-        "layer_components": []
-    }
+#     # Create a metadata file
+#     metadata = {
+#         "model_name": model_name,
+#         "model_type": config.model_type,
+#         "num_layers": getattr(config, "num_hidden_layers", getattr(config, "n_layer", None)),
+#         "hidden_size": getattr(config, "hidden_size", getattr(config, "n_embd", None)),
+#         "layer_components": []
+#     }
     
-    print(f"Model has {metadata['num_layers']} hidden layers")
+#     print(f"Model has {metadata['num_layers']} hidden layers")
     
-    # 1. Save embedding layer (Llama-style only for TinyLlama)
-    if hasattr(model, "model"):  # Llama-style
-        embed_layer = model.model.embed_tokens
-        embed_path = output_path / "embedding" / "layer.safetensors"
-        embed_path.parent.mkdir(exist_ok=True)
-        save_embedding_weights_vllm_format(embed_layer, str(embed_path))
-        metadata["layer_components"].append({
-            "type": "embedding",
-            "path": "embedding/layer.safetensors", 
-            "component_name": "model.embed_tokens"
-        })
+#     # 1. Save embedding layer (Llama-style only for TinyLlama)
+#     if hasattr(model, "model"):  # Llama-style
+#         embed_layer = model.model.embed_tokens
+#         embed_path = output_path / "embedding" / "layer.safetensors"
+#         embed_path.parent.mkdir(exist_ok=True)
+#         save_embedding_weights_vllm_format(embed_layer, str(embed_path))
+#         metadata["layer_components"].append({
+#             "type": "embedding",
+#             "path": "embedding/layer.safetensors", 
+#             "component_name": "model.embed_tokens"
+#         })
         
-        # Get transformer layers
-        transformer_layers = rgetattr(model, model_layers_key)
-        layers_key = model_layers_key
+#         # Get transformer layers
+#         transformer_layers = rgetattr(model, model_layers_key)
+#         layers_key = model_layers_key
         
-    else:
-        raise ValueError(f"Unknown model structure for {model_name}")
+#     else:
+#         raise ValueError(f"Unknown model structure for {model_name}")
     
-    # 2. Save each transformer layer individually
-    layers_dir = output_path / "layers"
-    layers_dir.mkdir(exist_ok=True)
+#     # 2. Save each transformer layer individually
+#     layers_dir = output_path / "layers"
+#     layers_dir.mkdir(exist_ok=True)
     
-    for layer_idx, layer in enumerate(transformer_layers):
-        layer_path = layers_dir / f"layer_{layer_idx}.safetensors"
-        save_layer_weights_vllm_format(layer, str(layer_path), f"layers.{layer_idx}", layer_idx)
+#     for layer_idx, layer in enumerate(transformer_layers):
+#         layer_path = layers_dir / f"layer_{layer_idx}.safetensors"
+#         save_layer_weights_vllm_format(layer, str(layer_path), f"layers.{layer_idx}", layer_idx)
         
-        metadata["layer_components"].append({
-            "type": "transformer_layer",
-            "layer_index": layer_idx,
-            "path": f"layers/layer_{layer_idx}.safetensors",
-            "component_name": f"model.layers.{layer_idx}"
-        })
+#         metadata["layer_components"].append({
+#             "type": "transformer_layer",
+#             "layer_index": layer_idx,
+#             "path": f"layers/layer_{layer_idx}.safetensors",
+#             "component_name": f"model.layers.{layer_idx}"
+#         })
     
-    # 3. Save lm_head and model.norm (needed for complete model)
-    if hasattr(model, "lm_head"):
-        lm_head_path = output_path / "lm_head" / "layer.safetensors"
-        lm_head_path.parent.mkdir(exist_ok=True)
-        lm_head_state_dict = {"lm_head.weight": model.lm_head.weight.detach().cpu()}
-        save_file(lm_head_state_dict, str(lm_head_path))
-        metadata["layer_components"].append({
-            "type": "lm_head",
-            "path": "lm_head/layer.safetensors",
-            "component_name": "lm_head"
-        })
-        print("Saved lm_head weights")
+#     # 3. Save lm_head and model.norm (needed for complete model)
+#     if hasattr(model, "lm_head"):
+#         lm_head_path = output_path / "lm_head" / "layer.safetensors"
+#         lm_head_path.parent.mkdir(exist_ok=True)
+#         lm_head_state_dict = {"lm_head.weight": model.lm_head.weight.detach().cpu()}
+#         save_file(lm_head_state_dict, str(lm_head_path))
+#         metadata["layer_components"].append({
+#             "type": "lm_head",
+#             "path": "lm_head/layer.safetensors",
+#             "component_name": "lm_head"
+#         })
+#         print("Saved lm_head weights")
     
-    if hasattr(model.model, "norm"):
-        norm_path = output_path / "norm" / "layer.safetensors"
-        norm_path.parent.mkdir(exist_ok=True)
-        norm_state_dict = {"model.norm.weight": model.model.norm.weight.detach().cpu()}
-        save_file(norm_state_dict, str(norm_path))
-        metadata["layer_components"].append({
-            "type": "norm",
-            "path": "norm/layer.safetensors",
-            "component_name": "model.norm"
-        })
-        print("Saved model.norm weights")
+#     if hasattr(model.model, "norm"):
+#         norm_path = output_path / "norm" / "layer.safetensors"
+#         norm_path.parent.mkdir(exist_ok=True)
+#         norm_state_dict = {"model.norm.weight": model.model.norm.weight.detach().cpu()}
+#         save_file(norm_state_dict, str(norm_path))
+#         metadata["layer_components"].append({
+#             "type": "norm",
+#             "path": "norm/layer.safetensors",
+#             "component_name": "model.norm"
+#         })
+#         print("Saved model.norm weights")
     
-    # Save metadata
-    metadata_path = output_path / "layer_metadata.json"
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+#     # Save metadata
+#     metadata_path = output_path / "layer_metadata.json"
+#     with open(metadata_path, "w") as f:
+#         json.dump(metadata, f, indent=2)
     
-    print(f"Successfully sharded model into {len(metadata['layer_components'])} components")
-    print(f"Saved to: {output_path}")
+#     print(f"Successfully sharded model into {len(metadata['layer_components'])} components")
+#     print(f"Saved to: {output_path}")
     
-    # Clean up model from memory
-    del model
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+#     # Clean up model from memory
+#     del model
+#     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-    return {
-        "status": "success",
-        "output_dir": str(output_path),
-        "metadata": metadata,
-        "total_components": len(metadata["layer_components"])
-    } 
+#     return {
+#         "status": "success",
+#         "output_dir": str(output_path),
+#         "metadata": metadata,
+#         "total_components": len(metadata["layer_components"])
+#     } 
