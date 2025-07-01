@@ -28,7 +28,7 @@ from src.utils.db_utils import (
     db as _db,
     PEERS_COLLECTION
 )
-from src.utils.gpu_utils import get_system_metrics, format_metrics_for_db
+# from src.utils.gpu_utils import get_system_metrics, format_metrics_for_db
 from src.utils.model_utils import (
     download_config,
     estimate_parameters,
