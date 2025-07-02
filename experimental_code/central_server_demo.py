@@ -30,28 +30,12 @@ active_inferences = {}  # request_id -> inference_state
 
 # Add global gossip sink and callback
 trigger_gossip_sink = None
-completion_gossip_sink = None
 
 # Constants for 32-byte gossip topics
 TRIGGER_TOPIC = bytes("trigger_topic".ljust(32), "utf-8")[:32]
-COMPLETION_TOPIC = bytes("completion_topic".ljust(32), "utf-8")[:32]
 
 # Registered peers {pubkey_str: NodeAddr}
 peer_table: Dict[str, NodeAddr] = {}
-
-class CompletionCallback(iroh.GossipMessageCallback):
-    async def on_message(self, msg):
-        from iroh import MessageType
-        t = msg.type()
-        if t == MessageType.JOINED:
-            print("🔎 Completion mesh membership:", msg.as_joined())
-            return
-            
-        if t == MessageType.RECEIVED:
-            rc = msg.as_received()
-            result_data = json.loads(rc.content.decode())
-            await handle_inference_completion(result_data)
-            print(f"📥 Processed completion for request: {result_data.get('request_id')}")
 
 # No-op callback for sinks where we do not need to process inbound messages
 class NoopCallback(iroh.GossipMessageCallback):
@@ -83,7 +67,7 @@ DEMO_MODEL_CONFIG = {
 @app.on_event("startup")
 async def startup():
     """Initialize Iroh node and create shared document"""
-    global node, doc, ticket, server_id, trigger_gossip_sink, completion_gossip_sink
+    global node, doc, ticket, server_id, trigger_gossip_sink
     
     print("🚀 Starting Central Server...")
     
@@ -105,22 +89,13 @@ async def startup():
     # print(f"📎 Share this ticket with peers:\n{ticket}\n")
     
     # Setup gossip topics
-    # trigger_topic = b"inference_triggers" + bytes(server_id, 'utf-8')[:16]
     trigger_topic = bytes("trigger_topic".ljust(32), 'utf-8')[:32]  # Convert text to 32 bytes
-    # completion_topic = b"inference_completions" + bytes(server_id, 'utf-8')[:16]
-    completion_topic = bytes("completion_topic".ljust(32), 'utf-8')[:32]  # Convert text to 32 bytes
-    # Subscribe to completions (updated on heartbeat)
-    completion_cb = CompletionCallback()
-    completion_gossip_sink = await node.gossip().subscribe(COMPLETION_TOPIC, [], completion_cb)
-    print(f"📡 Subscribed to completions on topic: {COMPLETION_TOPIC} (will refresh on peer joins)")
     
     # Initialise trigger sink with zero peers for now
     await refresh_trigger_sink()
-    # Initialise completion sink with zero peers
-    await refresh_completion_sink()
     
-    # Start background task to debug document state
-    # asyncio.create_task(debug_doc_state())
+    print(f"✅ Central Server started: {server_id}")
+    print("📡 Using HTTP for completions instead of gossip")
 
 # Removed old monitoring function - now using subscription callback
 
@@ -252,18 +227,26 @@ async def refresh_trigger_sink():
     # Recreate sink each time to update peer set
     trigger_gossip_sink = await node.gossip().subscribe(TRIGGER_TOPIC, peer_ids, NoopCallback())
     print(f"📡 Trigger sink refreshed with peers: {peer_ids}")
+    # print(f"📡 Trigger sink refreshed with peers: {peer_ids}")
 
-async def refresh_completion_sink():
-    """(Re)create the completion gossip sink with current peer list."""
-    global completion_gossip_sink
-    peer_ids = list(peer_table.keys())
-    completion_gossip_sink = await node.gossip().subscribe(COMPLETION_TOPIC, peer_ids, CompletionCallback())
-    print(f"📡 Completion sink refreshed with peers: {peer_ids}")
 
 class Heartbeat(BaseModel):
     node_id: str
     addresses: List[str]
     relay_url: Optional[str] = None
+
+class CompletionData(BaseModel):
+    request_id: str
+    output_text: str
+    peer_id: str
+    timestamp: float
+
+@app.post("/completion")
+async def receive_completion(completion: CompletionData):
+    """Receive completion result from final peer"""
+    await handle_inference_completion(completion.dict())
+    print(f"📥 Received completion for request: {completion.request_id}")
+    return {"status": "ok"}
 
 @app.post("/heartbeat")
 async def register_peer(hb: Heartbeat):
@@ -274,7 +257,6 @@ async def register_peer(hb: Heartbeat):
     peer_table[hb.node_id] = addr
     print(f"🗒️ Active peers: {list(peer_table.keys())}")
     await refresh_trigger_sink()
-    await refresh_completion_sink()
     # Return server info so peer can connect back to us via gossip
     srv_addr = await node.net().node_addr()
     # Build peer list (excluding requester)
