@@ -42,7 +42,22 @@ from src.utils.model_utils import (
 
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandemn Server")
+import socket
 
+def get_ipv4_address():
+    """Get the server's own IPv4 address."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't have to be reachable
+        s.connect(('10.254.254.254', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
+
+SERVER_IP = get_ipv4_address()
 # Global Variables for Iroh Node and Gossip Management
 # IROH STARTS HERE
 node = None  # Iroh node instance
@@ -1148,7 +1163,7 @@ async def deploy_model(request: ModelDeploymentRequest):
                 "is_first_peer": is_first_peer,
                 "is_last_peer": is_last_peer,
                 "required_files": required_files,
-                "server_download_url": f"http://localhost:8000/download_file/{request.model_name.replace('/', '_')}",
+                "server_download_url": f"http://{SERVER_IP}:8000/download_file/{request.model_name.replace('/', '_')}", #TODO: change to server ip
                 "vram_allocation": peer_info
             }
         
