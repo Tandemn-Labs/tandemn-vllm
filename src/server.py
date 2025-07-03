@@ -5,6 +5,7 @@ import json
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, Response
 from iroh.iroh_ffi import uniffi_set_event_loop
+from iroh import PublicKey, NodeAddr
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import uuid
@@ -12,6 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from colorama import Fore, Style, init as colorama_init  # ADD
+from src.utils.sharding_utils import shard_model_by_layers_safetensors
 
 from src.config.settings import (
     SERVER_HOST,
@@ -36,16 +38,23 @@ from src.utils.model_utils import (
     calculate_max_layers_for_peer,
     distribute_layers_across_peers
 )
-from src.utils.sharding_utils import shard_model_by_layers, shard_model_by_layers_safetensors
+
 
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandemn Server")
 
-# Global variables for Iroh node and document management
+# Global Variables for Iroh Node and Gossip Management
 node = None  # Iroh node instance
-doc = None   # Iroh document instance
-ticket = None  # Document sharing ticket
-server_peer_id = None  # Unique identifier for this server instance
+trigger_gossip_sink = None
+active_inferences = {}
+TRIGGER_TOPIC = bytes("trigger_topic".ljust(32), "utf-8")[:32]
+peer_table: Dict[str,NodeAddr] = {}
+server_id = None  # Unique identifier for this server instance
+previous_peers = set()  # Track which peers we've seen
+
+
+# doc = None   # Iroh document instance
+# ticket = None  # Document sharing ticket
 
 # Task tracking for background operations
 background_tasks = {}  # Dict to track running background tasks
@@ -69,6 +78,9 @@ def _get_peer_color(peer_id: str):
 class HeartbeatRequest(BaseModel):
     """Schema for heartbeat POSTs from peers."""
     peer_id: str
+    node_id: str #iroh_node_id
+    addresses: List[str] #addresses
+    relay_url: Optional[str] = None #relay_url
     cpu: float
     ram: float
     gpu_count: int
@@ -76,79 +88,22 @@ class HeartbeatRequest(BaseModel):
     total_free_vram_gb: Optional[float] = None
     timestamp: int
 
-# async def monitor_and_acknowledge_heartbeats():
-#     """Monitor peer heartbeats and send acknowledgments back to keep the connection alive."""
-#     global doc, node
-    
-#     print("💓 Starting heartbeat acknowledgment monitor...")
-#     processed_peers = set()  # Track by peer_id instead of hash to prevent duplicates
-#     last_cleanup = time.time()
-    
-#     author = await node.authors().create()
-#     while True:
-#         try:
-#             entries = await doc.get_many(iroh.Query.all(None))
-#             current_time = time.time()
-            
-#             # Periodic cleanup to prevent memory leaks
-#             # if current_time - last_cleanup > 60:  # Clean up every minute
-#             #     processed_peers.clear()
-#             #     last_cleanup = current_time
-#             #     print("🧹 Cleaned up processed peers set")
-#             # print(entries)
-#             for entry in entries:
-#                 key = entry.key().decode()
-                
-#                 # Look for heartbeat messages from peers (simplified format: heartbeat_{peer_id})
-#                 if key.startswith("heartbeat_") and not key.startswith("heartbeat_ack_"):
-#                     # Extract peer_id from heartbeat key: heartbeat_{peer_id}
-#                     try:
-#                         parts = key.split("_")
-#                         if len(parts) >= 2:
-#                             peer_id = parts[1]
-                            
-#                             # # Skip if we already processed this peer recently
-#                             # if peer_id in processed_peers:
-#                             #     continue
-                            
-#                             # Send acknowledgment back to peer (simplified format with static content)
-#                             ack_key = f"heartbeat_ack_{peer_id}"
-#                             ack_value = json.dumps({
-#                                 "server_id": server_peer_id,
-#                                 "status": "alive"
-#                                 # Removed changing ack_timestamp to prevent entry bloat
-#                             }).encode()
-                            
-#                             await doc.set_bytes(author, ack_key.encode(), ack_value)
-#                             processed_peers.add(peer_id)
-#                             print(f"💓 Acknowledged heartbeat from {peer_id}")
-                            
-#                     except Exception as e:
-#                         print(f"❌ Error processing heartbeat {key}: {e}")
-                
-#                 # Look for deployment completion messages from peers
-#                 elif key.startswith("deployment_complete_"):
-#                     try:
-#                         hash_value = entry.content_hash()
-#                         content = await node.blobs().read_to_bytes(hash_value)
-#                         completion_data = json.loads(content.decode())
-                        
-#                         model_name = completion_data.get("model_name")
-#                         peer_id = completion_data.get("peer_id")
-#                         success = completion_data.get("success", False)
-                        
-#                         if model_name and peer_id and model_name in active_deployments:
-#                             status = "completed" if success else "failed"
-#                             active_deployments[model_name]["completion_status"][peer_id] = status
-#                             print(f"📝 Peer {peer_id} deployment {status} for {model_name}")
-                            
-#                     except Exception as e:
-#                         print(f"❌ Error processing deployment completion {key}: {e}")
-            
-#         except Exception as e:
-#             print(f"❌ Error in heartbeat monitor: {e}")
-        
-#         await asyncio.sleep(2)  # Check every 2 seconds
+class NoopCallback(iroh.GossipMessageCallback):
+    async def on_message(self, msg):
+        return
+
+# still has to change
+class InferenceRequest(BaseModel):
+    model_name: str
+    input_text: str
+    max_tokens: int = 100
+
+# still has to change
+class InferenceResponse(BaseModel):
+    request_id: str
+    status: str  # "processing", "completed", "failed"
+    result: Optional[str] = None
+    processing_time: Optional[float] = None
 
 class ModelEstimationRequest(BaseModel):
     model_id: str
@@ -171,12 +126,21 @@ class ModelDeploymentRequest(BaseModel):
     model_name: str
     shard_folder: str
 
+async def refresh_trigger_sink():
+    """(Re)create the trigger gossip sink with current peer list."""
+    global trigger_gossip_sink
+    peer_ids = list(peer_table.keys())  # list of node_id strings
+    # Recreate sink each time to update peer set
+    trigger_gossip_sink = await node.gossip().subscribe(TRIGGER_TOPIC, peer_ids, NoopCallback())
+    print(f"📡 Trigger sink refreshed with peers: {peer_ids}")
+
 
 
 @app.on_event("startup")
 async def startup():
     """Initialize the Iroh node and document on server startup"""
-    global node, doc, ticket, server_peer_id
+    # global node, doc, ticket, server_peer_id
+    global node, server_id, trigger_gossip_sink, active_inferences, TRIGGER_TOPIC, peer_table
 
     print("🚀 Starting Iroh Tandemn server...")
     # Configure async event loop for Iroh
@@ -186,22 +150,26 @@ async def startup():
     await setup_collections()
     print("✅ MongoDB collections configured")
 
-    # Clear all peer records on fresh server start to prevent stale data
+    # Clear all peer records on fresh server start to prevent stale data; comment all this for prod
     delete_result = await _db[PEERS_COLLECTION].delete_many({})
     if delete_result.deleted_count > 0:
         print(f"🧹 Cleared {delete_result.deleted_count} stale peer record(s) from previous sessions")
     else:
         print("🧹 No previous peer records found to clear")
+    # only need to do this when we are testing ^^^
 
-    # Initialize Iroh node with document support
+    # Initialize Iroh node with gossip support
     options = iroh.NodeOptions()
-    options.enable_docs = True
+    options.enable_gossip = True
     node = await iroh.Iroh.memory_with_options(options)
+    server_id = await node.net().node_id()
+    print(f"✅ Iroh node started with server_id: {server_id}")
+    await refresh_trigger_sink()    
+    # print("📡 Using HTTP for completions instead of gossip")    # options.enable_docs = True
 
-    # Create and share document
-    doc = await node.docs().create()
-    ticket = await doc.share(iroh.ShareMode.WRITE, iroh.AddrInfoOptions.RELAY_AND_ADDRESSES)
-    server_peer_id = await node.net().node_id()
+    # # Create and share document
+    # doc = await node.docs().create()
+    # ticket = await doc.share(iroh.ShareMode.WRITE, iroh.AddrInfoOptions.RELAY_AND_ADDRESSES)
 
     # Record initial system metrics
     # author = await node.authors().create()
@@ -219,13 +187,11 @@ async def startup():
     #     print(f"❌ Failed to send server metrics: {e}")
 
     # Join the document to enable updates
-    doc = await node.docs().join(ticket)
-    print("✅ Iroh node started")
-    print("📎 SHARE THIS TICKET WITH ALL INTERNAL MACHINES:\n")
-    print(str(ticket) + "\n")
+    # doc = await node.docs().join(ticket)
+    # print("✅ Iroh node started")
+    # print("📎 SHARE THIS TICKET WITH ALL INTERNAL MACHINES:\n")
+    # print(str(ticket) + "\n")
     
-    # NOTE: Heartbeats are now handled via HTTP /heartbeat endpoint, so the
-    # Iroh-based acknowledgment monitor is no longer needed.
 
 @app.get("/health")
 async def health():
@@ -268,6 +234,31 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
     """Receive heartbeat from a peer and store metrics in MongoDB."""
     try:
         peer_ip = request.client.host if request.client else "unknown"
+
+        # This is the part that adds the peer to the network 
+        # IROH STARTS HERE
+        pk = PublicKey.from_string(hb.node_id)
+        addr = NodeAddr(pk, hb.relay_url, hb.addresses)
+        await node.net().add_node_addr(addr)
+        peer_table[hb.node_id] = addr
+        if hb.peer_id not in previous_peers:
+            previous_peers.add(hb.peer_id)
+            await refresh_trigger_sink()
+            print(f"🗒️ New peer detected: {hb.peer_id}")
+        print(f"🗒️ Active peers: {list(peer_table.keys())}")
+        srv_addr = await node.net().node_addr()
+        # Build peer list (excluding requester)
+        peers_payload = []
+        for pid, naddr in peer_table.items():
+            if pid == hb.node_id:
+                continue
+            peers_payload.append({
+                "node_id": pid,
+                "addresses": naddr.direct_addresses(),
+                "relay_url": naddr.relay_url()
+            })
+        # IROH ENDS HERE
+        
         # Compact metrics object similar to previous format
         formatted_metrics = {
             "cpu_percent": hb.cpu,
@@ -277,18 +268,33 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
             "gpu_info": hb.gpu_info or [],
             "timestamp": datetime.fromtimestamp(hb.timestamp)
         }
+
         # Update MongoDB (time-series) using existing helper
         await update_peer_metrics(hb.peer_id, formatted_metrics)
         # Upsert peer record
         await _db[PEERS_COLLECTION].update_one(
             {"peer_id": hb.peer_id},
-            {"$set": {"peer_id": hb.peer_id, "ip": peer_ip, "is_active": True, "last_seen": datetime.utcnow()}},
+            {"$set": {"peer_id": hb.peer_id,
+                      "node_id": hb.node_id, 
+                      "ip": peer_ip,
+                       "is_active": True,
+                        "last_seen": datetime.utcnow()}},
             upsert=True
         )
         # Colored log
         color = _get_peer_color(hb.peer_id)
         print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
-        return {"status": "ok"}
+        # return {"status": "ok"}
+        # added some more information than just ok 
+        #IROH STARTS HERE
+        return {
+            "status": "ok",
+            "server_id": server_id,
+            "server_addresses": srv_addr.direct_addresses(),
+            "relay_url": srv_addr.relay_url(),
+            "peers": peers_payload
+        }
+        #IROH ENDS HERE
     except Exception as e:
         print(f"❌ Heartbeat processing failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -315,10 +321,10 @@ async def get_peer_metrics_endpoint(peer_id: str, time_window: int = 300):
             "detail": str(e)
         }
 
-@app.get("/ticket")
-async def get_ticket():
-    """Endpoint to retrieve the document sharing ticket"""
-    return {"ticket": str(ticket)}
+# @app.get("/ticket")
+# async def get_ticket():
+#     """Endpoint to retrieve the document sharing ticket"""
+#     return {"ticket": str(ticket)}
 
 @app.post("/estimate_model")
 async def estimate_model(request: ModelEstimationRequest):
@@ -436,45 +442,45 @@ async def identify_peers(request: ModelEstimationRequest):
             detail=f"Failed to identify suitable peers: {str(e)}"
         )
 
-@app.post("/start_job")
-async def start_job():
-    """Endpoint to initiate a distributed computation job"""
-    global doc, node
-    author = await node.authors().create()
+# @app.post("/start_job")
+# async def start_job():
+#     """Endpoint to initiate a distributed computation job"""
+#     global doc, node
+#     author = await node.authors().create()
 
-    # Define input matrix for computation
-    U = torch.tensor([[1., 2.], [3., 4.]])
+#     # Define input matrix for computation
+#     U = torch.tensor([[1., 2.], [3., 4.]])
 
-    try:
-        # Send job payload to the first machine in the pipeline
-        payload = json.dumps(U.tolist()).encode()
-        await doc.set_bytes(author, TRIGGER_KEY.encode(), payload)
-        print("🚀 Sent job payload to first machine")
-        return {"status": "triggered"}
-    except Exception as e:
-        print(f"❌ Failed to send job trigger: {e}")
-        return {"status": "error", "detail": str(e)}
+#     try:
+#         # Send job payload to the first machine in the pipeline
+#         payload = json.dumps(U.tolist()).encode()
+#         await doc.set_bytes(author, TRIGGER_KEY.encode(), payload)
+#         print("🚀 Sent job payload to first machine")
+#         return {"status": "triggered"}
+#     except Exception as e:
+#         print(f"❌ Failed to send job trigger: {e}")
+#         return {"status": "error", "detail": str(e)}
 
-@app.get("/result")
-async def get_final_result():
-    """Endpoint to retrieve the final computation result"""
-    try:
-        # Query all entries and look for the final result
-        query = iroh.Query.all(None)
-        entries = await doc.get_many(query)
+# @app.get("/result")
+# async def get_final_result():
+#     """Endpoint to retrieve the final computation result"""
+#     try:
+#         # Query all entries and look for the final result
+#         query = iroh.Query.all(None)
+#         entries = await doc.get_many(query)
 
-        for entry in reversed(entries):
-            if entry.key().decode() == FINAL_RESULT_KEY:
-                content = await node.blobs().read_to_bytes(entry.content_hash())
-                tensor = torch.tensor(json.loads(content.decode()))
-                return {
-                    "status": "success",
-                    "result": tensor.tolist()
-                }
+#         for entry in reversed(entries):
+#             if entry.key().decode() == FINAL_RESULT_KEY:
+#                 content = await node.blobs().read_to_bytes(entry.content_hash())
+#                 tensor = torch.tensor(json.loads(content.decode()))
+#                 return {
+#                     "status": "success",
+#                     "result": tensor.tolist()
+#                 }
 
-        return {"status": "waiting", "detail": "No final result yet."}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+#         return {"status": "waiting", "detail": "No final result yet."}
+#     except Exception as e:
+#         return {"status": "error", "detail": str(e)}
 
 @app.post("/calculate_peer_layers")
 async def calculate_peer_layers(request: ModelEstimationRequest, peer_id: str, available_vram_gb: float):

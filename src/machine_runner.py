@@ -12,6 +12,8 @@ from typing import List, Dict, Any, Optional
 import time
 import aiofiles
 from colorama import Fore, Style, init as colorama_init
+from iroh import PublicKey, NodeAddr
+
 
 # FORCE vLLM v0 mode (required for selective layer loading)
 os.environ["VLLM_USE_V1"] = "0"
@@ -379,35 +381,35 @@ def get_model_status() -> Dict[str, Any]:
 # EXISTING FUNCTIONALITY (Matrix computation, heartbeat, etc.)
 # ============================================================================
 
-async def get_shared_ticket():
-    """
-    Fetch the shared ticket from the server.
+# async def get_shared_ticket():
+#     """
+#     Fetch the shared ticket from the server.
     
-    Returns:
-        str: The shared ticket for joining the Iroh document
+#     Returns:
+#         str: The shared ticket for joining the Iroh document
         
-    Raises:
-        Exception: If unable to fetch the ticket from the server
-    """
-    try:
-        server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f'{server_url}/ticket')
-            response.raise_for_status()
-            ticket_data = response.json()
-            ticket = ticket_data["ticket"]
-            print(f"✅ Fetched shared ticket from server at {server_url}")
-            return ticket
-    except httpx.RequestError as e:
-        raise Exception(f"Failed to connect to server: {e}")
-    except httpx.HTTPStatusError as e:
-        raise Exception(f"Server returned error {e.response.status_code}: {e.response.text}")
-    except json.JSONDecodeError as e:
-        raise Exception(f"Invalid ticket format received: {e}")
-    except KeyError as e:
-        raise Exception(f"Missing 'ticket' field in server response")
-    except Exception as e:
-        raise Exception(f"Unexpected error fetching ticket: {e}")
+#     Raises:
+#         Exception: If unable to fetch the ticket from the server
+#     """
+#     try:
+#         server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
+#         async with httpx.AsyncClient() as client:
+#             response = await client.get(f'{server_url}/ticket')
+#             response.raise_for_status()
+#             ticket_data = response.json()
+#             ticket = ticket_data["ticket"]
+#             print(f"✅ Fetched shared ticket from server at {server_url}")
+#             return ticket
+#     except httpx.RequestError as e:
+#         raise Exception(f"Failed to connect to server: {e}")
+#     except httpx.HTTPStatusError as e:
+#         raise Exception(f"Server returned error {e.response.status_code}: {e.response.text}")
+#     except json.JSONDecodeError as e:
+#         raise Exception(f"Invalid ticket format received: {e}")
+#     except KeyError as e:
+#         raise Exception(f"Missing 'ticket' field in server response")
+#     except Exception as e:
+#         raise Exception(f"Unexpected error fetching ticket: {e}")
 
 async def send_blob(doc, author, peer_id: str, data: torch.Tensor):
     """
@@ -518,12 +520,35 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                 total_free_vram = metrics_dict["total_free_vram_gb"]
                 payload = {
                     "peer_id": peer_id,
+                    "node_id": peer_id,
+                    "addresses": node_addr_obj.direct_addresses(),
+                    "relay_url": node_addr_obj.relay_url(),
                     **{k: v for k, v in metrics_dict.items() if k != "timestamp"},
                     "gpu_count": len(metrics.gpu_info),
                     "timestamp": int(time.time())
                 }
                 r = await client.post(server_url, json=payload)
                 if r.status_code == 200:
+                    #IROH STARTS HERE
+                    # register the central server as the central peer
+                    data = r.json()
+                    print(f"🗒️ Received data: {data}")
+                    srv_id = data["server_id"]
+                    srv_addrs = data["server_addresses"]
+                    srv_relay = data["relay_url"]
+                    pk = PublicKey.from_string(srv_id)
+                    srv_node_addr = NodeAddr(pk, srv_relay, srv_addrs)
+                    await current_node.net().add_node_addr(srv_node_addr)
+                    # register the other peers as well for co-discovery
+                    for p in data.get("peers", []):
+                        peer_id = p["node_id"]
+                        peer_addrs = p["addresses"]
+                        peer_relay = p["relay_url"]
+                        pk = PublicKey.from_string(peer_id)
+                        peer_node_addr = NodeAddr(pk, peer_relay, peer_addrs)
+                        await current_node.net().add_node_addr(peer_node_addr)
+                    #IROH ENDS HERE
+
                     consecutive_failures = 0  # Reset on success
                     print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
                 else:
@@ -541,7 +566,7 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
 
 async def main():
     """Main function to run the distributed computation node"""
-    global current_doc, current_node, current_peer_id
+    global current_doc, current_node, current_peer_id, node_id_obj, node_addr_obj
     
     # Set up the asyncio event loop for Iroh
     uniffi_set_event_loop(asyncio.get_running_loop())
@@ -552,40 +577,43 @@ async def main():
     
     # Configure and initialize the Iroh node
     options = iroh.NodeOptions()
-    options.enable_docs = True
+    options.enable_gossip = True    
+    # options.enable_docs = True
     node = await iroh.Iroh.memory_with_options(options)
     peer_id = await node.net().node_id()
+    node_id_obj   = await node.net().node_id()
+    node_addr_obj = await node.net().node_addr()
     print(f"🤖 Running as peer: {peer_id}")
     
     # Set globals for completion reporting
     current_node = node
-    current_peer_id = peer_id
+    current_peer_id = peer_id # questionable if this is needed
 
+    heartbeat_task = asyncio.create_task(http_heartbeat_loop(peer_id))
     # Register this peer in MongoDB
     await register_peer(peer_id, hostname)
     print(f"✅ Registered in MongoDB as {peer_id}")
 
     # Fetch the shared ticket from the server
-    try:
-        shared_ticket = await get_shared_ticket()
-    except Exception as e:
-        print(f"❌ Failed to get shared ticket: {e}")
-        return
+    # try:  
+        # shared_ticket = await get_shared_ticket()
+    # except Exception as e:
+    #     print(f"❌ Failed to get shared ticket: {e}")
+    #     return
 
     # Join the shared document and create an author for writing
-    doc = await node.docs().join(iroh.DocTicket(shared_ticket))
-    author = await node.authors().create()
+    # doc = await node.docs().join(iroh.DocTicket(shared_ticket))
+    # author = await node.authors().create()
     
-    # Set global doc for completion reporting
-    current_doc = doc
+    # Set global doc for completion reporting   
+    # current_doc = doc
     
     # Start HTTP heartbeat loop (1 Hz by default)
-    heartbeat_task = asyncio.create_task(http_heartbeat_loop(peer_id))
     
     # Start deployment instruction monitoring as background task
-    deployment_task = asyncio.create_task(
-        monitor_deployment_instructions(doc, node, peer_id)
-    )
+    # deployment_task = asyncio.create_task(
+    #     monitor_deployment_instructions(doc, node, peer_id)
+    # )
 
     try:
         # Wait until this peer is included in the pipeline configuration
@@ -610,26 +638,26 @@ async def main():
         print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
 
         # Main processing loop - continuously process computation jobs
-        while True:
-            await process_once(doc, author, peer_id, next_peer, is_first, is_last, local_matrix, node)
-            await asyncio.sleep(2)  # Small delay between processing cycles
+        # while True:
+            # await process_once(doc, author, peer_id, next_peer, is_first, is_last, local_matrix, node)
+            # await asyncio.sleep(2)  # Small delay between processing cycles
 
     except Exception as e:
         print(f"❌ Error in main loop: {e}")
     finally:
         # Cancel background tasks
         heartbeat_task.cancel()
-        deployment_task.cancel()
+        # deployment_task.cancel()
         
         try:
             await heartbeat_task
         except asyncio.CancelledError:
             pass
             
-        try:
-            await deployment_task
-        except asyncio.CancelledError:
-            pass
+        # try:
+        #     await deployment_task
+        # except asyncio.CancelledError:
+        #     pass
         
         # Deregister peer when shutting down
         await deregister_peer(peer_id)
