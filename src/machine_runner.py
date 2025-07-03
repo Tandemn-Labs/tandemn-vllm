@@ -12,7 +12,7 @@ from typing import List, Dict, Any, Optional
 import time
 import aiofiles
 from colorama import Fore, Style, init as colorama_init
-from iroh import PublicKey, NodeAddr
+from iroh import PublicKey, NodeAddr, MessageType
 
 
 # FORCE vLLM v0 mode (required for selective layer loading)
@@ -55,6 +55,55 @@ MATRIX_MAP = {
     1: torch.tensor([[0., 1.], [1., 0.]]),  # Matrix B (second machine)
     2: torch.tensor([[1., 1.], [0., 1.]]),  # Matrix C (third machine)
 }
+
+# IROH STARTS HERE
+# IROH STARTS HERE
+class DeploymentGossipCallback(iroh.GossipMessageCallback):
+    "Handle deployment instructions received via gossip"
+    def __init__(self, node, peer_id):
+        super().__init__()
+        self.node = node
+        self.peer_id = peer_id
+
+    async def on_message(self, msg):
+        print("="*100)
+        print(f"�� [DEBUG] DeploymentGossipCallback received message")
+        t = msg.type()  # ✅ Call the method
+        print(f"🔍 [DEBUG] Message type: {t}")
+        print("="*100)
+        
+        if t == MessageType.JOINED:
+            print("🔎 Deployment mesh membership:", msg.as_joined())
+            return
+            
+        if t == MessageType.RECEIVED:
+            print(f"�� [DEBUG] Processing RECEIVED deployment message")
+            rc = msg.as_received()
+            print(f"🔍 [DEBUG] Message content length: {len(rc.content)} bytes")
+            
+            try:
+                payload = json.loads(rc.content.decode())  # ✅ Use content, not payload
+                print(f"🔍 [DEBUG] Parsed JSON payload: {list(payload.keys())}")
+                
+                # Check if this is a deployment instruction
+                if payload.get("action") != "deploy_model":
+                    print(f"🔍 [DEBUG] Not a deployment instruction, skipping")
+                    return
+                    
+                instructions = payload.get("instructions", {})
+                print(f"📨 Received deployment instructions for {self.peer_id}: {instructions}")
+                
+                # Deploy model in background
+                asyncio.create_task(deploy_model_from_instructions(instructions))
+                
+            except Exception as e:
+                print(f"❌ Error handling deployment instruction: {e}")
+                print(f"❌ Exception type: {type(e)}")
+                import traceback
+                traceback.print_exc()
+# IROH ENDS HERE
+# IROH ENDS HERE
+
 
 # ============================================================================
 # SELECTIVE LAYER LOADING IMPLEMENTATION  
@@ -511,6 +560,7 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
     consecutive_failures = 0
     max_failures = 5  # ~5 seconds tolerance
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
+    deployment_subscribed = False  # Track if we've subscribed to deployment
 
     async with httpx.AsyncClient(timeout=2.0) as client:
         while True:
@@ -548,6 +598,13 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                         peer_node_addr = NodeAddr(pk, peer_relay, peer_addrs)
                         await current_node.net().add_node_addr(peer_node_addr)
                     #IROH ENDS HERE
+                    bootstrap_peers = [srv_id] + [p["node_id"] for p in data.get("peers", [])]
+                    print(f"🔗 Bootstrap peers: {bootstrap_peers}")
+                    if not deployment_subscribed:
+                        deployment_topic = bytes("deployment_topic".ljust(32), 'utf-8')[:32]
+                        await current_node.gossip().subscribe(deployment_topic, bootstrap_peers, DeploymentGossipCallback(current_node, peer_id))
+                        deployment_subscribed = True
+                        print(f"🎯 Subscribed to deployment instructions on topic {deployment_topic}")
 
                     consecutive_failures = 0  # Reset on success
                     print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
@@ -565,9 +622,11 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
             await asyncio.sleep(interval_s)
 
 async def main():
+
     """Main function to run the distributed computation node"""
     global current_doc, current_node, current_peer_id, node_id_obj, node_addr_obj
     
+    bootstrap_peers=[]
     # Set up the asyncio event loop for Iroh
     uniffi_set_event_loop(asyncio.get_running_loop())
 
@@ -578,8 +637,8 @@ async def main():
     # Configure and initialize the Iroh node
     options = iroh.NodeOptions()
     options.enable_gossip = True    
-    # options.enable_docs = True
     node = await iroh.Iroh.memory_with_options(options)
+
     peer_id = await node.net().node_id()
     node_id_obj   = await node.net().node_id()
     node_addr_obj = await node.net().node_addr()
@@ -589,10 +648,28 @@ async def main():
     current_node = node
     current_peer_id = peer_id # questionable if this is needed
 
+    # start heartbeat loop
     heartbeat_task = asyncio.create_task(http_heartbeat_loop(peer_id))
     # Register this peer in MongoDB
     await register_peer(peer_id, hostname)
     print(f"✅ Registered in MongoDB as {peer_id}")
+
+    await asyncio.sleep(1)
+    # # Subscribe to inference triggers
+    # trigger_topic = bytes("trigger_topic".ljust(32), 'utf-8')[:32]
+    # await node.gossip().subscribe(trigger_topic, bootstrap_peers, TriggerCallback(processor))
+
+    # # Subscribe to hidden-state transfers
+    # hidden_topic = bytes("hidden_state_topic".ljust(32), 'utf-8')[:32]
+    # await node.gossip().subscribe(hidden_topic, bootstrap, HiddenStateCallback(processor))
+
+    # --- NEW: subscribe to deployment instructions ---
+    # deployment_topic = bytes("deployment_topic".ljust(32), 'utf-8')[:32]
+    # await node.gossip().subscribe(deployment_topic, bootstrap_peers, DeploymentGossipCallback(node, peer_id))
+    # print(f"🎯 Subscribed to deployment instructions on topic {deployment_topic}")
+
+
+
 
     # Fetch the shared ticket from the server
     # try:  
@@ -638,9 +715,10 @@ async def main():
         print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
 
         # Main processing loop - continuously process computation jobs
-        # while True:
+        while True:
+            print("🔄 Processing...")
             # await process_once(doc, author, peer_id, next_peer, is_first, is_last, local_matrix, node)
-            # await asyncio.sleep(2)  # Small delay between processing cycles
+            await asyncio.sleep(2)  # Small delay between processing cycles
 
     except Exception as e:
         print(f"❌ Error in main loop: {e}")

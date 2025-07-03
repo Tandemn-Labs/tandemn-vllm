@@ -44,10 +44,15 @@ from src.utils.model_utils import (
 app = FastAPI(title="Iroh Tandemn Server")
 
 # Global Variables for Iroh Node and Gossip Management
+# IROH STARTS HERE
 node = None  # Iroh node instance
 trigger_gossip_sink = None
+deployment_gossip_sink = None
 active_inferences = {}
 TRIGGER_TOPIC = bytes("trigger_topic".ljust(32), "utf-8")[:32]
+DEPLOYMENT_TOPIC = bytes("deployment_topic".ljust(32), "utf-8")[:32]
+# IROH ENDS HERE
+
 peer_table: Dict[str,NodeAddr] = {}
 server_id = None  # Unique identifier for this server instance
 previous_peers = set()  # Track which peers we've seen
@@ -126,6 +131,7 @@ class ModelDeploymentRequest(BaseModel):
     model_name: str
     shard_folder: str
 
+# IROH STARTS HERE
 async def refresh_trigger_sink():
     """(Re)create the trigger gossip sink with current peer list."""
     global trigger_gossip_sink
@@ -134,7 +140,17 @@ async def refresh_trigger_sink():
     trigger_gossip_sink = await node.gossip().subscribe(TRIGGER_TOPIC, peer_ids, NoopCallback())
     print(f"📡 Trigger sink refreshed with peers: {peer_ids}")
 
-
+async def refresh_deployment_sink():
+    """(Re)create the deployment gossip sink with current peer list."""
+    global deployment_gossip_sink
+    peer_ids = list(peer_table.keys())  # list of node_id strings
+    # Recreate sink each time to update peer set
+    deployment_gossip_sink = await node.gossip().subscribe(
+        DEPLOYMENT_TOPIC,
+        peer_ids,
+        NoopCallback())
+    print(f"📡 Deployment sink refreshed with peers: {peer_ids}")
+# IROH ENDS HERE
 
 @app.on_event("startup")
 async def startup():
@@ -158,13 +174,17 @@ async def startup():
         print("🧹 No previous peer records found to clear")
     # only need to do this when we are testing ^^^
 
-    # Initialize Iroh node with gossip support
+    # IROH STARTS HERE
     options = iroh.NodeOptions()
     options.enable_gossip = True
     node = await iroh.Iroh.memory_with_options(options)
     server_id = await node.net().node_id()
     print(f"✅ Iroh node started with server_id: {server_id}")
+
     await refresh_trigger_sink()    
+    await refresh_deployment_sink()
+    # IROH ENDS HERE
+    
     # print("📡 Using HTTP for completions instead of gossip")    # options.enable_docs = True
 
     # # Create and share document
@@ -999,7 +1019,7 @@ async def deploy_model(request: ModelDeploymentRequest):
     Returns:
         Deployment status and peer assignments
     """
-    global active_deployments
+    global active_deployments, deployment_gossip_sink
     
     try:
         # Check if deployment is already in progress
@@ -1133,23 +1153,18 @@ async def deploy_model(request: ModelDeploymentRequest):
             }
         
         # 5. Send deployment instructions to each peer via Iroh
-        global doc, node
-        author = await node.authors().create()
-        
+        # IROH STARTS HERE
         for peer_id, instructions in deployment_instructions.items():
             try:
-                instruction_key = f"deploy_instruction_{peer_id}_{int(time.time())}"
-                instruction_data = json.dumps({
+                payload = json.dumps({
                     "action": "deploy_model",
                     "instructions": instructions
                 }).encode()
-                
-                await doc.set_bytes(author, instruction_key.encode(), instruction_data)
+                await deployment_gossip_sink.broadcast(payload)
                 print(f"📤 Sent deployment instructions to {peer_id}")
-                
             except Exception as e:
                 print(f"❌ Failed to send instructions to {peer_id}: {e}")
-        
+        # IROH ENDS HERE
         print(f"✅ Deployment initiated for {request.model_name}")
         print(f"📊 Distribution: {len(deployment_instructions)} peers")
         
@@ -1169,6 +1184,42 @@ async def deploy_model(request: ModelDeploymentRequest):
             "deployment_instructions": deployment_instructions,
             "message": f"Deployment instructions sent to {len(deployment_instructions)} peers. Peers will download required files and load model."
         }
+        # global doc, node
+        # author = await node.authors().create()
+        
+        # for peer_id, instructions in deployment_instructions.items():
+        #     try:
+        #         instruction_key = f"deploy_instruction_{peer_id}_{int(time.time())}"
+        #         instruction_data = json.dumps({
+        #             "action": "deploy_model",
+        #             "instructions": instructions
+        #         }).encode()
+                
+        #         await doc.set_bytes(author, instruction_key.encode(), instruction_data)
+        #         print(f"📤 Sent deployment instructions to {peer_id}")
+                
+        #     except Exception as e:
+        #         print(f"❌ Failed to send instructions to {peer_id}: {e}")
+        
+        # print(f"✅ Deployment initiated for {request.model_name}")
+        # print(f"📊 Distribution: {len(deployment_instructions)} peers")
+        
+        # # Keep deployment as in_progress - peers will update status when done
+        # # DON'T mark as completed here - instructions were just sent, not completed!
+        # active_deployments[request.model_name].update({
+        #     "instructions_sent_at": time.time(),
+        #     "deployment_map": {peer_id: info["assigned_layers"] for peer_id, info in deployment_instructions.items()},
+        #     "completion_status": {peer_id: "pending" for peer_id in deployment_instructions.keys()}
+        # })
+
+        # return {
+        #     "status": "deployment_initiated",
+        #     "model_name": request.model_name,
+        #     "total_peers": len(deployment_instructions),
+        #     "distribution_plan": distribution_plan,
+        #     "deployment_instructions": deployment_instructions,
+        #     "message": f"Deployment instructions sent to {len(deployment_instructions)} peers. Peers will download required files and load model."
+        # }
 
     except HTTPException:
         # Clean up deployment tracking on error
