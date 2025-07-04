@@ -387,7 +387,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             print(f"❌ Config directory not found: {config_dir}")
             deployment_status = "failed"
             return False
-        
+        print("Loading only a partial model for vLLM Inference")
         deployed_model = create_dynamic_vllm_model(
             model_dir=str(config_dir),
             assigned_layers=instructions["assigned_layers"]
@@ -838,12 +838,12 @@ async def main():
         is_first = index == 0
         is_last = index == len(pipeline) - 1
         next_peer = pipeline[index + 1] if not is_last else None
-        local_matrix = MATRIX_MAP.get(index)
-        if local_matrix is None:
-            print(f"❌ No matrix found for pipeline index {index}")
-            return
+        # local_matrix = MATRIX_MAP.get(index)
+        # if local_matrix is None:
+        #     print(f"❌ No matrix found for pipeline index {index}")
+        #     return
 
-        print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
+        # print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
 
         # Main processing loop - continuously process computation jobs
         while True:

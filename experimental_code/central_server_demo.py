@@ -112,10 +112,6 @@ async def handle_inference_completion(result_data: dict):
         
         print(f"✅ Inference {request_id} completed in {inference_state['processing_time']:.2f}s")
 
-@app.get("/ticket")
-async def get_ticket():
-    """Get the shared document ticket for peers to join"""
-    return {"ticket": str(ticket)}
 
 @app.post("/infer", response_model=InferenceResponse)
 async def start_inference(request: InferenceRequest):
