@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from colorama import Fore, Style, init as colorama_init  # ADD
 from src.utils.sharding_utils import shard_model_by_layers_safetensors
+from transformers import AutoTokenizer
+import os
 
 from src.config.settings import (
     SERVER_HOST,
@@ -669,99 +671,6 @@ async def get_peer_layer_capacity(peer_id: str, model_id: str, qbits: int = DEFA
             detail=f"Failed to get layer capacity for peer {peer_id}: {str(e)}"
         )
 
-# def run_sharding_task(task_id: str, request: ModelShardingRequest):
-#     """Background task function to run model sharding."""
-#     try:
-#         # Update task status
-#         background_tasks[task_id]["status"] = "running"
-#         background_tasks[task_id]["started_at"] = datetime.now().isoformat()
-        
-#         # Extract model name for directory naming
-#         model_name_safe = request.model_id.replace("/", "_").replace("\\", "_")
-#         output_dir = f"./shards/{model_name_safe}"
-        
-#         print(f"🔪 Starting background layer sharding for {request.model_id}")
-#         print(f"📁 Output directory: {output_dir}")
-        
-#         # Call the sharding function
-#         result = shard_model_by_layers(
-#             model_name=request.model_id,
-#             output_dir=output_dir,
-#             hf_token=request.hf_token,
-#             cache_dir=request.cache_dir,
-#             model_layers_key=request.model_layers_key
-#         )
-        
-#         # Update task with successful result
-#         background_tasks[task_id].update({
-#             "status": "completed",
-#             "completed_at": datetime.now().isoformat(),
-#             "result": {
-#                 "model_id": request.model_id,
-#                 "output_directory": result["output_dir"],
-#                 "total_components": result["total_components"],
-#                 "metadata": result["metadata"],
-#                 "message": f"Successfully created {result['total_components']} layer components"
-#             }
-#         })
-        
-#         print(f"✅ Background sharding completed for {request.model_id}")
-        
-#     except Exception as e:
-#         # Update task with error
-#         background_tasks[task_id].update({
-#             "status": "failed",
-#             "completed_at": datetime.now().isoformat(),
-#             "error": str(e)
-#         })
-#         print(f"❌ Background sharding failed for {request.model_id}: {e}")
-
-# def run_sharding_safetensors_task(task_id: str, request: ModelShardingSafetensorsRequest):
-#     """Background task function to run safetensors-based model sharding."""
-#     try:
-#         # Update task status
-#         background_tasks[task_id]["status"] = "running"
-#         background_tasks[task_id]["started_at"] = datetime.now().isoformat()
-        
-#         # Extract model name for directory naming
-#         model_name_safe = request.model_id.replace("/", "_").replace("\\", "_")
-#         output_dir = f"./shards/{model_name_safe}"
-        
-#         print(f"🔪 Starting background safetensors-based layer sharding for {request.model_id}")
-#         print(f"📁 Output directory: {output_dir}")
-        
-#         # Call the safetensors-based sharding function
-#         result = shard_model_by_layers_safetensors(
-#             model_name=request.model_id,
-#             output_dir=output_dir,
-#             hf_token=request.hf_token,
-#             cache_dir=request.cache_dir
-#         )
-        
-#         # Update task with successful result
-#         background_tasks[task_id].update({
-#             "status": "completed",
-#             "completed_at": datetime.now().isoformat(),
-#             "result": {
-#                 "model_id": request.model_id,
-#                 "output_directory": result["output_dir"],
-#                 "total_components": result["total_components"],
-#                 "metadata": result["metadata"],
-#                 "message": f"Successfully created {result['total_components']} layer components using safetensors processing"
-#             }
-#         })
-        
-#         print(f"✅ Background safetensors-based sharding completed for {request.model_id}")
-        
-#     except Exception as e:
-#         # Update task with error
-#         background_tasks[task_id].update({
-#             "status": "failed",
-#             "completed_at": datetime.now().isoformat(),
-#             "error": str(e)
-#         })
-#         print(f"❌ Background safetensors-based sharding failed for {request.model_id}: {e}")
-
 async def run_sharding_safetensors_task(task_id: str, request: ModelShardingSafetensorsRequest):
     """Background task function to run safetensors-based model sharding."""
     # Update task status
@@ -809,44 +718,6 @@ async def run_sharding_safetensors_task(task_id: str, request: ModelShardingSafe
         print(f"❌ Background safetensors-based sharding failed for {request.model_id}: {e}")
 
 
-# @app.post("/create_layer_shards")
-# async def create_layer_shards(request: ModelShardingRequest, background_tasks_runner: BackgroundTasks):
-#     """
-#     Start layer sharding for a model in the background.
-    
-#     Args:
-#         request: ModelShardingRequest containing model_id, hf_token, and optional parameters
-#         background_tasks_runner: FastAPI background tasks runner
-        
-#     Returns:
-#         Task ID for tracking the sharding progress
-#     """
-#     # Generate unique task ID
-#     task_id = str(uuid.uuid4())
-    
-#     # Initialize task tracking
-#     background_tasks[task_id] = {
-#         "task_id": task_id,
-#         "model_id": request.model_id,
-#         "status": "queued",
-#         "created_at": datetime.now().isoformat(),
-#         "started_at": None,
-#         "completed_at": None,
-#         "result": None,
-#         "error": None
-#     }
-    
-#     # Start background task
-#     background_tasks_runner.add_task(run_sharding_task, task_id, request)
-    
-#     print(f"🚀 Queued layer sharding task {task_id} for {request.model_id}")
-    
-#     return {
-#         "status": "queued",
-#         "task_id": task_id,
-#         "model_id": request.model_id,
-#         "message": "Layer sharding task started in background. Use /task_status/{task_id} to check progress."
-#     }
 
 @app.post("/create_layer_shards_safetensors")
 async def create_layer_shards_safetensors(request: ModelShardingSafetensorsRequest, background_tasks_runner: BackgroundTasks):
@@ -1258,6 +1129,126 @@ async def get_deployment_status(model_name: str):
         "started_at": deployment.get("started_at"),
         "instructions_sent_at": deployment.get("instructions_sent_at")
     }
+
+class DeploymentCompleteData(BaseModel):
+    model_name: str
+    peer_id: str
+    success: bool
+
+@app.post("/deployment_complete")
+async def deployment_complete(data: DeploymentCompleteData):
+    global active_deployments
+    """
+    Receive deployment‐done reports from peers.
+    """
+    print(f"🔍 [DEBUG] Deployment complete received for model {data.model_name} from peer {data.peer_id}")
+    if data.model_name not in active_deployments:
+        raise HTTPException(404, f"No deployment found for model {data.model_name}")
+
+    status_map = active_deployments[data.model_name]["completion_status"]
+    if data.peer_id not in status_map:
+        raise HTTPException(400, f"Peer {data.peer_id} not in deployment")
+
+    status_map[data.peer_id] = "success" if data.success else "failed"
+    # If every peer succeeded, mark the whole deployment ready; if any failed, fail it.
+    if all(s == "success" for s in status_map.values()):
+        active_deployments[data.model_name]["status"] = "ready"
+        print(f"✅ Deployment for {data.model_name} is now READY")
+    elif any(s == "failed" for s in status_map.values()):
+        active_deployments[data.model_name]["status"] = "failed"
+        print(f"❌ Deployment for {data.model_name} has FAILED")
+
+    return {"status": "ok"}
+
+class CompletionData(BaseModel):
+    request_id: str
+    output_text: str
+    peer_id: str
+    timestamp: int
+
+@app.post("/completion")
+async def completion(completion: CompletionData):
+    """
+    Receive completion data from a peer.
+    """
+    request_id = completion.request_id
+    if request_id in active_inferences:
+        inference_state = active_inferences[request_id]
+        inference_state["status"] = "completed"
+        inference_state["result"] = completion.output_text
+        inference_state["completed_at"] = time.time()
+        inference_state["processing_time"] = inference_state["completed_at"] - inference_state["started_at"]
+        print(f"✅ Inference {request_id} completed in {inference_state['processing_time']:.2f}s")
+    return {"status": "ok"}
+
+# new inference request model
+class InferenceRequest(BaseModel):
+    model_name: str
+    input_text: str
+    max_tokens: int = 100
+
+#IROH STARTS HERE
+@app.post("/infer")
+async def infer(request: InferenceRequest):
+    "Start Distributed Inference for a given model, across the peer network"
+    global trigger_gossip_sink, active_deployments, active_inferences
+
+    #0. Check if model deployed or not
+    if request.model_name not in active_deployments:
+        raise HTTPException(status_code=404, detail=f"No deployment found for model {request.model_name}")
+    
+    # check if deployment is ready
+    if active_deployments[request.model_name]["status"] != "ready":
+        raise HTTPException(status_code=404, detail=f"Deployment for model {request.model_name} is not ready")
+    
+    #1. Get the deployment instructions
+    deployment_map = active_deployments[request.model_name]["deployment_map"]
+    if not deployment_map:
+        raise HTTPException(status_code=404, detail=f"No deployment map found for model {request.model_name}")
+
+    #2. Send the trigger to the first peer
+    request_id = f"req_{int(time.time() * 1000)}_{len(active_inferences)}"
+    active_inferences[request_id] = {
+        "status": "processing",
+        "model_name": request.model_name,
+        "request_id": request_id,
+        "started_at": time.time(),
+        "result": None
+    }
+    
+    #3. Construct the pipeline from the deployment map
+    # The map is {peer_id: [layer_indices]}, we need an ordered list of peer_ids
+    pipeline = list(deployment_map.keys())
+
+    #4. Prepare input text and sampling parameters
+    sampling_params = {"max_tokens": request.max_tokens}
+    #4. Create the instruction payload
+    inference_payload = {
+        "action": "start_inference",
+        "request_id": request_id,
+        "model_name": request.model_name,
+        "input_text": request.input_text,
+        "pipeline": pipeline,
+        "sampling_params": sampling_params,
+        "assigned_layers": deployment_map,
+        "timestamp": time.time()
+    }
+    instruction_payload = json.dumps(inference_payload).encode()
+    
+
+    #5. Broadcast the instruction payload to the first peer
+    await refresh_trigger_sink() 
+    await trigger_gossip_sink.broadcast(instruction_payload)
+
+    print(f"🚀 Inference {request_id} started for model {request.model_name}")
+    return InferenceResponse(
+        request_id=request_id,
+        status="processing",
+        result=None,
+        processing_time=None
+    )
+#IROH ENDS HERE
+
 
 
 

@@ -13,7 +13,9 @@ import time
 import aiofiles
 from colorama import Fore, Style, init as colorama_init
 from iroh import PublicKey, NodeAddr, MessageType
-
+from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT
+import pickle
+from vllm import SamplingParams
 
 # FORCE vLLM v0 mode (required for selective layer loading)
 os.environ["VLLM_USE_V1"] = "0"
@@ -39,11 +41,13 @@ from src.utils.gpu_utils import (
 # Global variables for deployed model
 deployed_model = None
 deployment_status = "idle"  # idle, downloading, loading, ready, failed
+start_inference_run = None # this is the global variable for the inference run
+assigned_layers_global=[] # this is the global variable for the assigned layers
 
 # Global Iroh objects for completion reporting
-current_doc = None
 current_node = None 
 current_peer_id = None
+hidden_state_gossip_sink = None # this is the gossip sink for the hidden states
 
 # Constants for document keys
 TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
@@ -56,7 +60,6 @@ MATRIX_MAP = {
     2: torch.tensor([[1., 1.], [0., 1.]]),  # Matrix C (third machine)
 }
 
-# IROH STARTS HERE
 # IROH STARTS HERE
 class DeploymentGossipCallback(iroh.GossipMessageCallback):
     "Handle deployment instructions received via gossip"
@@ -102,9 +105,96 @@ class DeploymentGossipCallback(iroh.GossipMessageCallback):
                 import traceback
                 traceback.print_exc()
 # IROH ENDS HERE
+
+# IROH STARTS HERE
+class HiddenStateCallback(iroh.GossipMessageCallback):
+    "handles the hidden state gossip messages"
+    async def on_message(self, msg):
+        if msg.type()!=MessageType.RECEIVED:
+            print(f"🔍 [DEBUG] HiddenStateCallback received non-RECEIVED message")
+            return
+        try:
+            ref = json.loads(msg.as_received().content.decode())
+            request_id=ref.get("request_id")
+
+            # check if this message is for this peer or some else
+            if not request_id or request_id not in INFERENCE_CONTEXT:
+                print(f"🔍 [DEBUG] HiddenStateCallback received message for unknown request_id: {request_id}")
+                return
+            print(f"🔍 [DEBUG] HiddenStateCallback received message for request_id: {request_id}")
+            # download the blob data from it
+            blob_ticket=iroh.BlobTicket(ref.get("blob_ticket"))
+            hidden_bytes=await current_node.blob().read_ticket(blob_ticket.hash())
+            data=pickle.loads(hidden_bytes)
+
+            # check if hidden state or residual
+            # if information is provided, set the future to the result so the pre_hooks can be unblocked
+            if ref.get("is_residual"):
+                future=INFERENCE_CONTEXT[request_id].get("residual_future")
+                if future:
+                    future.set_result(data)
+            else:
+                future=INFERENCE_CONTEXT[request_id].get("hidden_state_future")
+                if future:
+                    future.set_result(data)
+        except Exception as e:
+            print(f"❌ Error in HiddenStateCallback: {e}")
+            import traceback
+            traceback.print_exc()
 # IROH ENDS HERE
 
+# IROH STARTS HERE
+# this is the callback function that needs to be called for the inference to start
 
+class TriggerCallback(iroh.GossipMessageCallback):
+    "handles the initial inference trigger from the server"
+    async def on_message(self, msg):
+        if msg.type()!=MessageType.RECEIVED:
+            print(f"🔍 [DEBUG] TriggerCallback received non-RECEIVED message")
+            return
+        
+        try:
+            payload=json.loads(msg.as_received().content.decode())
+            if payload.get("action")!="start_inference":
+                print(f"🔍 [DEBUG] TriggerCallback received non-start_inference message")
+                return
+            pipeline = payload.get("pipeline")
+            # we need to make sure that ONLY THE FIRST PEER starts the inference process
+            if pipeline and pipeline[0]==current_peer_id:
+                print(f"🔍 [DEBUG] TriggerCallback received start_inference message from the first peer")
+                if not start_inference_run:
+                    print(f"🔍 [DEBUG] TriggerCallback received start_inference message from the first peer, but start_inference_run is not set")
+                    return
+                
+                ##get the inference context
+                INFERENCE_CONTEXT[payload.get("request_id")]={}
+                sampling_params= SamplingParams(**payload.get("sampling_params"))
+
+                # start the synchronous and blocking inference run in a separate thread
+                # so that the main thread can continue gossip messages and the main loop isnt blocked
+                loop=asyncio.get_running_loop()
+                # loop.run_in_executor(None, # use default thread pool
+                #                     start_inference_run,
+                #                     payload.get("request_id"),
+                #                     pipeline,
+                #                     payload.get("token_ids"),
+                #                     sampling_params,
+                #                     payload.get("assigned_layers"))
+                loop.run_in_executor(
+                    None,
+                    start_inference_run,
+                    payload["request_id"],
+                    payload["pipeline"],
+                    payload["input_text"],
+                    SamplingParams(**payload["sampling_params"]),
+                    payload["assigned_layers"],            # will now be your dict
+                )
+        except Exception as e:
+            print(f"❌ Error in TriggerCallback: {e}")
+            import traceback
+            traceback.print_exc()
+
+        print(f"🔍 [DEBUG] TriggerCallback completed for {payload.get('request_id')}")
 # ============================================================================
 # SELECTIVE LAYER LOADING IMPLEMENTATION  
 # ============================================================================
@@ -223,7 +313,7 @@ async def download_file(url: str, local_path: Path, chunk_size: int = 16*1024*10
 
 async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
     """Deploy model based on deployment instructions received from server."""
-    global deployed_model, deployment_status
+    global deployed_model, deployment_status, start_inference_run, hidden_state_gossip_sink, current_node, current_peer_id
     
     model_name = instructions.get('model_name', 'unknown')
     
@@ -302,7 +392,18 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             model_dir=str(config_dir),
             assigned_layers=instructions["assigned_layers"]
         )
-        
+        # If loading is successful, prepare the inference function.
+        server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
+        start_inference_run = register_inference_hooks(
+            llm=deployed_model,
+            node=current_node,
+            hidden_state_gossip_sink=hidden_state_gossip_sink,
+            peer_id=current_peer_id,
+            server_url=server_url
+        )
+        assigned_layers_global = instructions['assigned_layers']
+
+        ##################################################
         deployment_status = "ready"
         print(f"✅ Model deployment completed successfully!")
         print(f"   Peer role: {'First' if instructions['is_first_peer'] else 'Last' if instructions['is_last_peer'] else 'Middle'}")
@@ -311,10 +412,11 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         
         # Clear attempts counter on success
         deploy_model_from_instructions.deployment_attempts[attempt_key] = 0
+        deployment_status = "ready"
+        print(f"🔍 [DEBUG] Deployment status set to ready")
         
         # Report completion to server
         await report_deployment_completion(instructions['model_name'], success=True)
-        
         return True
         
     except Exception as e:
@@ -329,28 +431,48 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         
         return False
 
-async def report_deployment_completion(model_name: str, success: bool):
-    """Report deployment completion status to server via Iroh."""
-    try:
-        # Access global Iroh objects (these will be set in main())
-        global current_doc, current_node, current_peer_id
+# async def report_deployment_completion(model_name: str, success: bool):
+#     """Report deployment completion status to server via Iroh."""
+#     try:
+#         # Access global Iroh objects (these will be set in main())
+#         global current_doc, current_node, current_peer_id
         
-        if not all([current_doc, current_node, current_peer_id]):
-            print("⚠️ Cannot report completion - Iroh not initialized")
-            return
+#         if not all([current_doc, current_node, current_peer_id]):
+#             print("⚠️ Cannot report completion - Iroh not initialized")
+#             return
             
-        author = await current_node.authors().create()
-        completion_key = f"deployment_complete_{current_peer_id}_{int(time.time())}"
-        completion_data = json.dumps({
-            "peer_id": current_peer_id,
-            "model_name": model_name,
-            "success": success,
-            "timestamp": int(time.time())
-        }).encode()
+#         author = await current_node.authors().create()
+#         completion_key = f"deployment_complete_{current_peer_id}_{int(time.time())}"
+#         completion_data = json.dumps({
+#             "peer_id": current_peer_id,
+#             "model_name": model_name,
+#             "success": success,
+#             "timestamp": int(time.time())
+#         }).encode()
         
-        await current_doc.set_bytes(author, completion_key.encode(), completion_data)
-        print(f"📤 Reported deployment {'success' if success else 'failure'} to server")
+#         await current_doc.set_bytes(author, completion_key.encode(), completion_data)
+#         print(f"📤 Reported deployment {'success' if success else 'failure'} to server")
         
+#     except Exception as e:
+#         print(f"❌ Failed to report deployment completion: {e}")
+
+
+async def report_deployment_completion(model_name: str, success: bool):
+    """
+    Notify the central server that this peer has finished deploying.
+    """
+    # url = f"http://{SERVER_HOST}:{SERVER_PORT}/deployment_complete"
+    url = f"http://localhost:8000/deployment_complete"
+    payload = {
+        "model_name": model_name,
+        "peer_id": current_peer_id,
+        "success": success
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+        print(f"📤 Reported deployment completion: {payload}")
     except Exception as e:
         print(f"❌ Failed to report deployment completion: {e}")
 
@@ -561,6 +683,8 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
     max_failures = 5  # ~5 seconds tolerance
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
     deployment_subscribed = False  # Track if we've subscribed to deployment
+    hidden_state_subscribed = False  # Track if we've subscribed to hidden-state transfers
+    trigger_subscribed = False  # Track if we've subscribed to inference triggers
 
     async with httpx.AsyncClient(timeout=2.0) as client:
         while True:
@@ -605,8 +729,17 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                         await current_node.gossip().subscribe(deployment_topic, bootstrap_peers, DeploymentGossipCallback(current_node, peer_id))
                         deployment_subscribed = True
                         print(f"🎯 Subscribed to deployment instructions on topic {deployment_topic}")
-
-                    consecutive_failures = 0  # Reset on success
+                    if not hidden_state_subscribed:
+                        hidden_state_topic = bytes("hidden_state_topic".ljust(32), 'utf-8')[:32]
+                        await current_node.gossip().subscribe(hidden_state_topic, bootstrap_peers, HiddenStateCallback())
+                        hidden_state_subscribed = True
+                        print(f"🎯 Subscribed to hidden-state transfers on topic {hidden_state_topic}")
+                    if not trigger_subscribed:
+                        trigger_topic = bytes("trigger_topic".ljust(32), 'utf-8')[:32]
+                        await current_node.gossip().subscribe(trigger_topic, bootstrap_peers, TriggerCallback())
+                        trigger_subscribed = True
+                        print(f"🎯 Subscribed to inference triggers on topic {trigger_topic}")
+                        consecutive_failures = 0  # Reset on success
                     print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
                 else:
                     consecutive_failures += 1
@@ -659,9 +792,7 @@ async def main():
     # trigger_topic = bytes("trigger_topic".ljust(32), 'utf-8')[:32]
     # await node.gossip().subscribe(trigger_topic, bootstrap_peers, TriggerCallback(processor))
 
-    # # Subscribe to hidden-state transfers
-    # hidden_topic = bytes("hidden_state_topic".ljust(32), 'utf-8')[:32]
-    # await node.gossip().subscribe(hidden_topic, bootstrap, HiddenStateCallback(processor))
+
 
     # --- NEW: subscribe to deployment instructions ---
     # deployment_topic = bytes("deployment_topic".ljust(32), 'utf-8')[:32]
