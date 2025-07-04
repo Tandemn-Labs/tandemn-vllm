@@ -1178,6 +1178,7 @@ async def completion(completion: CompletionData):
         inference_state["result"] = completion.output_text
         inference_state["completed_at"] = time.time()
         inference_state["processing_time"] = inference_state["completed_at"] - inference_state["started_at"]
+        print(f"Result: {completion.output_text}")
         print(f"✅ Inference {request_id} completed in {inference_state['processing_time']:.2f}s")
     return {"status": "ok"}
 

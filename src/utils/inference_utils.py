@@ -1,11 +1,11 @@
 import asyncio
 import iroh
 import pickle
-import httpx
+import httpx  # type: ignore
 import json
 from typing import Dict, Any, List
 import time
-from vllm import TokensPrompt
+from vllm import TokensPrompt, LLM  # type: ignore
 
 
 # This global dictionary is the bridge between the async network world and the sync vLLM world.
@@ -13,6 +13,7 @@ from vllm import TokensPrompt
 # Value: A dictionary holding asyncio.Future objects for the hidden_state and residual.
 # Basically just a placeholder for the time we do not move on to AsyncVLLM. 
 INFERENCE_CONTEXT: Dict[str, Dict[str, Any]] = {}
+sent_flag=False
 
 
 async def send_hidden_state_blob(
@@ -54,16 +55,30 @@ async def send_hidden_state_blob(
 
 async def send_final_result_to_server(
     request_id: str,
-    output_text: str,
+    output_obj,
+    peer_id: str,
     server_url: str = "http://{SERVER_IP}:8000"):
     try:
-        # the output from vLLM distributed inference is sent back to the central server
-        final_output=output[0].outputs[0].text
+        # vLLM ≥0.4 returns CompletionSequenceGroupOutput
+        print(f"🔍 Output object type: {type(output_obj)}")
+        if isinstance(output_obj, str):
+            final_text = output_obj
+
+        elif hasattr(output_obj, "sequences"):           # CompletionSequenceGroupOutput
+            final_text = output_obj.sequences[0].text
+
+        elif hasattr(output_obj, "outputs"):             # RequestOutput
+            final_text = output_obj.outputs[0].text
+
+        elif hasattr(output_obj, "text"):                # SequenceOutput (older)
+            final_text = output_obj.text
+        else:
+            raise ValueError(f"Unknown output type: {type(output_obj)}")
         completion_data={
             "request_id": request_id,
-            "output_text": final_output,
-            "peer_id": "final_peer", # we need to change this and get the actual peer_id
-            "timestamp": time.time()
+            "output_text": final_text,
+            "peer_id": peer_id,  # we need to change this and get the actual peer_id
+            "timestamp": int(time.time())  # cast to int for Pydantic
         }
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.post(
@@ -93,12 +108,12 @@ def register_inference_hooks(
     sampler=model_runner.sampler # need to check why is this used for
     
     # Just a placeholder for the hooks 
-    hook_context={}
+    hook_context: Dict[str, Any] = {}
 
-    def pre_hook(module,args):
+    def pre_hook(module, args):
         "this hook is called BEFORE a layer does its forward pass"
-        request_id=hook_context.get("request_id")
-        if not hook_context.get("is_first_peer"):
+        request_id = hook_context["request_id"]
+        if not hook_context["is_first_peer"]:
             print("Detected a non-first peer, injecting previous peer's hidden state")
             hidden_state_future=asyncio.Future() # because many times the hidden state is not available immediately
             residual_future=asyncio.Future()
@@ -121,13 +136,13 @@ def register_inference_hooks(
 
     def post_hook(module, args, output):
         "Runs after the pre-hooks in a layer - it sends the output to the next peer"
-        request_id=hook_context.get("request_id")
-        # for the last peer, we need to ignore this step, given we have to convert logits to text there
-        if hook_context.get("is_last_peer"):
-            return 
+        request_id = hook_context["request_id"]
+        # for the last peer, we need to ignore this step
+        if hook_context["is_last_peer"]:
+            return
         print(f"↪️ POST-HOOK for {request_id}: Sending hidden states...")
         hidden_states,residual=output
-        pipeline=hook_context.get("pipeline")
+        pipeline = hook_context["pipeline"]
         current_idx=pipeline.index(peer_id)
         next_peer_id=pipeline[current_idx+1]
 
@@ -135,33 +150,49 @@ def register_inference_hooks(
         asyncio.create_task(send_hidden_state_blob(node, hidden_state_gossip_sink,request_id, next_peer_id, pipeline, hidden_states.cpu(), is_residual=False))
         asyncio.create_task(send_hidden_state_blob(node, hidden_state_gossip_sink,request_id, next_peer_id, pipeline, residual.cpu(), is_residual=False))
     
+    # Capture the main asyncio loop so we can schedule coroutines from threads
+    main_loop = asyncio.get_running_loop()
     def final_output_hook(module, args, output):
+        global sent_flag
         "Runs on the final peer, sends the final output to the server"
-        request_id=hook_context.get("request_id")
         # do not do anything if we are not the last peer
-        if not hook_context.get("is_last_peer"):
+        if sent_flag or not hook_context.get("is_last_peer"):
             return
+        sent_flag=True # this is to avoid sending the final output to the server multiple times
+        request_id = hook_context["request_id"]
+        peer_id = hook_context["peer_id"]
         print(f"🎯 FINAL-OUTPUT-HOOK for {request_id}: Sending final output to the server...")
 
-        # send the final output to the server
-        asyncio.create_task(send_final_result_to_server(request_id, output, server_url, peer_id))
+        # Send the final output to the server via the main event loop
+        try:
+            asyncio.run_coroutine_threadsafe(
+                send_final_result_to_server(request_id, output,peer_id, server_url),
+                main_loop
+            )
+        except Exception as e:
+            print(f"❌ Failed to schedule send_final_result_to_server: {e}")
 
         # delete the request_id from the INFERENCE_CONTEXT
         if request_id in INFERENCE_CONTEXT:
             del INFERENCE_CONTEXT[request_id]
     # confirm this -> do we need to send in the tokens or do we need to send the prompt? assigned Layers will come from the pipeline
-    def start_inference_run(request_id, pipeline: List[str], input_text: str, sampling_params, assigned_layers: Dict[str, Any]):
+    def start_inference_run(request_id: str, pipeline: List[str], input_text: str, sampling_params: Any, assigned_layers: Dict[str, List[int]]):
         "The runner of inference hehe"
-        # update the hook context, in order to make it concurrent (atleast that what i think i should have it)
+        # Determine this peer's position in the pipeline
+        idx = pipeline.index(peer_id)
+        is_first = (idx == 0)
+        is_last = (idx == len(pipeline) - 1)
+        # update the hook context for pre/post hooks
         hook_context.update({
             "request_id": request_id,
             "pipeline": pipeline,
             "input_text": input_text,
-            "is_first_peer": True,
-            "is_last_peer": False
+            "is_first_peer": is_first,
+            "is_last_peer": is_last,
+            "peer_id": peer_id
         })
         
-        # Safely get this peer's layers
+        # Safely get this peer's assigned layers
         real_layers = assigned_layers.get(peer_id, [])
         real_layers=[layer for layer in model.model.layers if "PPMissingLayer" not in layer.__class__.__name__]
         # if no real layers, exit
@@ -173,18 +204,28 @@ def register_inference_hooks(
         print(f"✅ Dynamically attaching hooks to layers: {first_layer.__class__.__name__} -> {last_layer.__class__.__name__}")
 
         # attach the pre-hooks and the post hooks
-        pre_hook_handle=first_layer.register_forward_pre_hook(pre_hook)
-        post_hook_handle=last_layer.register_forward_hook(post_hook)
-        sampler_hook_handle=sampler.register_forward_hook(final_output_hook)
-        
-        # GPU GO BRRRRRRRRRRRRRRR
+        pre_hook_handle = first_layer.register_forward_pre_hook(pre_hook)
+        post_hook_handle = last_layer.register_forward_hook(post_hook)
+        # No sampler hook needed; final result will be sent after llm.generate
+
         print("Starting the inference run...")
-        # Use raw text prompt for vLLM
-        llm.generate([input_text], sampling_params)
+        # Run vLLM inference and capture completions
+        completions = llm.generate([input_text], sampling_params=sampling_params)
+
+        # If last peer, schedule sending final result back to server
+        if hook_context["is_last_peer"] and completions:
+            comp = completions[0]
+            final_text = comp.outputs[0].text
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    send_final_result_to_server(request_id, final_text, peer_id, server_url),
+                    main_loop,
+                )
+            except Exception as e:
+                print(f"❌ Failed to schedule send_final_result_to_server: {e}")
 
         pre_hook_handle.remove()
         post_hook_handle.remove()
-        sampler_hook_handle.remove()
         print(f"🎉 Inference run completed for {request_id}")
         return
     
