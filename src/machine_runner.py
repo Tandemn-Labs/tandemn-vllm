@@ -686,6 +686,10 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
     hidden_state_subscribed = False  # Track if we've subscribed to hidden-state transfers
     trigger_subscribed = False  # Track if we've subscribed to inference triggers
 
+    # Topology tracking - only update network when peers change
+    known_peers = set()  # Track known peer node_ids
+    server_added = False  # Track if server was added to network
+
     async with httpx.AsyncClient(timeout=2.0) as client:
         while True:
             try:
@@ -704,26 +708,39 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                 r = await client.post(server_url, json=payload)
                 if r.status_code == 200:
                     #IROH STARTS HERE
-                    # register the central server as the central peer
                     data = r.json()
                     print(f"🗒️ Received data: {data}")
-                    srv_id = data["server_id"]
-                    srv_addrs = data["server_addresses"]
-                    srv_relay = data["relay_url"]
-                    pk = PublicKey.from_string(srv_id)
-                    srv_node_addr = NodeAddr(pk, srv_relay, srv_addrs)
-                    await current_node.net().add_node_addr(srv_node_addr)
-                    # register the other peers as well for co-discovery
+                    
+                    # Only add server to network once
+                    if not server_added:
+                        srv_id = data["server_id"]
+                        srv_addrs = data["server_addresses"]
+                        srv_relay = data["relay_url"]
+                        pk = PublicKey.from_string(srv_id)
+                        srv_node_addr = NodeAddr(pk, srv_relay, srv_addrs)
+                        await current_node.net().add_node_addr(srv_node_addr)
+                        server_added = True
+                        print(f"🔗 Added server to network: {srv_id[:8]}")
+                    
+                    # Check for new peers and only add them if they're actually new
+                    current_peer_ids = {p["node_id"] for p in data.get("peers", [])}
+                    new_peers = current_peer_ids - known_peers
+                    
                     for p in data.get("peers", []):
-                        peer_id = p["node_id"]
-                        peer_addrs = p["addresses"]
-                        peer_relay = p["relay_url"]
-                        pk = PublicKey.from_string(peer_id)
-                        peer_node_addr = NodeAddr(pk, peer_relay, peer_addrs)
-                        await current_node.net().add_node_addr(peer_node_addr)
+                        if p["node_id"] in new_peers:
+                            peer_id = p["node_id"]
+                            peer_addrs = p["addresses"]
+                            peer_relay = p["relay_url"]
+                            pk = PublicKey.from_string(peer_id)
+                            peer_node_addr = NodeAddr(pk, peer_relay, peer_addrs)
+                            await current_node.net().add_node_addr(peer_node_addr)
+                            print(f"🔗 Added new peer to network: {peer_id[:8]}")
                     #IROH ENDS HERE
+                    # Update known peers
+                    known_peers = current_peer_ids
                     bootstrap_peers = [srv_id] + [p["node_id"] for p in data.get("peers", [])]
                     print(f"🔗 Bootstrap peers: {bootstrap_peers}")
+                    
                     if not deployment_subscribed:
                         deployment_topic = bytes("deployment_topic".ljust(32), 'utf-8')[:32]
                         await current_node.gossip().subscribe(deployment_topic, bootstrap_peers, DeploymentGossipCallback(current_node, peer_id))

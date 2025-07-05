@@ -58,7 +58,10 @@ DEPLOYMENT_TOPIC = bytes("deployment_topic".ljust(32), "utf-8")[:32]
 
 peer_table: Dict[str,NodeAddr] = {}
 server_id = None  # Unique identifier for this server instance
-previous_peers = set()  # Track which peers we've seen
+# Peer tracking for topology changes
+active_peer_ids = set()  # Currently active peer node_ids
+peer_last_seen = {}  # Track when each peer was last seen
+PEER_TIMEOUT = 30  # Seconds before considering a peer dead
 
 
 # doc = None   # Iroh document instance
@@ -99,12 +102,6 @@ class HeartbeatRequest(BaseModel):
 class NoopCallback(iroh.GossipMessageCallback):
     async def on_message(self, msg):
         return
-
-# still has to change
-class InferenceRequest(BaseModel):
-    model_name: str
-    input_text: str
-    max_tokens: int = 100
 
 # still has to change
 class InferenceResponse(BaseModel):
@@ -257,19 +254,50 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
     """Receive heartbeat from a peer and store metrics in MongoDB."""
     try:
         peer_ip = request.client.host if request.client else "unknown"
-
-        # This is the part that adds the peer to the network 
-        # IROH STARTS HERE
-        pk = PublicKey.from_string(hb.node_id)
-        addr = NodeAddr(pk, hb.relay_url, hb.addresses)
-        await node.net().add_node_addr(addr)
-        peer_table[hb.node_id] = addr
-        if hb.peer_id not in previous_peers:
-            previous_peers.add(hb.peer_id)
-            await refresh_trigger_sink()
+        
+        # Track when this peer was last seen
+        current_time = time.time()
+        peer_last_seen[hb.node_id] = current_time
+        
+        # Check if this is a new peer or if peer table needs updating
+        topology_changed = False
+        
+        if hb.node_id not in peer_table:
+            # New peer - add to Iroh network
+            pk = PublicKey.from_string(hb.node_id)
+            addr = NodeAddr(pk, hb.relay_url, hb.addresses)
+            await node.net().add_node_addr(addr)
+            peer_table[hb.node_id] = addr
+            active_peer_ids.add(hb.node_id)
+            topology_changed = True
             print(f"🗒️ New peer detected: {hb.peer_id}")
-        print(f"🗒️ Active peers: {list(peer_table.keys())}")
+        
+        # Check for dead peers (haven't sent heartbeat in PEER_TIMEOUT seconds)
+        dead_peers = []
+        for node_id, last_seen in list(peer_last_seen.items()):
+            if current_time - last_seen > PEER_TIMEOUT:
+                dead_peers.append(node_id)
+        
+        # Remove dead peers from tracking
+        for dead_node_id in dead_peers:
+            if dead_node_id in peer_table:
+                del peer_table[dead_node_id]
+                active_peer_ids.discard(dead_node_id)
+                del peer_last_seen[dead_node_id]
+                topology_changed = True
+                print(f"💀 Peer {dead_node_id[:8]} timed out and removed")
+        
+        # Only refresh sinks if topology actually changed
+        if topology_changed:
+            await refresh_trigger_sink()
+            await refresh_deployment_sink()
+            print(f"🔄 Network topology changed - sinks refreshed")
+        
+        print(f"🗒️ Active peers: {len(active_peer_ids)} ({list(p[:8] for p in active_peer_ids)})")
+        
+        # Get server address once
         srv_addr = await node.net().node_addr()
+        
         # Build peer list (excluding requester)
         peers_payload = []
         for pid, naddr in peer_table.items():
@@ -280,7 +308,6 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
                 "addresses": naddr.direct_addresses(),
                 "relay_url": naddr.relay_url()
             })
-        # IROH ENDS HERE
         
         # Compact metrics object similar to previous format
         formatted_metrics = {
@@ -307,9 +334,7 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         # Colored log
         color = _get_peer_color(hb.peer_id)
         print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
-        # return {"status": "ok"}
-        # added some more information than just ok 
-        #IROH STARTS HERE
+        
         return {
             "status": "ok",
             "server_id": server_id,
@@ -317,7 +342,6 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
             "relay_url": srv_addr.relay_url(),
             "peers": peers_payload
         }
-        #IROH ENDS HERE
     except Exception as e:
         print(f"❌ Heartbeat processing failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -465,45 +489,6 @@ async def identify_peers(request: ModelEstimationRequest):
             detail=f"Failed to identify suitable peers: {str(e)}"
         )
 
-# @app.post("/start_job")
-# async def start_job():
-#     """Endpoint to initiate a distributed computation job"""
-#     global doc, node
-#     author = await node.authors().create()
-
-#     # Define input matrix for computation
-#     U = torch.tensor([[1., 2.], [3., 4.]])
-
-#     try:
-#         # Send job payload to the first machine in the pipeline
-#         payload = json.dumps(U.tolist()).encode()
-#         await doc.set_bytes(author, TRIGGER_KEY.encode(), payload)
-#         print("🚀 Sent job payload to first machine")
-#         return {"status": "triggered"}
-#     except Exception as e:
-#         print(f"❌ Failed to send job trigger: {e}")
-#         return {"status": "error", "detail": str(e)}
-
-# @app.get("/result")
-# async def get_final_result():
-#     """Endpoint to retrieve the final computation result"""
-#     try:
-#         # Query all entries and look for the final result
-#         query = iroh.Query.all(None)
-#         entries = await doc.get_many(query)
-
-#         for entry in reversed(entries):
-#             if entry.key().decode() == FINAL_RESULT_KEY:
-#                 content = await node.blobs().read_to_bytes(entry.content_hash())
-#                 tensor = torch.tensor(json.loads(content.decode()))
-#                 return {
-#                     "status": "success",
-#                     "result": tensor.tolist()
-#                 }
-
-#         return {"status": "waiting", "detail": "No final result yet."}
-#     except Exception as e:
-#         return {"status": "error", "detail": str(e)}
 
 @app.post("/calculate_peer_layers")
 async def calculate_peer_layers(request: ModelEstimationRequest, peer_id: str, available_vram_gb: float):
