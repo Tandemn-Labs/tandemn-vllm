@@ -953,7 +953,13 @@ async def deploy_model(request: ModelDeploymentRequest):
             peers_vram=peers_vram,
             q_bits=16  # Default quantization, for testing for now
         )
-        print(distribution_plan)
+        print(f"📋 Distribution plan created:")
+        print(f"   • Model can fit: {distribution_plan['can_fit_model']}")
+        print(f"   • Total VRAM needed: {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB")
+        print(f"   • Available VRAM: {distribution_plan['total_available_vram_gb']:.1f}GB")
+        print(f"   • Peers involved: {len(distribution_plan['distribution'])}")
+        for peer_id, peer_info in distribution_plan['distribution'].items():
+            print(f"   • {peer_id}: {peer_info['assigned_layers']} layers, {peer_info['estimated_vram_usage']:.1f}GB")
 
         if not distribution_plan["can_fit_model"]:
             raise HTTPException(

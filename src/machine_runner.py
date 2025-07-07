@@ -398,19 +398,31 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
 
         # running the blocking operation within the machine runner,
         # in a different thread, so the heartbeat loop can continue
-        # and the peer does not STALL during a deployment. 
+        # and the peer does not STALL during a deployment.
         loop_for_deployment = asyncio.get_running_loop()
-        loop_for_deployment.run_in_executor(
+        
+        # AWAIT the result from the background thread. This pauses this function
+        # but allows the event loop to run other tasks (like heartbeats).
+        # Any exception from the background thread (like the out-of-memory error)
+        # will be raised here and caught by the outer try/except block.
+        loaded_model = await loop_for_deployment.run_in_executor(
             None,
             create_dynamic_vllm_model,
             str(config_dir),
-            instructions["assigned_layers"]
+            instructions["assigned_layers"],
         )
-        # deployed_model = create_dynamic_vllm_model(
-        #     model_dir=str(config_dir),
-        #     assigned_layers=instructions["assigned_layers"]
-        # )
+
+        # Explicitly update the global state ONLY after successful loading.
+        deployed_model = loaded_model
+
+        # Now we can safely check if the model was loaded before proceeding.
+        if deployed_model is None:
+            print("❌ Model loading returned None. Deployment cannot continue.")
+            # Raise an exception to be caught by the main handler.
+            raise ValueError("Model loading failed in the background thread.")
+
         # If loading is successful, prepare the inference function.
+        print("✅ Model loaded successfully, registering inference hooks...")
         server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
         start_inference_run = register_inference_hooks(
             llm=deployed_model,
