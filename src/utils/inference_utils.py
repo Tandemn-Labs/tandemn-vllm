@@ -146,9 +146,32 @@ def register_inference_hooks(
         current_idx=pipeline.index(peer_id)
         next_peer_id=pipeline[current_idx+1]
 
-        # have to confirm if this is what we want to do with the residual and the hooks
-        asyncio.create_task(send_hidden_state_blob(node, hidden_state_gossip_sink,request_id, next_peer_id, pipeline, hidden_states.cpu(), is_residual=False))
-        asyncio.create_task(send_hidden_state_blob(node, hidden_state_gossip_sink,request_id, next_peer_id, pipeline, residual.cpu(), is_residual=False))
+        # Schedule sends on the main asyncio loop (thread-safe)
+        # not really sure if this is the best way to do this
+        asyncio.run_coroutine_threadsafe(
+            send_hidden_state_blob(
+                node,
+                hidden_state_gossip_sink,
+                request_id,
+                next_peer_id,
+                pipeline,
+                hidden_states.cpu(),
+                is_residual=False
+            ),
+            main_loop
+        )
+        asyncio.run_coroutine_threadsafe(
+            send_hidden_state_blob(
+                node,
+                hidden_state_gossip_sink,
+                request_id,
+                next_peer_id,
+                pipeline,
+                residual.cpu(),
+                is_residual=False
+            ),
+            main_loop
+        )
     
     # Capture the main asyncio loop so we can schedule coroutines from threads
     main_loop = asyncio.get_running_loop()
