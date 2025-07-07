@@ -50,15 +50,15 @@ current_peer_id = None
 hidden_state_gossip_sink = None # this is the gossip sink for the hidden states
 
 # Constants for document keys
-TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
-FINAL_RESULT_KEY = "final_result"  # Key used to store the final computation result
+# TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
+# FINAL_RESULT_KEY = "final_result"  # Key used to store the final computation result
 
-# Predefined matrices for each position in the pipeline
-MATRIX_MAP = {
-    0: torch.tensor([[2., 0.], [1., 2.]]),  # Matrix A (first machine)
-    1: torch.tensor([[0., 1.], [1., 0.]]),  # Matrix B (second machine)
-    2: torch.tensor([[1., 1.], [0., 1.]]),  # Matrix C (third machine)
-}
+# # Predefined matrices for each position in the pipeline
+# MATRIX_MAP = {
+#     0: torch.tensor([[2., 0.], [1., 2.]]),  # Matrix A (first machine)
+#     1: torch.tensor([[0., 1.], [1., 0.]]),  # Matrix B (second machine)
+#     2: torch.tensor([[1., 1.], [0., 1.]]),  # Matrix C (third machine)
+# }
 
 # IROH STARTS HERE
 class DeploymentGossipCallback(iroh.GossipMessageCallback):
@@ -494,67 +494,67 @@ async def report_deployment_completion(model_name: str, success: bool):
     except Exception as e:
         print(f"❌ Failed to report deployment completion: {e}")
 
-async def handle_deployment_instruction(doc, node, instruction_data: bytes):
-    """Handle deployment instruction received via Iroh."""
-    try:
-        instruction = json.loads(instruction_data.decode())
+# async def handle_deployment_instruction(doc, node, instruction_data: bytes):
+#     """Handle deployment instruction received via Iroh."""
+#     try:
+#         instruction = json.loads(instruction_data.decode())
         
-        if instruction.get("action") == "deploy_model":
-            instructions = instruction.get("instructions", {})
-            print(f"📨 Received deployment instruction for {instructions.get('model_name', 'unknown')}")
+#         if instruction.get("action") == "deploy_model":
+#             instructions = instruction.get("instructions", {})
+#             print(f"📨 Received deployment instruction for {instructions.get('model_name', 'unknown')}")
             
-            # Deploy model in background (non-blocking)
-            asyncio.create_task(deploy_model_from_instructions(instructions))
+#             # Deploy model in background (non-blocking)
+#             asyncio.create_task(deploy_model_from_instructions(instructions))
             
-        else:
-            print(f"⚠️  Unknown instruction action: {instruction.get('action')}")
+#         else:
+#             print(f"⚠️  Unknown instruction action: {instruction.get('action')}")
             
-    except Exception as e:
-        print(f"❌ Error handling deployment instruction: {e}")
+#     except Exception as e:
+#         print(f"❌ Error handling deployment instruction: {e}")
 
-async def monitor_deployment_instructions(doc, node, peer_id: str):
-    """Monitor for deployment instructions sent to this peer."""
-    seen_hashes = set()
+# async def monitor_deployment_instructions(doc, node, peer_id: str):
+#     """Monitor for deployment instructions sent to this peer."""
+#     seen_hashes = set()
     
-    while True:
-        try:
-            # Look for deployment instructions addressed to this peer
-            entries = await doc.get_many(iroh.Query.all(None))
+#     while True:
+#         try:
+#             # Look for deployment instructions addressed to this peer
+#             entries = await doc.get_many(iroh.Query.all(None))
             
-            for entry in entries:
-                key = entry.key().decode()
-                hash_value = entry.content_hash()
+#             for entry in entries:
+#                 key = entry.key().decode()
+#                 hash_value = entry.content_hash()
                 
-                # Skip if we've already processed this entry
-                if hash_value in seen_hashes:
-                    continue
+#                 # Skip if we've already processed this entry
+#                 if hash_value in seen_hashes:
+#                     continue
                 
-                # Check if this is a deployment instruction for us
-                if key.startswith(f"deploy_instruction_{peer_id}_"):
-                    seen_hashes.add(hash_value)
-                    content = await node.blobs().read_to_bytes(hash_value)
+#                 # Check if this is a deployment instruction for us
+#                 if key.startswith(f"deploy_instruction_{peer_id}_"):
+#                     seen_hashes.add(hash_value)
+#                     content = await node.blobs().read_to_bytes(hash_value)
                     
-                    # Add timestamp check to ignore old instructions
-                    try:
-                        # Extract timestamp from key: deploy_instruction_{peer_id}_{timestamp}
-                        timestamp_str = key.split("_")[-1]
-                        instruction_time = int(timestamp_str)
-                        current_time = int(time.time())
+#                     # Add timestamp check to ignore old instructions
+#                     try:
+#                         # Extract timestamp from key: deploy_instruction_{peer_id}_{timestamp}
+#                         timestamp_str = key.split("_")[-1]
+#                         instruction_time = int(timestamp_str)
+#                         current_time = int(time.time())
                         
-                        # Ignore instructions older than 30 seconds
-                        if current_time - instruction_time > 30:
-                            print(f"⏰ Ignoring old deployment instruction from {instruction_time}")
-                            continue
-                    except (ValueError, IndexError):
-                        # If timestamp parsing fails, process the instruction anyway
-                        pass
+#                         # Ignore instructions older than 30 seconds
+#                         if current_time - instruction_time > 30:
+#                             print(f"⏰ Ignoring old deployment instruction from {instruction_time}")
+#                             continue
+#                     except (ValueError, IndexError):
+#                         # If timestamp parsing fails, process the instruction anyway
+#                         pass
                     
-                    await handle_deployment_instruction(doc, node, content)
+#                     await handle_deployment_instruction(doc, node, content)
             
-        except Exception as e:
-            print(f"❌ Error monitoring deployment instructions: {e}")
+#         except Exception as e:
+#             print(f"❌ Error monitoring deployment instructions: {e}")
         
-        await asyncio.sleep(2)  # Check every 2 seconds
+#         await asyncio.sleep(2)  # Check every 2 seconds
 
 def get_model_status() -> Dict[str, Any]:
     """Get current model deployment status."""
@@ -600,96 +600,96 @@ def get_model_status() -> Dict[str, Any]:
 #     except Exception as e:
 #         raise Exception(f"Unexpected error fetching ticket: {e}")
 
-async def send_blob(doc, author, peer_id: str, data: torch.Tensor):
-    """
-    Send a tensor to another peer in the network.
+# async def send_blob(doc, author, peer_id: str, data: torch.Tensor):
+#     """
+#     Send a tensor to another peer in the network.
     
-    Args:
-        doc: Iroh document
-        author: Iroh author for writing
-        peer_id: ID of the recipient peer
-        data: Tensor data to send
-    """
-    try:
-        encoded = json.dumps(data.tolist()).encode()
-        await doc.set_bytes(author, peer_id.encode(), encoded)
-        print(f"📤 Sent to {peer_id}: {data}")
-    except Exception as e:
-        print(f"❌ Failed to send to {peer_id}: {e}")
+#     Args:
+#         doc: Iroh document
+#         author: Iroh author for writing
+#         peer_id: ID of the recipient peer
+#         data: Tensor data to send
+#     """
+#     try:
+#         encoded = json.dumps(data.tolist()).encode()
+#         await doc.set_bytes(author, peer_id.encode(), encoded)
+#         print(f"📤 Sent to {peer_id}: {data}")
+#     except Exception as e:
+#         print(f"❌ Failed to send to {peer_id}: {e}")
 
-async def receive_blob(doc, peer_id: str, node):
-    """
-    Wait for and receive a tensor addressed to this peer.
+# async def receive_blob(doc, peer_id: str, node):
+#     """
+#     Wait for and receive a tensor addressed to this peer.
     
-    Args:
-        doc: Iroh document
-        peer_id: This peer's ID
-        node: Iroh node
+#     Args:
+#         doc: Iroh document
+#         peer_id: This peer's ID
+#         node: Iroh node
         
-    Returns:
-        The received tensor
-    """
-    seen = set()  # Track already processed content hashes
-    while True:
-        try:
-            entries = await doc.get_many(iroh.Query.all(None))
-            for entry in entries:
-                key = entry.key().decode()
-                if key != peer_id:
-                    continue
-                hash = entry.content_hash()
-                if hash in seen:
-                    continue
-                seen.add(hash)
-                content = await node.blobs().read_to_bytes(hash)
-                tensor = torch.tensor(json.loads(content.decode()))
-                return tensor
-        except Exception as e:
-            print(f"❌ Polling error for {peer_id}: {e}")
-        await asyncio.sleep(2)  # Poll every 2 seconds
+#     Returns:
+#         The received tensor
+#     """
+#     seen = set()  # Track already processed content hashes
+#     while True:
+#         try:
+#             entries = await doc.get_many(iroh.Query.all(None))
+#             for entry in entries:
+#                 key = entry.key().decode()
+#                 if key != peer_id:
+#                     continue
+#                 hash = entry.content_hash()
+#                 if hash in seen:
+#                     continue
+#                 seen.add(hash)
+#                 content = await node.blobs().read_to_bytes(hash)
+#                 tensor = torch.tensor(json.loads(content.decode()))
+#                 return tensor
+#         except Exception as e:
+#             print(f"❌ Polling error for {peer_id}: {e}")
+#         await asyncio.sleep(2)  # Poll every 2 seconds
 
-async def process_once(doc, author, peer_id: str, next_peer: Optional[str], is_first: bool, is_last: bool, local_matrix: torch.Tensor, node):
-    """
-    Process one computation job in the pipeline.
+# async def process_once(doc, author, peer_id: str, next_peer: Optional[str], is_first: bool, is_last: bool, local_matrix: torch.Tensor, node):
+#     """
+#     Process one computation job in the pipeline.
     
-    Args:
-        doc: Iroh document
-        author: Iroh author for writing
-        peer_id: This peer's ID
-        next_peer: ID of the next peer in the pipeline
-        is_first: Whether this is the first machine in the pipeline
-        is_last: Whether this is the last machine in the pipeline
-        local_matrix: The matrix assigned to this peer
-        node: Iroh node
-    """
-    try:
-        if is_first:
-            # First machine waits for job trigger
-            trigger = await receive_blob(doc, TRIGGER_KEY, node)
-            print(f"📥 Received trigger: {trigger}")
-            input_matrix = trigger
-        else:
-            # Other machines wait for input from previous machine
-            input_matrix = await receive_blob(doc, peer_id, node)
-            print(f"📥 Received input: {input_matrix}")
+#     Args:
+#         doc: Iroh document
+#         author: Iroh author for writing
+#         peer_id: This peer's ID
+#         next_peer: ID of the next peer in the pipeline
+#         is_first: Whether this is the first machine in the pipeline
+#         is_last: Whether this is the last machine in the pipeline
+#         local_matrix: The matrix assigned to this peer
+#         node: Iroh node
+#     """
+#     try:
+#         if is_first:
+#             # First machine waits for job trigger
+#             trigger = await receive_blob(doc, TRIGGER_KEY, node)
+#             print(f"📥 Received trigger: {trigger}")
+#             input_matrix = trigger
+#         else:
+#             # Other machines wait for input from previous machine
+#             input_matrix = await receive_blob(doc, peer_id, node)
+#             print(f"📥 Received input: {input_matrix}")
         
-        # Perform matrix multiplication
-        result = torch.matmul(input_matrix, local_matrix)
-        print(f"🔢 Computed result: {result}")
+#         # Perform matrix multiplication
+#         result = torch.matmul(input_matrix, local_matrix)
+#         print(f"🔢 Computed result: {result}")
         
-        if is_last:
-            # Last machine stores final result
-            await send_blob(doc, author, FINAL_RESULT_KEY, result)
-            print("✅ Stored final result")
-        elif next_peer:
-            # Pass result to next machine
-            await send_blob(doc, author, next_peer, result)
-            print(f"📤 Sent result to {next_peer}")
-        else:
-            print("⚠️ No next peer specified, cannot send result")
+#         if is_last:
+#             # Last machine stores final result
+#             await send_blob(doc, author, FINAL_RESULT_KEY, result)
+#             print("✅ Stored final result")
+#         elif next_peer:
+#             # Pass result to next machine
+#             await send_blob(doc, author, next_peer, result)
+#             print(f"📤 Sent result to {next_peer}")
+#         else:
+#             print("⚠️ No next peer specified, cannot send result")
             
-    except Exception as e:
-        print(f"❌ Error in computation: {e}")
+#     except Exception as e:
+#         print(f"❌ Error in computation: {e}")
 
 colorama_init(autoreset=True)
 COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
@@ -727,7 +727,7 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                 if r.status_code == 200:
                     #IROH STARTS HERE
                     data = r.json()
-                    print(f"🗒️ Received data: {data}")
+                    # print(f"🗒️ Received data: {data}")
                     
                     # Only add server to network once
                     if not server_added:
@@ -792,7 +792,7 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
 async def main():
 
     """Main function to run the distributed computation node"""
-    global current_doc, current_node, current_peer_id, node_id_obj, node_addr_obj
+    global current_node, current_peer_id, node_id_obj, node_addr_obj
     
     bootstrap_peers=[]
     # Set up the asyncio event loop for Iroh

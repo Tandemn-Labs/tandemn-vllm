@@ -951,15 +951,15 @@ async def deploy_model(request: ModelDeploymentRequest):
         distribution_plan = distribute_layers_across_peers(
             config=config,
             peers_vram=peers_vram,
-            q_bits=32  # Default quantization, for testing for now
+            q_bits=16  # Default quantization, for testing for now
         )
         print(distribution_plan)
 
-        if not distribution_plan["can_fit_model"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Model cannot fit in available VRAM. Need {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB, have {distribution_plan['total_available_vram_gb']:.1f}GB"
-            )
+        # if not distribution_plan["can_fit_model"]:
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail=f"Model cannot fit in available VRAM. Need {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB, have {distribution_plan['total_available_vram_gb']:.1f}GB"
+        #     )
 
         # 4. Create optimized deployment instructions for each peer
         deployment_instructions = {}
