@@ -491,8 +491,8 @@ async def report_deployment_completion(model_name: str, success: bool):
     """
     Notify the central server that this peer has finished deploying.
     """
-    # url = f"http://{SERVER_HOST}:{SERVER_PORT}/deployment_complete"
-    url = f"http://localhost:8000/deployment_complete"
+    url = f"http://{SERVER_HOST}:{SERVER_PORT}/deployment_complete"
+    # url = f"http://localhost:8000/deployment_complete"
     payload = {
         "model_name": model_name,
         "peer_id": current_peer_id,

@@ -951,7 +951,7 @@ async def deploy_model(request: ModelDeploymentRequest):
         distribution_plan = distribute_layers_across_peers(
             config=config,
             peers_vram=peers_vram,
-            q_bits=16  # Default quantization, for testing for now
+            q_bits=32  # Default quantization, for testing for now
         )
         print(f"📋 Distribution plan created:")
         print(f"   • Model can fit: {distribution_plan['can_fit_model']}")
@@ -1015,7 +1015,14 @@ async def deploy_model(request: ModelDeploymentRequest):
                 "vram_allocation": peer_info
             }
         
-        # 5. Send deployment instructions to each peer via Iroh
+        # 5. Persist deployment tracking information BEFORE broadcasting
+        active_deployments[request.model_name].update({
+            "instructions_sent_at": time.time(),
+            "deployment_map": {pid: instr["assigned_layers"] for pid, instr in deployment_instructions.items()},
+            "completion_status": {pid: "pending" for pid in deployment_instructions.keys()},
+        })
+
+        # 6. Send deployment instructions to each peer via Iroh
         # IROH STARTS HERE
         for peer_id, instructions in deployment_instructions.items():
             try:
