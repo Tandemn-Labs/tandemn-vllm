@@ -92,6 +92,12 @@ class DeploymentGossipCallback(iroh.GossipMessageCallback):
                 if payload.get("action") != "deploy_model":
                     print(f"🔍 [DEBUG] Not a deployment instruction, skipping")
                     return
+                
+                # check if the target peer is this peer
+                target_peer_id = payload.get("target_peer_id")
+                if target_peer_id != self.peer_id:
+                    print(f"🔍 [DEBUG] Not a deployment instruction for this peer, skipping, {target_peer_id}")
+                    return
                     
                 instructions = payload.get("instructions", {})
                 print(f"📨 Received deployment instructions for {self.peer_id}: {instructions}")
@@ -242,7 +248,8 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
             skip_tokenizer_init=False,
             gpu_memory_utilization=0.8,  # Use much less memory
             use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
-            load_format="dummy"     # ← this is the magic flag
+            load_format="dummy",     # ← this is the magic flag
+            dtype="float32"
         )
         
         print(f"✅ Successfully created vLLM model with selective layers!")
@@ -388,10 +395,21 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             deployment_status = "failed"
             return False
         print("Loading only a partial model for vLLM Inference")
-        deployed_model = create_dynamic_vllm_model(
-            model_dir=str(config_dir),
-            assigned_layers=instructions["assigned_layers"]
+
+        # running the blocking operation within the machine runner,
+        # in a different thread, so the heartbeat loop can continue
+        # and the peer does not STALL during a deployment. 
+        loop_for_deployment = asyncio.get_running_loop()
+        loop_for_deployment.run_in_executor(
+            None,
+            create_dynamic_vllm_model,
+            str(config_dir),
+            instructions["assigned_layers"]
         )
+        # deployed_model = create_dynamic_vllm_model(
+        #     model_dir=str(config_dir),
+        #     assigned_layers=instructions["assigned_layers"]
+        # )
         # If loading is successful, prepare the inference function.
         server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
         start_inference_run = register_inference_hooks(

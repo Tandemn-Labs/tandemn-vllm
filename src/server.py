@@ -951,7 +951,7 @@ async def deploy_model(request: ModelDeploymentRequest):
         distribution_plan = distribute_layers_across_peers(
             config=config,
             peers_vram=peers_vram,
-            q_bits=16  # Default quantization
+            q_bits=32  # Default quantization, for testing for now
         )
         print(distribution_plan)
 
@@ -1015,6 +1015,7 @@ async def deploy_model(request: ModelDeploymentRequest):
             try:
                 payload = json.dumps({
                     "action": "deploy_model",
+                    "target_peer_id": peer_id, # fix this if needed
                     "instructions": instructions
                 }).encode()
                 await deployment_gossip_sink.broadcast(payload)
