@@ -757,14 +757,14 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                     new_peers = current_peer_ids - known_peers
                     
                     for p in data.get("peers", []):
-                        if p["node_id"] in new_peers:
-                            peer_id = p["node_id"]
+                        remote_peer_id = p["node_id"]
+                        if remote_peer_id in new_peers:
                             peer_addrs = p["addresses"]
                             peer_relay = p["relay_url"]
-                            pk = PublicKey.from_string(peer_id)
+                            pk = PublicKey.from_string(remote_peer_id)
                             peer_node_addr = NodeAddr(pk, peer_relay, peer_addrs)
                             await current_node.net().add_node_addr(peer_node_addr)
-                            print(f"🔗 Added new peer to network: {peer_id[:8]}")
+                            print(f"🔗 Added new peer to network: {remote_peer_id[:8]}")
                     #IROH ENDS HERE
                     # Update known peers
                     known_peers = current_peer_ids
