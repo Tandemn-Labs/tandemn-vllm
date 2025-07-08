@@ -145,14 +145,21 @@ def register_inference_hooks(
 
             # Slice original positions to match the seq_len of hidden_states
             orig_positions = args[0]
+            
+            # TODO: Understand what the hell is this
+            if orig_positions.dim() == 1:  
+                orig_positions = orig_positions.unsqueeze(0)  # add a dimension for the batch size
+            
             seq_len = hidden_states.shape[1]
             # Keep the last seq_len tokens
+            # i am not sure if this is correct or not
             positions_to_inject = orig_positions[:, -seq_len:]
 
+
             # Move to correct device
-            positions_to_inject = positions_to_inject.to(orig_positions.device)
-            hidden_states_to_inject = hidden_states.to(positions_to_inject.device)
-            residual_to_inject = residual.to(positions_to_inject.device)
+            positions_to_inject = positions_to_inject.to(orig_positions.device, non_blocking=True)
+            hidden_states_to_inject = hidden_states.to(positions_to_inject.device, non_blocking=True)
+            residual_to_inject = residual.to(positions_to_inject.device, non_blocking=True)
 
             return (positions_to_inject, hidden_states_to_inject, residual_to_inject)
         
