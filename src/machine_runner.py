@@ -164,7 +164,15 @@ class TriggerCallback(iroh.GossipMessageCallback):
             if payload.get("action")!="start_inference":
                 print(f"🔍 [DEBUG] TriggerCallback received non-start_inference message")
                 return
+            
             pipeline = payload.get("pipeline")
+            request_id = payload.get("request_id")
+            
+            # ALL peers need to know about this request for hidden state handling
+            if request_id and current_peer_id in pipeline:
+                print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id}")
+                INFERENCE_CONTEXT[request_id] = {}
+            
             # we need to make sure that ONLY THE FIRST PEER starts the inference process
             if pipeline and pipeline[0]==current_peer_id:
                 print(f"🔍 [DEBUG] TriggerCallback received start_inference message from the first peer")

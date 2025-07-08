@@ -137,9 +137,17 @@ def register_inference_hooks(
     def post_hook(module, args, output):
         "Runs after the pre-hooks in a layer - it sends the output to the next peer"
         request_id = hook_context["request_id"]
+        
         # for the last peer, we need to ignore this step
         if hook_context["is_last_peer"]:
             return
+            
+        # Prevent multiple calls per inference - only send once per request
+        context_key = f"{request_id}_sent"
+        if hook_context.get(context_key, False):
+            return  # Already sent for this request
+        hook_context[context_key] = True
+        
         print(f"↪️ POST-HOOK for {request_id}: Sending hidden states...")
         hidden_states,residual=output
         pipeline = hook_context["pipeline"]
@@ -215,6 +223,11 @@ def register_inference_hooks(
             "peer_id": peer_id
         })
         
+        # Clear any previous sent flags for this request
+        sent_key = f"{request_id}_sent"
+        if sent_key in hook_context:
+            del hook_context[sent_key]
+        
         # Safely get this peer's assigned layers
         real_layers = assigned_layers.get(peer_id, [])
         real_layers=[layer for layer in model.model.layers if "PPMissingLayer" not in layer.__class__.__name__]
@@ -222,8 +235,10 @@ def register_inference_hooks(
         if not real_layers:
             print(f"⚠️ No real layers detected here. Cannot participate in this inference")
             return
-        
-        first_layer,last_layer=real_layers[0], real_layers[1]
+        # Fix: Attach hooks to FIRST and LAST real layers, regardless of count
+        # first_layer, last_layer = real_layers[0], real_layers[1]
+        first_layer = real_layers[0]
+        last_layer = real_layers[-1]  # Use -1 to get the last layer
         print(f"✅ Dynamically attaching hooks to layers: {first_layer.__class__.__name__} -> {last_layer.__class__.__name__}")
 
         # attach the pre-hooks and the post hooks
