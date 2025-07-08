@@ -124,13 +124,23 @@ def register_inference_hooks(
                 print(f"❌ CRITICAL: Futures not found for {request_id} on non-first peer!")
                 # Without futures, this peer cannot proceed. Returning original args.
                 return args
-
+            
             # Block and wait for the hidden state and residual to be available
-            loop = asyncio.get_running_loop()
+            # loop = asyncio.get_running_loop()
+            # print(f"⏳ Waiting for hidden state for {request_id}...")
+            # hidden_states = loop.run_until_complete(hidden_state_future)
+            # print(f"⏳ Waiting for residual for {request_id}...")
+            # residual = loop.run_until_complete(residual_future)
+            
+            # Basically loop until complete is done, and then get the result
             print(f"⏳ Waiting for hidden state for {request_id}...")
-            hidden_states = loop.run_until_complete(hidden_state_future)
+            while not hidden_state_future.done():
+                time.sleep(0.01)
+            hidden_states = hidden_state_future.result()
             print(f"⏳ Waiting for residual for {request_id}...")
-            residual = loop.run_until_complete(residual_future)
+            while not residual_future.done():
+                time.sleep(0.01)
+            residual = residual_future.result()
             print(f"✅ Received hidden state and residual for {request_id}. Injecting into the next layer.")
             
             # Inject the received tensors into the model arguments
