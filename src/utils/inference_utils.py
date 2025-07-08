@@ -142,12 +142,19 @@ def register_inference_hooks(
                 time.sleep(0.01)
             residual = residual_future.result()
             print(f"✅ Received hidden state and residual for {request_id}. Injecting into the next layer.")
-            
-            # Inject the received tensors into the model arguments
-            argument = args[0]
-            hidden_states_to_inject = hidden_states.to(argument.device)
-            residual_to_inject = residual.to(argument.device)
-            return (argument, hidden_states_to_inject, residual_to_inject)
+
+            # Slice original positions to match the seq_len of hidden_states
+            orig_positions = args[0]
+            seq_len = hidden_states.shape[1]
+            # Keep the last seq_len tokens
+            positions_to_inject = orig_positions[:, -seq_len:]
+
+            # Move to correct device
+            positions_to_inject = positions_to_inject.to(orig_positions.device)
+            hidden_states_to_inject = hidden_states.to(positions_to_inject.device)
+            residual_to_inject = residual.to(positions_to_inject.device)
+
+            return (positions_to_inject, hidden_states_to_inject, residual_to_inject)
         
         # If this is the first peer, just return the original args
         return args
