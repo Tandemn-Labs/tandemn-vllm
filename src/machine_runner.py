@@ -128,10 +128,33 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
                 print(f"🔍 [DEBUG] HiddenStateCallback received message for unknown request_id: {request_id}")
                 return
             print(f"🔍 [DEBUG] HiddenStateCallback received message for request_id: {request_id}")
-            # download the blob data from it
-            blob_ticket=iroh.BlobTicket(ref.get("blob_ticket"))
-            hidden_bytes=await current_node.blobs().read_to_bytes(blob_ticket.hash())
-            data=pickle.loads(hidden_bytes)
+            
+            # Properly download the blob first before reading
+            blob_ticket_str = ref.get("blob_ticket")
+            if not blob_ticket_str:
+                print(f"❌ No blob_ticket in message for {request_id}")
+                return
+                
+            print(f"🔍 [DEBUG] Starting blob download for request {request_id}")
+            blob_ticket = iroh.BlobTicket(blob_ticket_str)
+            blob_hash = blob_ticket.hash()
+            opts = blob_ticket.as_download_options()
+            
+            # Define a simple download callback
+            class DownloadProgressCallback(iroh.DownloadCallback):
+                async def progress(self, progress):
+                    print(f"🔍 [DEBUG] Download progress: {progress}")
+                    pass  # Silent progress tracking
+            
+            # Download the blob using ticket-derived options
+            print(f"🔍 [DEBUG] Downloading blob {blob_hash}...")
+            await current_node.blobs().download(blob_hash, opts, DownloadProgressCallback())
+            print(f"🔍 [DEBUG] Download completed, reading bytes...")
+            
+            # Now read the downloaded blob
+            hidden_bytes = await current_node.blobs().read_to_bytes(blob_hash)
+            print(f"🔍 [DEBUG] Read {len(hidden_bytes)} bytes from blob")
+            data = pickle.loads(hidden_bytes)
 
             # check if hidden state or residual
             # if information is provided, set the future to the result so the pre_hooks can be unblocked
@@ -139,10 +162,12 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
                 future=INFERENCE_CONTEXT[request_id].get("residual_future")
                 if future:
                     future.set_result(data)
+                    print(f"✅ Set residual future for {request_id}")
             else:
                 future=INFERENCE_CONTEXT[request_id].get("hidden_state_future")
                 if future:
                     future.set_result(data)
+                    print(f"✅ Set hidden_state future for {request_id}")
         except Exception as e:
             print(f"❌ Error in HiddenStateCallback: {e}")
             import traceback
