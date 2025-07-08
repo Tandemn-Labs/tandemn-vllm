@@ -114,6 +114,10 @@ def register_inference_hooks(
     # Just a placeholder for the hooks 
     hook_context: Dict[str, Any] = {}
 
+    # This coroutine runs on the main event loop to safely create futures
+    async def create_future_pair():
+        return {"h": asyncio.Future(), "r": asyncio.Future()}
+
     def _slice_last_token(t: torch.Tensor) -> torch.Tensor:
         """Slices the last token from a tensor, handling both 2D and 3D cases."""
         if t.dim() == 2:
@@ -259,10 +263,15 @@ def register_inference_hooks(
         # Create the future pair for the *next* step and add it to this peer's context
         # This prepares the peer for receiving the next token's data
         next_step_idx = step_idx + 1
-        INFERENCE_CONTEXT[request_id]["futures"][next_step_idx] = {
-            "h": asyncio.Future(),
-            "r": asyncio.Future()
-        }
+        # This is thread-safe because it schedules creation on the loop where asyncio is running
+        concurrent_future = asyncio.run_coroutine_threadsafe(
+            create_future_pair(),
+            main_loop
+        )
+        # Block until the futures are created on the main loop and get the result
+        future_pair = concurrent_future.result()
+
+        INFERENCE_CONTEXT[request_id]["futures"][next_step_idx] = future_pair
         
         # IMPORTANT: Increment step index for the *next* hook invocation
         hook_context["step_idx"] = next_step_idx
