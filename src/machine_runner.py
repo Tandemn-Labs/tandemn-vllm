@@ -778,7 +778,12 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                         print(f"🎯 Subscribed to deployment instructions on topic {deployment_topic}")
                     if not hidden_state_subscribed:
                         hidden_state_topic = bytes("hidden_state_topic".ljust(32), 'utf-8')[:32]
-                        await current_node.gossip().subscribe(hidden_state_topic, bootstrap_peers, HiddenStateCallback())
+                        global hidden_state_gossip_sink
+                        hidden_state_gossip_sink = await current_node.gossip().subscribe(
+                            hidden_state_topic,
+                            bootstrap_peers,
+                            HiddenStateCallback(),
+                        )
                         hidden_state_subscribed = True
                         print(f"🎯 Subscribed to hidden-state transfers on topic {hidden_state_topic}")
                     if not trigger_subscribed:
