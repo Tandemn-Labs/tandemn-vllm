@@ -15,7 +15,6 @@ from colorama import Fore, Style, init as colorama_init
 from iroh import PublicKey, NodeAddr, MessageType
 from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT
 import pickle
-from vllm import SamplingParams
 
 # FORCE vLLM v0 mode (required for selective layer loading)
 os.environ["VLLM_USE_V1"] = "0"
@@ -114,33 +113,28 @@ class DeploymentGossipCallback(iroh.GossipMessageCallback):
 
 # IROH STARTS HERE
 class HiddenStateCallback(iroh.GossipMessageCallback):
-    "handles the hidden state gossip messages"
+    """Handles the hidden state gossip messages and stores data for synchronous access"""
     async def on_message(self, msg):
-        if msg.type()!=MessageType.RECEIVED:
+        if msg.type() != MessageType.RECEIVED:
             print(f"🔍 [DEBUG] HiddenStateCallback received non-RECEIVED message")
             return
         try:
             ref = json.loads(msg.as_received().content.decode())
-            request_id=ref.get("request_id")
+            request_id = ref.get("request_id")
 
-            # check if this message is for this peer or some else
-            if not request_id or request_id not in INFERENCE_CONTEXT:
-                print(f"🔍 [DEBUG] HiddenStateCallback received message for unknown request_id: {request_id}")
+            # Check if this message is for this peer
+            if not request_id:
+                print(f"🔍 [DEBUG] HiddenStateCallback received message with no request_id")
                 return
             
             step_idx = ref.get("step_idx", 0)
-            futures_map = INFERENCE_CONTEXT[request_id].get("futures", {})
-            pair = futures_map.get(step_idx)
-
-            if not pair:
-                print(f"❌ No future pair found for request {request_id} at step {step_idx}")
-                return
+            print(f"🔍 [DEBUG] HiddenStateCallback received message for request_id: {request_id}, step: {step_idx}")
 
             if not current_node:
                 print(f"❌ Iroh node not initialized, cannot process blob.")
                 return
 
-            # Properly download the blob first before reading
+            # Download the blob (same as before)
             blob_ticket_str = ref.get("blob_ticket")
             if not blob_ticket_str:
                 print(f"❌ No blob_ticket in message for {request_id}")
@@ -155,7 +149,7 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
             class DownloadProgressCallback(iroh.DownloadCallback):
                 async def progress(self, progress):
                     print(f"🔍 [DEBUG] Download progress: {progress}")
-                    pass  # Silent progress tracking
+                    pass
             
             # Download the blob using ticket-derived options
             print(f"🔍 [DEBUG] Downloading blob {blob_hash}...")
@@ -167,13 +161,24 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
             print(f"🔍 [DEBUG] Read {len(hidden_bytes)} bytes from blob")
             data = pickle.loads(hidden_bytes)
 
-            # check if hidden state or residual
-            # if information is provided, set the future to the result so the pre_hooks can be unblocked
-            future = pair["r"] if ref.get("is_residual") else pair["h"]
-            if not future.done():
-                future.set_result(data)
-                status = "residual" if ref.get("is_residual") else "hidden_state"
-                print(f"✅ Set {status} future for {request_id} at step {step_idx}")
+            # Store data directly in INFERENCE_CONTEXT for synchronous access (thread-safe)
+            from src.utils.inference_utils import INFERENCE_CONTEXT, CONTEXT_LOCK
+            
+            with CONTEXT_LOCK:
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                
+                if step_idx not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][step_idx] = {}
+                
+                # Store the tensor based on type
+                if ref.get("is_residual"):
+                    INFERENCE_CONTEXT[request_id][step_idx]["residual"] = data
+                    print(f"✅ Stored residual for {request_id} at step {step_idx}")
+                else:
+                    INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = data
+                    print(f"✅ Stored hidden_state for {request_id} at step {step_idx}")
+                
         except Exception as e:
             print(f"❌ Error in HiddenStateCallback: {e}")
             import traceback
@@ -181,18 +186,16 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
 # IROH ENDS HERE
 
 # IROH STARTS HERE
-# this is the callback function that needs to be called for the inference to start
-
 class TriggerCallback(iroh.GossipMessageCallback):
-    "handles the initial inference trigger from the server"
+    """Handles the initial inference trigger from the server"""
     async def on_message(self, msg):
-        if msg.type()!=MessageType.RECEIVED:
+        if msg.type() != MessageType.RECEIVED:
             print(f"🔍 [DEBUG] TriggerCallback received non-RECEIVED message")
             return
         
         try:
-            payload=json.loads(msg.as_received().content.decode())
-            if payload.get("action")!="start_inference":
+            payload = json.loads(msg.as_received().content.decode())
+            if payload.get("action") != "start_inference":
                 print(f"🔍 [DEBUG] TriggerCallback received non-start_inference message")
                 return
             
@@ -206,25 +209,19 @@ class TriggerCallback(iroh.GossipMessageCallback):
             is_first_peer = pipeline[0] == current_peer_id
             print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id} (is_first_peer: {is_first_peer})")
 
-            # ALL peers in the pipeline must start their vLLM engine.
-            # The first peer gets the real prompt, others will start and wait in the pre_hook.
+            # Initialize context for this request (no futures needed anymore)
             if request_id not in INFERENCE_CONTEXT:
-                INFERENCE_CONTEXT[request_id] = {"futures": {}}
-            
-            # Non-first peers need a future to await the first hidden state from the previous peer.
-            if not is_first_peer:
-                INFERENCE_CONTEXT[request_id]["futures"][0] = {
-                    "h": asyncio.Future(),
-                    "r": asyncio.Future()
-                }
+                INFERENCE_CONTEXT[request_id] = {}
             
             if not start_inference_run:
                 print(f"🔍 [DEBUG] start_inference_run is not set, cannot proceed.")
                 return
             
-            # ALL peers in the pipeline must start their vLLM engine.
-            # The first peer gets the real prompt, others will start and wait in the pre_hook.
+            # Start the inference run in a background thread
             input_text = payload.get("input_text")
+
+            # Import SamplingParams locally to avoid top-level import issues
+            from vllm import SamplingParams
 
             loop = asyncio.get_running_loop()
             loop.run_in_executor(
@@ -232,7 +229,7 @@ class TriggerCallback(iroh.GossipMessageCallback):
                 start_inference_run,
                 payload["request_id"],
                 payload["pipeline"],
-                input_text,  # Use modified input_text
+                input_text,
                 SamplingParams(**payload["sampling_params"]),
                 payload["assigned_layers"],
             )
@@ -243,6 +240,7 @@ class TriggerCallback(iroh.GossipMessageCallback):
             traceback.print_exc()
 
         print(f"🔍 [DEBUG] TriggerCallback completed for {payload.get('request_id')}")
+# IROH ENDS HERE
 # ============================================================================
 # SELECTIVE LAYER LOADING IMPLEMENTATION  
 # ============================================================================
