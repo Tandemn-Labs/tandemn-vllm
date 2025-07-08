@@ -160,7 +160,9 @@ def register_inference_hooks(
                 orig_positions = orig_positions.unsqueeze(0)
             elif orig_positions.dim() >= 2: #(B,S) -> (1,B,S)
                 # flatten the batch dimension
-                orig_positions = orig_positions.view(orig_positions.shape[0], -1)
+                # orig_positions = orig_positions.view(orig_positions.shape[0], -1)
+                orig_positions = orig_positions.contiguous()
+
 
             # 3. Matching Sequence length with precision
             batch_size, seq_len = hidden_states.shape[:2]
@@ -197,7 +199,9 @@ def register_inference_hooks(
             return
             
         # Prevent multiple calls per inference - only send once per request
-        context_key = f"{request_id}_sent"
+        # context_key = f"{request_id}_sent"
+        context_key = f"{request_id}_{hook_context['step_idx']}_sent"
+        print(f"🔍 [DEBUG] context_key: {context_key}")
         if hook_context.get(context_key, False):
             return  # Already sent for this request
         hook_context[context_key] = True
@@ -257,6 +261,9 @@ def register_inference_hooks(
             ),
             main_loop
         )
+        context_key = f"{request_id}_{step_idx}_sent"
+        hook_context[context_key] = True
+        hook_context["step_idx"] += 1   
     
     # Capture the main asyncio loop so we can schedule coroutines from threads
     main_loop = asyncio.get_running_loop()
