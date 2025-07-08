@@ -215,7 +215,7 @@ class TriggerCallback(iroh.GossipMessageCallback):
             
             # ALL peers in the pipeline must start their vLLM engine.
             # The first peer gets the real prompt, others will start and wait in the pre_hook.
-            input_text = payload.get("input_text") if is_first_peer else ""
+            input_text = payload.get("input_text")
 
             loop = asyncio.get_running_loop()
             loop.run_in_executor(
