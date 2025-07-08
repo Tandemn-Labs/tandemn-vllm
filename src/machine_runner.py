@@ -127,8 +127,19 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
             if not request_id or request_id not in INFERENCE_CONTEXT:
                 print(f"🔍 [DEBUG] HiddenStateCallback received message for unknown request_id: {request_id}")
                 return
-            print(f"🔍 [DEBUG] HiddenStateCallback received message for request_id: {request_id}")
             
+            step_idx = ref.get("step_idx", 0)
+            futures_map = INFERENCE_CONTEXT[request_id].get("futures", {})
+            pair = futures_map.get(step_idx)
+
+            if not pair:
+                print(f"❌ No future pair found for request {request_id} at step {step_idx}")
+                return
+
+            if not current_node:
+                print(f"❌ Iroh node not initialized, cannot process blob.")
+                return
+
             # Properly download the blob first before reading
             blob_ticket_str = ref.get("blob_ticket")
             if not blob_ticket_str:
@@ -158,16 +169,11 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
 
             # check if hidden state or residual
             # if information is provided, set the future to the result so the pre_hooks can be unblocked
-            if ref.get("is_residual"):
-                future=INFERENCE_CONTEXT[request_id].get("residual_future")
-                if future:
-                    future.set_result(data)
-                    print(f"✅ Set residual future for {request_id}")
-            else:
-                future=INFERENCE_CONTEXT[request_id].get("hidden_state_future")
-                if future:
-                    future.set_result(data)
-                    print(f"✅ Set hidden_state future for {request_id}")
+            future = pair["r"] if ref.get("is_residual") else pair["h"]
+            if not future.done():
+                future.set_result(data)
+                status = "residual" if ref.get("is_residual") else "hidden_state"
+                print(f"✅ Set {status} future for {request_id} at step {step_idx}")
         except Exception as e:
             print(f"❌ Error in HiddenStateCallback: {e}")
             import traceback
@@ -200,14 +206,17 @@ class TriggerCallback(iroh.GossipMessageCallback):
             is_first_peer = pipeline[0] == current_peer_id
             print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id} (is_first_peer: {is_first_peer})")
 
-            # Subsequent peers need futures to await data, which are created here.
+            # ALL peers in the pipeline must start their vLLM engine.
+            # The first peer gets the real prompt, others will start and wait in the pre_hook.
+            if request_id not in INFERENCE_CONTEXT:
+                INFERENCE_CONTEXT[request_id] = {"futures": {}}
+            
+            # Non-first peers need a future to await the first hidden state from the previous peer.
             if not is_first_peer:
-                INFERENCE_CONTEXT[request_id] = {
-                    "hidden_state_future": asyncio.Future(),
-                    "residual_future": asyncio.Future()
+                INFERENCE_CONTEXT[request_id]["futures"][0] = {
+                    "h": asyncio.Future(),
+                    "r": asyncio.Future()
                 }
-            else:
-                INFERENCE_CONTEXT[request_id] = {} # First peer doesn't wait for incoming data.
             
             if not start_inference_run:
                 print(f"🔍 [DEBUG] start_inference_run is not set, cannot proceed.")

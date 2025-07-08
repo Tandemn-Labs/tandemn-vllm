@@ -5,12 +5,14 @@ import httpx  # type: ignore
 import json
 from typing import Dict, Any, List
 import time
-from vllm import TokensPrompt, LLM  # type: ignore
+from vllm import LLM, SamplingParams, TokensPrompt  # type: ignore
+import torch
+from collections import deque
 
 
 # This global dictionary is the bridge between the async network world and the sync vLLM world.
 # Key: request_id (str)
-# Value: A dictionary holding asyncio.Future objects for the hidden_state and residual.
+# Value: A dictionary holding a dictionary of asyncio.Future objects, keyed by step_idx
 # Basically just a placeholder for the time we do not move on to AsyncVLLM. 
 INFERENCE_CONTEXT: Dict[str, Dict[str, Any]] = {}
 sent_flag=False
@@ -112,38 +114,41 @@ def register_inference_hooks(
     # Just a placeholder for the hooks 
     hook_context: Dict[str, Any] = {}
 
+    def _slice_last_token(t: torch.Tensor) -> torch.Tensor:
+        """Slices the last token from a tensor, handling both 2D and 3D cases."""
+        if t.dim() == 2:
+            return t[-1:, :]  # Shape (T, D) -> (1, D)
+        elif t.dim() > 2:
+            return t[:, -1:, :]  # Shape (B, T, D) -> (B, 1, D)
+        return t
+
     def pre_hook(module, args):
         "this hook is called BEFORE a layer does its forward pass"
         request_id = hook_context["request_id"]
         if not hook_context["is_first_peer"]:
             print("Detected a non-first peer, injecting previous peer's hidden state")
             
-            # GET futures from context, do not create them here, because many times the hidden states are not available 
-            hidden_state_future = INFERENCE_CONTEXT[request_id].get("hidden_state_future")
-            residual_future = INFERENCE_CONTEXT[request_id].get("residual_future")
-
-            if not hidden_state_future or not residual_future:
-                print(f"❌ CRITICAL: Futures not found for {request_id} on non-first peer!")
-                # Without futures, this peer cannot proceed. Returning original args.
+            step_idx = hook_context.get("step_idx", 0)
+            futures_map = INFERENCE_CONTEXT.get(request_id, {}).get("futures", {})
+            
+            pair = futures_map.get(step_idx)
+            if not pair:
+                print(f"❌ CRITICAL: Futures not found for {request_id} step {step_idx} on non-first peer!")
                 return args
-            
-            # Block and wait for the hidden state and residual to be available
-            # loop = asyncio.get_running_loop()
-            # print(f"⏳ Waiting for hidden state for {request_id}...")
-            # hidden_states = loop.run_until_complete(hidden_state_future)
-            # print(f"⏳ Waiting for residual for {request_id}...")
-            # residual = loop.run_until_complete(residual_future)
-            
+
+            hidden_state_future = pair["h"]
+            residual_future = pair["r"]
+
             # Basically loop until complete is done, and then get the result
-            print(f"⏳ Waiting for hidden state for {request_id}...")
+            print(f"⏳ Waiting for hidden state for {request_id} (step {step_idx})...")
             while not hidden_state_future.done():
                 time.sleep(0.01)
             hidden_states = hidden_state_future.result()
-            print(f"⏳ Waiting for residual for {request_id}...")
+            print(f"⏳ Waiting for residual for {request_id} (step {step_idx})...")
             while not residual_future.done():
                 time.sleep(0.01)
             residual = residual_future.result()
-            print(f"✅ Received hidden state and residual for {request_id}. Injecting into the next layer.")
+            print(f"✅ Received hidden state and residual for {request_id} (step {step_idx}). Injecting into the next layer.")
 
             # Slice original positions to match the seq_len of hidden_states
             orig_positions = args[0]
@@ -198,15 +203,14 @@ def register_inference_hooks(
         if hook_context["is_last_peer"]:
             return
             
+        step_idx = hook_context.get("step_idx", 0)
         # Prevent multiple calls per inference - only send once per request
-        # context_key = f"{request_id}_sent"
-        context_key = f"{request_id}_{hook_context['step_idx']}_sent"
-        print(f"🔍 [DEBUG] context_key: {context_key}")
+        context_key = f"{request_id}_step_{step_idx}_sent"
         if hook_context.get(context_key, False):
             return  # Already sent for this request
         hook_context[context_key] = True
         
-        print(f"↪️ POST-HOOK for {request_id}: Sending hidden states...")
+        print(f"↪️ POST-HOOK for {request_id}, step {step_idx}: Sending hidden states...")
         hidden_states,residual=output
         pipeline = hook_context["pipeline"]
         current_idx=pipeline.index(peer_id)
@@ -217,19 +221,9 @@ def register_inference_hooks(
         # based on the generation phase. 
         # During decoding, send the last token (incremental)
         # during prefill, send the full sequence
-        step_idx = hook_context["step_idx"]
         if step_idx > 0:
-            if hidden_states.dim() >= 2: #(B,S) -> (1,B,S)
-                hidden_states = hidden_states[:, -1:, :] # sending only the last token
-            if residual.dim() >= 2: #(B,S) -> (1,B,S)
-                residual = residual[:, -1:, :] # sending only the last token
-        # check if we need the below code or not
-        # else:
-        #     # during prefill, send the full sequence
-        #     if hidden_states.dim() >= 2: #(B,S) -> (1,B,S)
-        #         hidden_states = hidden_states.cpu()
-        #     if residual.dim() >= 2: #(B,S) -> (1,B,S)
-        #         residual = residual.cpu()
+            hidden_states = _slice_last_token(hidden_states)
+            residual = _slice_last_token(residual)
 
         # MATRIX MANIPULATION ENDS HERE
 
@@ -261,9 +255,17 @@ def register_inference_hooks(
             ),
             main_loop
         )
-        context_key = f"{request_id}_{step_idx}_sent"
-        hook_context[context_key] = True
-        hook_context["step_idx"] += 1   
+
+        # Create the future pair for the *next* step and add it to this peer's context
+        # This prepares the peer for receiving the next token's data
+        next_step_idx = step_idx + 1
+        INFERENCE_CONTEXT[request_id]["futures"][next_step_idx] = {
+            "h": asyncio.Future(),
+            "r": asyncio.Future()
+        }
+        
+        # IMPORTANT: Increment step index for the *next* hook invocation
+        hook_context["step_idx"] = next_step_idx
     
     # Capture the main asyncio loop so we can schedule coroutines from threads
     main_loop = asyncio.get_running_loop()
@@ -311,9 +313,9 @@ def register_inference_hooks(
         })
         
         # Clear any previous sent flags for this request
-        sent_key = f"{request_id}_sent"
-        if sent_key in hook_context:
-            del hook_context[sent_key]
+        for key in list(hook_context.keys()):
+            if key.startswith(f"{request_id}_") and key.endswith("_sent"):
+                del hook_context[key]
         
         # Safely get this peer's assigned layers
         real_layers = assigned_layers.get(peer_id, [])
