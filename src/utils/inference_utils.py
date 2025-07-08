@@ -23,7 +23,8 @@ async def send_hidden_state_blob(
     next_peer_id: str,
     pipeline: List[str],
     data_to_send: Any,
-    is_residual: bool = False
+    is_residual: bool = False,
+    step_idx: int = 0 # add the tracking for the step so as to only send last token during decoding
 ):
     "Serializes the data, stores it as a blob, and sends it to the next peer"
     try:
@@ -43,7 +44,8 @@ async def send_hidden_state_blob(
             "tensor_dtype": str(data_to_send.dtype),
             "next_peer_id": next_peer_id,
             "pipeline": pipeline,
-            "is_residual": is_residual
+            "is_residual": is_residual,
+            "step_idx": step_idx
         }
         reference_bytes = json.dumps(reference).encode()
         # send it over gossip network
@@ -145,21 +147,41 @@ def register_inference_hooks(
 
             # Slice original positions to match the seq_len of hidden_states
             orig_positions = args[0]
-            
-            # TODO: Understand what the hell is this
-            if orig_positions.dim() == 1:  
-                orig_positions = orig_positions.unsqueeze(0)  # add a dimension for the batch size
-            
-            seq_len = hidden_states.shape[1]
-            # Keep the last seq_len tokens
-            # i am not sure if this is correct or not
-            positions_to_inject = orig_positions[:, -seq_len:]
 
+            # MATRIX MANIPULATION STARTS HERE
+            # 1. Ensure that the hidden states and residuals have the same batch dimension
+            if hidden_states.dim() == 2: #(B,S) -> (1,B,S)
+                hidden_states = hidden_states.unsqueeze(0)
+            if residual.dim() == 2: #(B,S) -> (1,B,S)
+                residual = residual.unsqueeze(0)
+            
+            # 2. Ensure the positions have the same batch dimension
+            if orig_positions.dim() == 1: #(S,) -> (1,S)
+                orig_positions = orig_positions.unsqueeze(0)
+            elif orig_positions.dim() >= 2: #(B,S) -> (1,B,S)
+                # flatten the batch dimension
+                orig_positions = orig_positions.view(orig_positions.shape[0], -1)
 
-            # Move to correct device
+            # 3. Matching Sequence length with precision
+            batch_size, seq_len = hidden_states.shape[:2]
+            
+            # 4. Slice the positions to match the hidden states sequence length
+            if orig_positions.shape[1] >= seq_len:
+                positions_to_inject = orig_positions[:, -seq_len:]
+            else:
+                positions_to_inject = orig_positions
+
+            # 5. Handle any mismatch in batch sizes
+            if positions_to_inject.shape[0] != batch_size:
+                # expand the positions to match the batch size
+                positions_to_inject = positions_to_inject.expand(batch_size, -1)
+
+            # 6. Move to correct device
             positions_to_inject = positions_to_inject.to(orig_positions.device, non_blocking=True)
             hidden_states_to_inject = hidden_states.to(positions_to_inject.device, non_blocking=True)
             residual_to_inject = residual.to(positions_to_inject.device, non_blocking=True)
+
+            # MATRIX MANIPULATION ENDS HERE
 
             return (positions_to_inject, hidden_states_to_inject, residual_to_inject)
         
@@ -186,6 +208,27 @@ def register_inference_hooks(
         current_idx=pipeline.index(peer_id)
         next_peer_id=pipeline[current_idx+1]
 
+        # MATRIX MANIPULATION STARTS HERE
+        # 1. Implement Smart Slicing - Only send the necessary tokens to the next peer
+        # based on the generation phase. 
+        # During decoding, send the last token (incremental)
+        # during prefill, send the full sequence
+        step_idx = hook_context["step_idx"]
+        if step_idx > 0:
+            if hidden_states.dim() >= 2: #(B,S) -> (1,B,S)
+                hidden_states = hidden_states[:, -1:, :] # sending only the last token
+            if residual.dim() >= 2: #(B,S) -> (1,B,S)
+                residual = residual[:, -1:, :] # sending only the last token
+        # check if we need the below code or not
+        # else:
+        #     # during prefill, send the full sequence
+        #     if hidden_states.dim() >= 2: #(B,S) -> (1,B,S)
+        #         hidden_states = hidden_states.cpu()
+        #     if residual.dim() >= 2: #(B,S) -> (1,B,S)
+        #         residual = residual.cpu()
+
+        # MATRIX MANIPULATION ENDS HERE
+
         # Schedule sends on the main asyncio loop (thread-safe)
         # not really sure if this is the best way to do this
         asyncio.run_coroutine_threadsafe(
@@ -196,7 +239,8 @@ def register_inference_hooks(
                 next_peer_id,
                 pipeline,
                 hidden_states.cpu(),
-                is_residual=False
+                is_residual=False, 
+                step_idx=step_idx
             ),
             main_loop
         )
@@ -215,6 +259,7 @@ def register_inference_hooks(
     
     # Capture the main asyncio loop so we can schedule coroutines from threads
     main_loop = asyncio.get_running_loop()
+
     def final_output_hook(module, args, output):
         global sent_flag
         "Runs on the final peer, sends the final output to the server"
@@ -238,6 +283,7 @@ def register_inference_hooks(
         # delete the request_id from the INFERENCE_CONTEXT
         if request_id in INFERENCE_CONTEXT:
             del INFERENCE_CONTEXT[request_id]
+
     # confirm this -> do we need to send in the tokens or do we need to send the prompt? assigned Layers will come from the pipeline
     def start_inference_run(request_id: str, pipeline: List[str], input_text: str, sampling_params: Any, assigned_layers: Dict[str, List[int]]):
         "The runner of inference hehe"
