@@ -130,7 +130,7 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
             print(f"🔍 [DEBUG] HiddenStateCallback received message for request_id: {request_id}")
             # download the blob data from it
             blob_ticket=iroh.BlobTicket(ref.get("blob_ticket"))
-            hidden_bytes=await current_node.blob().read_ticket(blob_ticket.hash())
+            hidden_bytes=await current_node.blobs().read_to_bytes(blob_ticket.hash())
             data=pickle.loads(hidden_bytes)
 
             # check if hidden state or residual
