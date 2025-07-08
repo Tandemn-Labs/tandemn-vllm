@@ -252,7 +252,8 @@ def register_inference_hooks(
                 next_peer_id,
                 pipeline,
                 residual.cpu(),
-                is_residual=True
+                is_residual=True,
+                step_idx=step_idx
             ),
             main_loop
         )
@@ -298,7 +299,8 @@ def register_inference_hooks(
             "input_text": input_text,
             "is_first_peer": is_first,
             "is_last_peer": is_last,
-            "peer_id": peer_id
+            "peer_id": peer_id,
+            "step_idx": 0
         })
         
         # Clear any previous sent flags for this request
