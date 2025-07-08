@@ -115,23 +115,31 @@ def register_inference_hooks(
         request_id = hook_context["request_id"]
         if not hook_context["is_first_peer"]:
             print("Detected a non-first peer, injecting previous peer's hidden state")
-            hidden_state_future=asyncio.Future() # because many times the hidden state is not available immediately
-            residual_future=asyncio.Future()
-            # storing future for the time we are not using AsyncVLLM
-            INFERENCE_CONTEXT[request_id]["hidden_state_future"]=hidden_state_future
-            INFERENCE_CONTEXT[request_id]["residual_future"]=residual_future
             
-            # make an infinite loop to wait for the hidden state and residual to be available
-            loop=asyncio.get_running_loop()
-            hidden_states=loop.run_until_complete(hidden_state_future)
-            residual=loop.run_until_complete(residual_future)
-            print(f"✅ Received hidden state and residual for {request_id}. Injecting into the next layer rn")
-            # add this within 
+            # GET futures from context, do not create them here, because many times the hidden states are not available 
+            hidden_state_future = INFERENCE_CONTEXT[request_id].get("hidden_state_future")
+            residual_future = INFERENCE_CONTEXT[request_id].get("residual_future")
+
+            if not hidden_state_future or not residual_future:
+                print(f"❌ CRITICAL: Futures not found for {request_id} on non-first peer!")
+                # Without futures, this peer cannot proceed. Returning original args.
+                return args
+
+            # Block and wait for the hidden state and residual to be available
+            loop = asyncio.get_running_loop()
+            print(f"⏳ Waiting for hidden state for {request_id}...")
+            hidden_states = loop.run_until_complete(hidden_state_future)
+            print(f"⏳ Waiting for residual for {request_id}...")
+            residual = loop.run_until_complete(residual_future)
+            print(f"✅ Received hidden state and residual for {request_id}. Injecting into the next layer.")
+            
+            # Inject the received tensors into the model arguments
             argument = args[0]
             hidden_states_to_inject = hidden_states.to(argument.device)
             residual_to_inject = residual.to(argument.device)
             return (argument, hidden_states_to_inject, residual_to_inject)
-        # else just return the args as is, as we do not have to do anything here
+        
+        # If this is the first peer, just return the original args
         return args
 
     def post_hook(module, args, output):
@@ -176,7 +184,7 @@ def register_inference_hooks(
                 next_peer_id,
                 pipeline,
                 residual.cpu(),
-                is_residual=False
+                is_residual=True
             ),
             main_loop
         )

@@ -193,41 +193,41 @@ class TriggerCallback(iroh.GossipMessageCallback):
             pipeline = payload.get("pipeline")
             request_id = payload.get("request_id")
             
-            # ALL peers need to know about this request for hidden state handling
-            if request_id and current_peer_id in pipeline:
-                print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id}")
-                INFERENCE_CONTEXT[request_id] = {}
-            
-            # we need to make sure that ONLY THE FIRST PEER starts the inference process
-            if pipeline and pipeline[0]==current_peer_id:
-                print(f"🔍 [DEBUG] TriggerCallback received start_inference message from the first peer")
-                if not start_inference_run:
-                    print(f"🔍 [DEBUG] TriggerCallback received start_inference message from the first peer, but start_inference_run is not set")
-                    return
-                
-                ##get the inference context
-                INFERENCE_CONTEXT[payload.get("request_id")]={}
-                sampling_params= SamplingParams(**payload.get("sampling_params"))
+            # This peer is not in the pipeline, ignore
+            if not (request_id and current_peer_id in pipeline):
+                return
 
-                # start the synchronous and blocking inference run in a separate thread
-                # so that the main thread can continue gossip messages and the main loop isnt blocked
-                loop=asyncio.get_running_loop()
-                # loop.run_in_executor(None, # use default thread pool
-                #                     start_inference_run,
-                #                     payload.get("request_id"),
-                #                     pipeline,
-                #                     payload.get("token_ids"),
-                #                     sampling_params,
-                #                     payload.get("assigned_layers"))
-                loop.run_in_executor(
-                    None,
-                    start_inference_run,
-                    payload["request_id"],
-                    payload["pipeline"],
-                    payload["input_text"],
-                    SamplingParams(**payload["sampling_params"]),
-                    payload["assigned_layers"],            # will now be your dict
-                )
+            is_first_peer = pipeline[0] == current_peer_id
+            print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id} (is_first_peer: {is_first_peer})")
+
+            # Subsequent peers need futures to await data, which are created here.
+            if not is_first_peer:
+                INFERENCE_CONTEXT[request_id] = {
+                    "hidden_state_future": asyncio.Future(),
+                    "residual_future": asyncio.Future()
+                }
+            else:
+                INFERENCE_CONTEXT[request_id] = {} # First peer doesn't wait for incoming data.
+            
+            if not start_inference_run:
+                print(f"🔍 [DEBUG] start_inference_run is not set, cannot proceed.")
+                return
+            
+            # ALL peers in the pipeline must start their vLLM engine.
+            # The first peer gets the real prompt, others will start and wait in the pre_hook.
+            input_text = payload.get("input_text") if is_first_peer else ""
+
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(
+                None,
+                start_inference_run,
+                payload["request_id"],
+                payload["pipeline"],
+                input_text,  # Use modified input_text
+                SamplingParams(**payload["sampling_params"]),
+                payload["assigned_layers"],
+            )
+
         except Exception as e:
             print(f"❌ Error in TriggerCallback: {e}")
             import traceback
