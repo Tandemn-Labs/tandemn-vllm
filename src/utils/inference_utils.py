@@ -461,9 +461,7 @@ def register_inference_hooks(
             main_loop
         )
         
-        # IMPORTANT: Increment step index for the *next* hook invocation
-        with context_lock:
-            hook_context["current_step"] = current_step + 1
+        # NOTE: Step increment moved to sampler_post_hook to ensure it happens on ALL peers
     
     # Capture the main asyncio loop so we can schedule coroutines from threads
     main_loop = asyncio.get_running_loop()
@@ -500,6 +498,11 @@ def register_inference_hooks(
                 ),
                 main_loop
             )
+            
+            # CRITICAL FIX: Increment step on ALL peers, including last peer
+            with context_lock:
+                hook_context["current_step"] = current_step + 1
+                
             return output
         else:
             # Not the last peer, must wait for the definitive sampler output.
@@ -513,6 +516,11 @@ def register_inference_hooks(
                     if step_data and "sampler_output" in step_data:
                         received_output = step_data["sampler_output"]
                         print(f"✅ Received sampler output for {request_id} (step {current_step}).")
+                        
+                        # CRITICAL FIX: Increment step on non-last peers too
+                        with context_lock:
+                            hook_context["current_step"] = current_step + 1
+                            
                         # Here, we are replacing this peer's sampler output with the one from the last peer
                         return received_output
                 

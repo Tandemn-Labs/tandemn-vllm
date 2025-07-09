@@ -149,8 +149,7 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
             # Define a simple download callback
             class DownloadProgressCallback(iroh.DownloadCallback):
                 async def progress(self, progress):
-                    print(f"🔍 [DEBUG] Download progress: {progress}")
-                    pass
+                    pass  # No-op callback to avoid NoneType errors
             
             # Download the blob using ticket-derived options
             print(f"🔍 [DEBUG] Downloading blob {blob_hash}...")
@@ -216,7 +215,12 @@ class TokenCallback(iroh.GossipMessageCallback):
             blob_hash = blob_ticket.hash()
             opts = blob_ticket.as_download_options()
             
-            await current_node.blobs().download(blob_hash, opts, None)
+            # Define a simple download callback to avoid the NoneType error
+            class SimpleDownloadCallback(iroh.DownloadCallback):
+                async def progress(self, progress):
+                    pass  # No-op callback
+            
+            await current_node.blobs().download(blob_hash, opts, SimpleDownloadCallback())
             
             token_bytes = await current_node.blobs().read_to_bytes(blob_hash)
             data = pickle.loads(token_bytes)
