@@ -47,6 +47,7 @@ assigned_layers_global=[] # this is the global variable for the assigned layers
 current_node = None 
 current_peer_id = None
 hidden_state_gossip_sink = None # this is the gossip sink for the hidden states
+token_gossip_sink = None # this is the gossip sink for sampler outputs
 
 # Constants for document keys
 # TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
@@ -185,6 +186,58 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
             traceback.print_exc()
 # IROH ENDS HERE
 
+
+# IROH STARTS HERE
+class TokenCallback(iroh.GossipMessageCallback):
+    """Handles the token gossip messages and stores data for synchronous access"""
+    async def on_message(self, msg):
+        if msg.type() != MessageType.RECEIVED:
+            print(f"🔍 [DEBUG] TokenCallback received non-RECEIVED message")
+            return
+        try:
+            ref = json.loads(msg.as_received().content.decode())
+            request_id = ref.get("request_id")
+            if not request_id:
+                return
+            
+            step_idx = ref.get("step_idx", 0)
+            print(f"📨 TokenCallback received message for request_id: {request_id}, step: {step_idx}")
+
+            if not current_node:
+                print(f"❌ Iroh node not initialized, cannot process blob.")
+                return
+
+            blob_ticket_str = ref.get("blob_ticket")
+            if not blob_ticket_str:
+                print(f"❌ No blob_ticket in message for {request_id}")
+                return
+                
+            blob_ticket = iroh.BlobTicket(blob_ticket_str)
+            blob_hash = blob_ticket.hash()
+            opts = blob_ticket.as_download_options()
+            
+            await current_node.blobs().download(blob_hash, opts, None)
+            
+            token_bytes = await current_node.blobs().read_to_bytes(blob_hash)
+            data = pickle.loads(token_bytes)
+
+            from src.utils.inference_utils import INFERENCE_CONTEXT, CONTEXT_LOCK
+            with CONTEXT_LOCK:
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                if step_idx not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][step_idx] = {}
+                
+                INFERENCE_CONTEXT[request_id][step_idx]["sampler_output"] = data
+                print(f"✅ Stored sampler_output for {request_id} at step {step_idx}")
+                
+        except Exception as e:
+            print(f"❌ Error in TokenCallback: {e}")
+            import traceback
+            traceback.print_exc()
+# IROH ENDS HERE
+
+
 # IROH STARTS HERE
 class TriggerCallback(iroh.GossipMessageCallback):
     """Handles the initial inference trigger from the server"""
@@ -206,6 +259,7 @@ class TriggerCallback(iroh.GossipMessageCallback):
             if not (request_id and current_peer_id in pipeline):
                 return
 
+            # only the first peer gets to start the inference
             is_first_peer = pipeline[0] == current_peer_id
             print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id} (is_first_peer: {is_first_peer})")
 
@@ -468,6 +522,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             llm=deployed_model,
             node=current_node,
             hidden_state_gossip_sink=hidden_state_gossip_sink,
+            token_gossip_sink=token_gossip_sink,
             peer_id=current_peer_id,
             server_url=server_url
         )
@@ -754,6 +809,7 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
     deployment_subscribed = False  # Track if we've subscribed to deployment
     hidden_state_subscribed = False  # Track if we've subscribed to hidden-state transfers
+    token_subscribed = False # Track if we've subscribed to token transfers
     trigger_subscribed = False  # Track if we've subscribed to inference triggers
 
     # Topology tracking - only update network when peers change
@@ -816,6 +872,7 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                         await current_node.gossip().subscribe(deployment_topic, bootstrap_peers, DeploymentGossipCallback(current_node, peer_id))
                         deployment_subscribed = True
                         print(f"🎯 Subscribed to deployment instructions on topic {deployment_topic}")
+
                     if not hidden_state_subscribed:
                         hidden_state_topic = bytes("hidden_state_topic".ljust(32), 'utf-8')[:32]
                         global hidden_state_gossip_sink
@@ -826,12 +883,25 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                         )
                         hidden_state_subscribed = True
                         print(f"🎯 Subscribed to hidden-state transfers on topic {hidden_state_topic}")
+
+                    if not token_subscribed:
+                        token_topic = bytes("token_topic".ljust(32), 'utf-8')[:32]
+                        global token_gossip_sink
+                        token_gossip_sink = await current_node.gossip().subscribe(
+                            token_topic,
+                            bootstrap_peers,
+                            TokenCallback(),
+                        )
+                        token_subscribed = True
+                        print(f"🎯 Subscribed to token transfers on topic {token_topic}")
+
                     if not trigger_subscribed:
                         trigger_topic = bytes("trigger_topic".ljust(32), 'utf-8')[:32]
                         await current_node.gossip().subscribe(trigger_topic, bootstrap_peers, TriggerCallback())
                         trigger_subscribed = True
                         print(f"🎯 Subscribed to inference triggers on topic {trigger_topic}")
                         consecutive_failures = 0  # Reset on success
+
                     print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
                 else:
                     consecutive_failures += 1
