@@ -15,7 +15,6 @@ from colorama import Fore, Style, init as colorama_init
 from iroh import PublicKey, NodeAddr, MessageType
 from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT
 import pickle
-from vllm import SamplingParams
 
 # FORCE vLLM v0 mode (required for selective layer loading)
 os.environ["VLLM_USE_V1"] = "0"
@@ -48,6 +47,7 @@ assigned_layers_global=[] # this is the global variable for the assigned layers
 current_node = None 
 current_peer_id = None
 hidden_state_gossip_sink = None # this is the gossip sink for the hidden states
+token_gossip_sink = None # this is the gossip sink for sampler outputs
 
 # Constants for document keys
 # TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
@@ -114,33 +114,28 @@ class DeploymentGossipCallback(iroh.GossipMessageCallback):
 
 # IROH STARTS HERE
 class HiddenStateCallback(iroh.GossipMessageCallback):
-    "handles the hidden state gossip messages"
+    """Handles the hidden state gossip messages and stores data for synchronous access"""
     async def on_message(self, msg):
-        if msg.type()!=MessageType.RECEIVED:
+        if msg.type() != MessageType.RECEIVED:
             print(f"🔍 [DEBUG] HiddenStateCallback received non-RECEIVED message")
             return
         try:
             ref = json.loads(msg.as_received().content.decode())
-            request_id=ref.get("request_id")
+            request_id = ref.get("request_id")
 
-            # check if this message is for this peer or some else
-            if not request_id or request_id not in INFERENCE_CONTEXT:
-                print(f"🔍 [DEBUG] HiddenStateCallback received message for unknown request_id: {request_id}")
+            # Check if this message is for this peer
+            if not request_id:
+                print(f"🔍 [DEBUG] HiddenStateCallback received message with no request_id")
                 return
             
             step_idx = ref.get("step_idx", 0)
-            futures_map = INFERENCE_CONTEXT[request_id].get("futures", {})
-            pair = futures_map.get(step_idx)
-
-            if not pair:
-                print(f"❌ No future pair found for request {request_id} at step {step_idx}")
-                return
+            print(f"🔍 [DEBUG] HiddenStateCallback received message for request_id: {request_id}, step: {step_idx}")
 
             if not current_node:
                 print(f"❌ Iroh node not initialized, cannot process blob.")
                 return
 
-            # Properly download the blob first before reading
+            # Download the blob (same as before)
             blob_ticket_str = ref.get("blob_ticket")
             if not blob_ticket_str:
                 print(f"❌ No blob_ticket in message for {request_id}")
@@ -154,8 +149,7 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
             # Define a simple download callback
             class DownloadProgressCallback(iroh.DownloadCallback):
                 async def progress(self, progress):
-                    print(f"🔍 [DEBUG] Download progress: {progress}")
-                    pass  # Silent progress tracking
+                    pass  # No-op callback to avoid NoneType errors
             
             # Download the blob using ticket-derived options
             print(f"🔍 [DEBUG] Downloading blob {blob_hash}...")
@@ -167,32 +161,98 @@ class HiddenStateCallback(iroh.GossipMessageCallback):
             print(f"🔍 [DEBUG] Read {len(hidden_bytes)} bytes from blob")
             data = pickle.loads(hidden_bytes)
 
-            # check if hidden state or residual
-            # if information is provided, set the future to the result so the pre_hooks can be unblocked
-            future = pair["r"] if ref.get("is_residual") else pair["h"]
-            if not future.done():
-                future.set_result(data)
-                status = "residual" if ref.get("is_residual") else "hidden_state"
-                print(f"✅ Set {status} future for {request_id} at step {step_idx}")
+            # Store data directly in INFERENCE_CONTEXT for synchronous access (thread-safe)
+            from src.utils.inference_utils import INFERENCE_CONTEXT, CONTEXT_LOCK
+            
+            with CONTEXT_LOCK:
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                
+                if step_idx not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][step_idx] = {}
+                
+                # Store the tensor based on type
+                if ref.get("is_residual"):
+                    INFERENCE_CONTEXT[request_id][step_idx]["residual"] = data
+                    print(f"✅ Stored residual for {request_id} at step {step_idx}")
+                else:
+                    INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = data
+                    print(f"✅ Stored hidden_state for {request_id} at step {step_idx}")
+                
         except Exception as e:
             print(f"❌ Error in HiddenStateCallback: {e}")
             import traceback
             traceback.print_exc()
 # IROH ENDS HERE
 
-# IROH STARTS HERE
-# this is the callback function that needs to be called for the inference to start
 
-class TriggerCallback(iroh.GossipMessageCallback):
-    "handles the initial inference trigger from the server"
+# IROH STARTS HERE
+class TokenCallback(iroh.GossipMessageCallback):
+    """Handles the token gossip messages and stores data for synchronous access"""
     async def on_message(self, msg):
-        if msg.type()!=MessageType.RECEIVED:
+        if msg.type() != MessageType.RECEIVED:
+            print(f"🔍 [DEBUG] TokenCallback received non-RECEIVED message")
+            return
+        try:
+            ref = json.loads(msg.as_received().content.decode())
+            request_id = ref.get("request_id")
+            if not request_id:
+                return
+            
+            step_idx = ref.get("step_idx", 0)
+            print(f"📨 TokenCallback received message for request_id: {request_id}, step: {step_idx}")
+
+            if not current_node:
+                print(f"❌ Iroh node not initialized, cannot process blob.")
+                return
+
+            blob_ticket_str = ref.get("blob_ticket")
+            if not blob_ticket_str:
+                print(f"❌ No blob_ticket in message for {request_id}")
+                return
+                
+            blob_ticket = iroh.BlobTicket(blob_ticket_str)
+            blob_hash = blob_ticket.hash()
+            opts = blob_ticket.as_download_options()
+            
+            # Define a simple download callback to avoid the NoneType error
+            class SimpleDownloadCallback(iroh.DownloadCallback):
+                async def progress(self, progress):
+                    pass  # No-op callback
+            
+            await current_node.blobs().download(blob_hash, opts, SimpleDownloadCallback())
+            
+            token_bytes = await current_node.blobs().read_to_bytes(blob_hash)
+            data = pickle.loads(token_bytes)
+
+            from src.utils.inference_utils import INFERENCE_CONTEXT, CONTEXT_LOCK
+            with CONTEXT_LOCK:
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                if step_idx not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][step_idx] = {}
+                
+                INFERENCE_CONTEXT[request_id][step_idx]["sampler_output"] = data
+                print(f"✅ Stored sampler_output for {request_id} at step {step_idx}")
+                
+        except Exception as e:
+            print(f"❌ Error in TokenCallback: {e}")
+            import traceback
+            traceback.print_exc()
+# IROH ENDS HERE
+
+
+# IROH STARTS HERE
+class TriggerCallback(iroh.GossipMessageCallback):
+    """Handles the initial inference trigger from the server"""
+    async def on_message(self, msg):
+        if msg.type() != MessageType.RECEIVED:
             print(f"🔍 [DEBUG] TriggerCallback received non-RECEIVED message")
             return
         
         try:
-            payload=json.loads(msg.as_received().content.decode())
-            if payload.get("action")!="start_inference":
+            payload = json.loads(msg.as_received().content.decode())
+            if payload.get("action") != "start_inference":
                 print(f"🔍 [DEBUG] TriggerCallback received non-start_inference message")
                 return
             
@@ -203,28 +263,23 @@ class TriggerCallback(iroh.GossipMessageCallback):
             if not (request_id and current_peer_id in pipeline):
                 return
 
+            # only the first peer gets to start the inference
             is_first_peer = pipeline[0] == current_peer_id
             print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id} (is_first_peer: {is_first_peer})")
 
-            # ALL peers in the pipeline must start their vLLM engine.
-            # The first peer gets the real prompt, others will start and wait in the pre_hook.
+            # Initialize context for this request (no futures needed anymore)
             if request_id not in INFERENCE_CONTEXT:
-                INFERENCE_CONTEXT[request_id] = {"futures": {}}
-            
-            # Non-first peers need a future to await the first hidden state from the previous peer.
-            if not is_first_peer:
-                INFERENCE_CONTEXT[request_id]["futures"][0] = {
-                    "h": asyncio.Future(),
-                    "r": asyncio.Future()
-                }
+                INFERENCE_CONTEXT[request_id] = {}
             
             if not start_inference_run:
                 print(f"🔍 [DEBUG] start_inference_run is not set, cannot proceed.")
                 return
             
-            # ALL peers in the pipeline must start their vLLM engine.
-            # The first peer gets the real prompt, others will start and wait in the pre_hook.
+            # Start the inference run in a background thread
             input_text = payload.get("input_text")
+
+            # Import SamplingParams locally to avoid top-level import issues
+            from vllm import SamplingParams
 
             loop = asyncio.get_running_loop()
             loop.run_in_executor(
@@ -232,7 +287,7 @@ class TriggerCallback(iroh.GossipMessageCallback):
                 start_inference_run,
                 payload["request_id"],
                 payload["pipeline"],
-                input_text,  # Use modified input_text
+                input_text,
                 SamplingParams(**payload["sampling_params"]),
                 payload["assigned_layers"],
             )
@@ -243,6 +298,7 @@ class TriggerCallback(iroh.GossipMessageCallback):
             traceback.print_exc()
 
         print(f"🔍 [DEBUG] TriggerCallback completed for {payload.get('request_id')}")
+# IROH ENDS HERE
 # ============================================================================
 # SELECTIVE LAYER LOADING IMPLEMENTATION  
 # ============================================================================
@@ -470,6 +526,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             llm=deployed_model,
             node=current_node,
             hidden_state_gossip_sink=hidden_state_gossip_sink,
+            token_gossip_sink=token_gossip_sink,
             peer_id=current_peer_id,
             server_url=server_url
         )
@@ -756,6 +813,7 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
     deployment_subscribed = False  # Track if we've subscribed to deployment
     hidden_state_subscribed = False  # Track if we've subscribed to hidden-state transfers
+    token_subscribed = False # Track if we've subscribed to token transfers
     trigger_subscribed = False  # Track if we've subscribed to inference triggers
 
     # Topology tracking - only update network when peers change
@@ -818,6 +876,7 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                         await current_node.gossip().subscribe(deployment_topic, bootstrap_peers, DeploymentGossipCallback(current_node, peer_id))
                         deployment_subscribed = True
                         print(f"🎯 Subscribed to deployment instructions on topic {deployment_topic}")
+
                     if not hidden_state_subscribed:
                         hidden_state_topic = bytes("hidden_state_topic".ljust(32), 'utf-8')[:32]
                         global hidden_state_gossip_sink
@@ -828,12 +887,25 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                         )
                         hidden_state_subscribed = True
                         print(f"🎯 Subscribed to hidden-state transfers on topic {hidden_state_topic}")
+
+                    if not token_subscribed:
+                        token_topic = bytes("token_topic".ljust(32), 'utf-8')[:32]
+                        global token_gossip_sink
+                        token_gossip_sink = await current_node.gossip().subscribe(
+                            token_topic,
+                            bootstrap_peers,
+                            TokenCallback(),
+                        )
+                        token_subscribed = True
+                        print(f"🎯 Subscribed to token transfers on topic {token_topic}")
+
                     if not trigger_subscribed:
                         trigger_topic = bytes("trigger_topic".ljust(32), 'utf-8')[:32]
                         await current_node.gossip().subscribe(trigger_topic, bootstrap_peers, TriggerCallback())
                         trigger_subscribed = True
                         print(f"🎯 Subscribed to inference triggers on topic {trigger_topic}")
                         consecutive_failures = 0  # Reset on success
+
                     print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
                 else:
                     consecutive_failures += 1
