@@ -6,16 +6,17 @@ import json
 import torch
 import iroh
 import httpx
-from iroh.iroh_ffi import uniffi_set_event_loop
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import time
 import aiofiles
 from colorama import Fore, Style, init as colorama_init
-from iroh import PublicKey, NodeAddr, MessageType
 from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT
 import pickle
 
+## Tensor_Iroh Starts here ###########################
+from src.utils.tensor_protocol_adapter import TensorTransport
+######################################################
 # FORCE vLLM v0 mode (required for selective layer loading)
 os.environ["VLLM_USE_V1"] = "0"
 print("🔧 FORCED vLLM v0 mode (VLLM_USE_V1=0) for selective layer loading compatibility")
@@ -38,27 +39,28 @@ from src.utils.gpu_utils import (
 )
 
 # Global variables for deployed model
-deployed_model = None
+
+# Global Iroh objects for completion reporting
+# current_node = None 
+# current_peer_id = None
+# hidden_state_gossip_sink = None # this is the gossip sink for the hidden states
+# token_gossip_sink = None # this is the gossip sink for sampler outputs
+
+# Global TensorTransport instance (lazy-started in main)########################
+tensor_transport: TensorTransport | None = None
+peer_ticket_map: dict[str, str] = {}  # peer_id  → ticket string (filled in heartbeat)
+current_peer_ticket = None # this is the global variable for the current peer ticket
+deployed_model = None # this is the global variable for the deployed model
 deployment_status = "idle"  # idle, downloading, loading, ready, failed
 start_inference_run = None # this is the global variable for the inference run
 assigned_layers_global=[] # this is the global variable for the assigned layers
+central_server_ticket = None # this is the global variable for the central server ticket
+################################################################################
 
-# Global Iroh objects for completion reporting
-current_node = None 
-current_peer_id = None
-hidden_state_gossip_sink = None # this is the gossip sink for the hidden states
-token_gossip_sink = None # this is the gossip sink for sampler outputs
+colorama_init(autoreset=True)
+COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
+PEER_COLOR = COLORS[int(socket.gethostname().__hash__()) % len(COLORS)]  # deterministic per host
 
-# Constants for document keys
-# TRIGGER_KEY = "job_trigger"  # Key used to trigger a new computation job
-# FINAL_RESULT_KEY = "final_result"  # Key used to store the final computation result
-
-# # Predefined matrices for each position in the pipeline
-# MATRIX_MAP = {
-#     0: torch.tensor([[2., 0.], [1., 2.]]),  # Matrix A (first machine)
-#     1: torch.tensor([[0., 1.], [1., 0.]]),  # Matrix B (second machine)
-#     2: torch.tensor([[1., 1.], [0., 1.]]),  # Matrix C (third machine)
-# }
 
 # IROH STARTS HERE
 class DeploymentGossipCallback(iroh.GossipMessageCallback):
@@ -110,136 +112,6 @@ class DeploymentGossipCallback(iroh.GossipMessageCallback):
                 print(f"❌ Exception type: {type(e)}")
                 import traceback
                 traceback.print_exc()
-# IROH ENDS HERE
-
-# IROH STARTS HERE
-class HiddenStateCallback(iroh.GossipMessageCallback):
-    """Handles the hidden state gossip messages and stores data for synchronous access"""
-    async def on_message(self, msg):
-        if msg.type() != MessageType.RECEIVED:
-            print(f"🔍 [DEBUG] HiddenStateCallback received non-RECEIVED message")
-            return
-        try:
-            ref = json.loads(msg.as_received().content.decode())
-            request_id = ref.get("request_id")
-
-            # Check if this message is for this peer
-            if not request_id:
-                print(f"🔍 [DEBUG] HiddenStateCallback received message with no request_id")
-                return
-            
-            step_idx = ref.get("step_idx", 0)
-            print(f"🔍 [DEBUG] HiddenStateCallback received message for request_id: {request_id}, step: {step_idx}")
-
-            if not current_node:
-                print(f"❌ Iroh node not initialized, cannot process blob.")
-                return
-
-            # Download the blob (same as before)
-            blob_ticket_str = ref.get("blob_ticket")
-            if not blob_ticket_str:
-                print(f"❌ No blob_ticket in message for {request_id}")
-                return
-                
-            print(f"🔍 [DEBUG] Starting blob download for request {request_id}")
-            blob_ticket = iroh.BlobTicket(blob_ticket_str)
-            blob_hash = blob_ticket.hash()
-            opts = blob_ticket.as_download_options()
-            
-            # Define a simple download callback
-            class DownloadProgressCallback(iroh.DownloadCallback):
-                async def progress(self, progress):
-                    pass  # No-op callback to avoid NoneType errors
-            
-            # Download the blob using ticket-derived options
-            print(f"🔍 [DEBUG] Downloading blob {blob_hash}...")
-            await current_node.blobs().download(blob_hash, opts, DownloadProgressCallback())
-            print(f"🔍 [DEBUG] Download completed, reading bytes...")
-            
-            # Now read the downloaded blob
-            hidden_bytes = await current_node.blobs().read_to_bytes(blob_hash)
-            print(f"🔍 [DEBUG] Read {len(hidden_bytes)} bytes from blob")
-            data = pickle.loads(hidden_bytes)
-
-            # Store data directly in INFERENCE_CONTEXT for synchronous access (thread-safe)
-            from src.utils.inference_utils import INFERENCE_CONTEXT, CONTEXT_LOCK
-            
-            with CONTEXT_LOCK:
-                if request_id not in INFERENCE_CONTEXT:
-                    INFERENCE_CONTEXT[request_id] = {}
-                
-                if step_idx not in INFERENCE_CONTEXT[request_id]:
-                    INFERENCE_CONTEXT[request_id][step_idx] = {}
-                
-                # Store the tensor based on type
-                if ref.get("is_residual"):
-                    INFERENCE_CONTEXT[request_id][step_idx]["residual"] = data
-                    print(f"✅ Stored residual for {request_id} at step {step_idx}")
-                else:
-                    INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = data
-                    print(f"✅ Stored hidden_state for {request_id} at step {step_idx}")
-                
-        except Exception as e:
-            print(f"❌ Error in HiddenStateCallback: {e}")
-            import traceback
-            traceback.print_exc()
-# IROH ENDS HERE
-
-
-# IROH STARTS HERE
-class TokenCallback(iroh.GossipMessageCallback):
-    """Handles the token gossip messages and stores data for synchronous access"""
-    async def on_message(self, msg):
-        if msg.type() != MessageType.RECEIVED:
-            print(f"🔍 [DEBUG] TokenCallback received non-RECEIVED message")
-            return
-        try:
-            ref = json.loads(msg.as_received().content.decode())
-            request_id = ref.get("request_id")
-            if not request_id:
-                return
-            
-            step_idx = ref.get("step_idx", 0)
-            print(f"📨 TokenCallback received message for request_id: {request_id}, step: {step_idx}")
-
-            if not current_node:
-                print(f"❌ Iroh node not initialized, cannot process blob.")
-                return
-
-            blob_ticket_str = ref.get("blob_ticket")
-            if not blob_ticket_str:
-                print(f"❌ No blob_ticket in message for {request_id}")
-                return
-                
-            blob_ticket = iroh.BlobTicket(blob_ticket_str)
-            blob_hash = blob_ticket.hash()
-            opts = blob_ticket.as_download_options()
-            
-            # Define a simple download callback to avoid the NoneType error
-            class SimpleDownloadCallback(iroh.DownloadCallback):
-                async def progress(self, progress):
-                    pass  # No-op callback
-            
-            await current_node.blobs().download(blob_hash, opts, SimpleDownloadCallback())
-            
-            token_bytes = await current_node.blobs().read_to_bytes(blob_hash)
-            data = pickle.loads(token_bytes)
-
-            from src.utils.inference_utils import INFERENCE_CONTEXT, CONTEXT_LOCK
-            with CONTEXT_LOCK:
-                if request_id not in INFERENCE_CONTEXT:
-                    INFERENCE_CONTEXT[request_id] = {}
-                if step_idx not in INFERENCE_CONTEXT[request_id]:
-                    INFERENCE_CONTEXT[request_id][step_idx] = {}
-                
-                INFERENCE_CONTEXT[request_id][step_idx]["sampler_output"] = data
-                print(f"✅ Stored sampler_output for {request_id} at step {step_idx}")
-                
-        except Exception as e:
-            print(f"❌ Error in TokenCallback: {e}")
-            import traceback
-            traceback.print_exc()
-# IROH ENDS HERE
 
 
 # IROH STARTS HERE
@@ -560,41 +432,15 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         
         return False
 
-# async def report_deployment_completion(model_name: str, success: bool):
-#     """Report deployment completion status to server via Iroh."""
-#     try:
-#         # Access global Iroh objects (these will be set in main())
-#         global current_doc, current_node, current_peer_id
-        
-#         if not all([current_doc, current_node, current_peer_id]):
-#             print("⚠️ Cannot report completion - Iroh not initialized")
-#             return
-            
-#         author = await current_node.authors().create()
-#         completion_key = f"deployment_complete_{current_peer_id}_{int(time.time())}"
-#         completion_data = json.dumps({
-#             "peer_id": current_peer_id,
-#             "model_name": model_name,
-#             "success": success,
-#             "timestamp": int(time.time())
-#         }).encode()
-        
-#         await current_doc.set_bytes(author, completion_key.encode(), completion_data)
-#         print(f"📤 Reported deployment {'success' if success else 'failure'} to server")
-        
-#     except Exception as e:
-#         print(f"❌ Failed to report deployment completion: {e}")
-
 
 async def report_deployment_completion(model_name: str, success: bool):
     """
     Notify the central server that this peer has finished deploying.
     """
     url = f"http://{SERVER_HOST}:{SERVER_PORT}/deployment_complete"
-    # url = f"http://localhost:8000/deployment_complete"
     payload = {
         "model_name": model_name,
-        "peer_id": current_peer_id,
+        "peer_id": current_peer_ticket,
         "success": success
     }
     try:
@@ -802,24 +648,15 @@ def get_model_status() -> Dict[str, Any]:
 #     except Exception as e:
 #         print(f"❌ Error in computation: {e}")
 
-colorama_init(autoreset=True)
-COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
-PEER_COLOR = COLORS[int(socket.gethostname().__hash__()) % len(COLORS)]  # deterministic per host
 
-async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
+async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0):
     """Send heartbeat to central server over HTTP and exit if server stops responding."""
+    global central_server_ticket
     consecutive_failures = 0
-    max_failures = 5  # ~5 seconds tolerance
+    max_failures = 10 # 10 seconds tolerance
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
-    deployment_subscribed = False  # Track if we've subscribed to deployment
-    hidden_state_subscribed = False  # Track if we've subscribed to hidden-state transfers
-    token_subscribed = False # Track if we've subscribed to token transfers
-    trigger_subscribed = False  # Track if we've subscribed to inference triggers
-
-    # Topology tracking - only update network when peers change
-    known_peers = set()  # Track known peer node_ids
-    server_added = False  # Track if server was added to network
-
+    server_added = False
+        
     async with httpx.AsyncClient(timeout=2.0) as client:
         while True:
             try:
@@ -827,187 +664,69 @@ async def http_heartbeat_loop(peer_id: str, interval_s: float = 1.0):
                 metrics_dict = format_metrics_for_db(metrics)
                 total_free_vram = metrics_dict["total_free_vram_gb"]
                 payload = {
-                    "peer_id": peer_id,
-                    "node_id": peer_id,
-                    "addresses": node_addr_obj.direct_addresses(),
-                    "relay_url": node_addr_obj.relay_url(),
+                    "peer_id": current_peer_ticket,
                     **{k: v for k, v in metrics_dict.items() if k != "timestamp"},
                     "gpu_count": len(metrics.gpu_info),
                     "timestamp": int(time.time())
                 }
-                r = await client.post(server_url, json=payload)
-                if r.status_code == 200:
-                    #IROH STARTS HERE
-                    data = r.json()
-                    # print(f"🗒️ Received data: {data}")
-                    
+                response = await client.post(server_url, json=payload)
+                if response.status_code == 200:
+                    data = response.json()
                     # Only add server to network once
                     if not server_added:
-                        srv_id = data["server_id"]
-                        srv_addrs = data["server_addresses"]
-                        srv_relay = data["relay_url"]
-                        pk = PublicKey.from_string(srv_id)
-                        srv_node_addr = NodeAddr(pk, srv_relay, srv_addrs)
-                        await current_node.net().add_node_addr(srv_node_addr)
+                        central_server_ticket = data["central_server_ticket"]
+                        print(f"🔗 Central server ticket: {central_server_ticket}")
                         server_added = True
-                        print(f"🔗 Added server to network: {srv_id[:8]}")
-                    
-                    # Check for new peers and only add them if they're actually new
-                    current_peer_ids = {p["node_id"] for p in data.get("peers", [])}
-                    new_peers = current_peer_ids - known_peers
-                    
-                    for p in data.get("peers", []):
-                        remote_peer_id = p["node_id"]
-                        if remote_peer_id in new_peers:
-                            peer_addrs = p["addresses"]
-                            peer_relay = p["relay_url"]
-                            pk = PublicKey.from_string(remote_peer_id)
-                            peer_node_addr = NodeAddr(pk, peer_relay, peer_addrs)
-                            await current_node.net().add_node_addr(peer_node_addr)
-                            print(f"🔗 Added new peer to network: {remote_peer_id[:8]}")
-                    #IROH ENDS HERE
-                    # Update known peers
-                    known_peers = current_peer_ids
-                    bootstrap_peers = [srv_id] + [p["node_id"] for p in data.get("peers", [])]
-                    print(f"🔗 Bootstrap peers: {bootstrap_peers}")
-                    
-                    if not deployment_subscribed:
-                        deployment_topic = bytes("deployment_topic".ljust(32), 'utf-8')[:32]
-                        await current_node.gossip().subscribe(deployment_topic, bootstrap_peers, DeploymentGossipCallback(current_node, peer_id))
-                        deployment_subscribed = True
-                        print(f"🎯 Subscribed to deployment instructions on topic {deployment_topic}")
-
-                    if not hidden_state_subscribed:
-                        hidden_state_topic = bytes("hidden_state_topic".ljust(32), 'utf-8')[:32]
-                        global hidden_state_gossip_sink
-                        hidden_state_gossip_sink = await current_node.gossip().subscribe(
-                            hidden_state_topic,
-                            bootstrap_peers,
-                            HiddenStateCallback(),
-                        )
-                        hidden_state_subscribed = True
-                        print(f"🎯 Subscribed to hidden-state transfers on topic {hidden_state_topic}")
-
-                    if not token_subscribed:
-                        token_topic = bytes("token_topic".ljust(32), 'utf-8')[:32]
-                        global token_gossip_sink
-                        token_gossip_sink = await current_node.gossip().subscribe(
-                            token_topic,
-                            bootstrap_peers,
-                            TokenCallback(),
-                        )
-                        token_subscribed = True
-                        print(f"🎯 Subscribed to token transfers on topic {token_topic}")
-
-                    if not trigger_subscribed:
-                        trigger_topic = bytes("trigger_topic".ljust(32), 'utf-8')[:32]
-                        await current_node.gossip().subscribe(trigger_topic, bootstrap_peers, TriggerCallback())
-                        trigger_subscribed = True
-                        print(f"🎯 Subscribed to inference triggers on topic {trigger_topic}")
-                        consecutive_failures = 0  # Reset on success
-
                     print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
                 else:
                     consecutive_failures += 1
-                    print(f"{PEER_COLOR}⚠️ Heartbeat HTTP {r.status_code}{Style.RESET_ALL}")
+                    print(f"{PEER_COLOR}⚠️ Heartbeat HTTP {response.status_code}{Style.RESET_ALL}")
             except Exception as e:
                 consecutive_failures += 1
                 print(f"{PEER_COLOR}⚠️ Heartbeat error: {e}{Style.RESET_ALL}")
-
             if consecutive_failures >= max_failures:
                 print(f"{PEER_COLOR}💔 Lost contact with server, shutting down peer{Style.RESET_ALL}")
                 os._exit(1)
-
             await asyncio.sleep(interval_s)
 
 async def main():
 
     """Main function to run the distributed computation node"""
-    global current_node, current_peer_id, node_id_obj, node_addr_obj
+    global current_node, current_peer_id, node_id_obj, node_addr_obj, current_peer_ticket, peer_ticket_map
     
-    bootstrap_peers=[]
-    # Set up the asyncio event loop for Iroh
-    uniffi_set_event_loop(asyncio.get_running_loop())
+    # bootstrap_peers=[]
 
+    # Set up Tensor_Iroh and get the ticket #################################
+    tensor_transport = TensorTransport()
+    await tensor_transport.start()
+    current_peer_ticket = tensor_transport.ticket
+    print(f"🪪 TensorTransport started – ticket:\n{current_peer_ticket}\n")
     # Set up a unique data directory for this node
     hostname = socket.gethostname()
-    data_dir = os.path.join(tempfile.gettempdir(), f"iroh_node_{hostname}")
-    
-    # Configure and initialize the Iroh node
-    options = iroh.NodeOptions()
-    options.enable_gossip = True    
-    node = await iroh.Iroh.memory_with_options(options)
-
-    peer_id = await node.net().node_id()
-    node_id_obj   = await node.net().node_id()
-    node_addr_obj = await node.net().node_addr()
-    print(f"🤖 Running as peer: {peer_id}")
-    
-    # Set globals for completion reporting
-    current_node = node
-    current_peer_id = peer_id # questionable if this is needed
-
-    # start heartbeat loop
-    heartbeat_task = asyncio.create_task(http_heartbeat_loop(peer_id))
-    # Register this peer in MongoDB
-    await register_peer(peer_id, hostname)
-    print(f"✅ Registered in MongoDB as {peer_id}")
-
+    ticket_and_hostname = f"Ticket: {current_peer_ticket}, Hostname: {hostname}"
+    peer_ticket_map[ticket_and_hostname] = current_peer_ticket # check if we even need ticket_and_hostname
+    print(f"🤖 Running as peer: {current_peer_ticket}")
+    heartbeat_task = asyncio.create_task(http_heartbeat_loop(current_peer_ticket))
+    # await register_peer(current_peer_ticket, hostname)
+    print(f"✅ Registered in MongoDB as {current_peer_ticket}")
     await asyncio.sleep(1)
-    # # Subscribe to inference triggers
-    # trigger_topic = bytes("trigger_topic".ljust(32), 'utf-8')[:32]
-    # await node.gossip().subscribe(trigger_topic, bootstrap_peers, TriggerCallback(processor))
-
-
-
-    # --- NEW: subscribe to deployment instructions ---
-    # deployment_topic = bytes("deployment_topic".ljust(32), 'utf-8')[:32]
-    # await node.gossip().subscribe(deployment_topic, bootstrap_peers, DeploymentGossipCallback(node, peer_id))
-    # print(f"🎯 Subscribed to deployment instructions on topic {deployment_topic}")
-
-
-
-
-    # Fetch the shared ticket from the server
-    # try:  
-        # shared_ticket = await get_shared_ticket()
-    # except Exception as e:
-    #     print(f"❌ Failed to get shared ticket: {e}")
-    #     return
-
-    # Join the shared document and create an author for writing
-    # doc = await node.docs().join(iroh.DocTicket(shared_ticket))
-    # author = await node.authors().create()
-    
-    # Set global doc for completion reporting   
-    # current_doc = doc
-    
-    # Start HTTP heartbeat loop (1 Hz by default)
-    
-    # Start deployment instruction monitoring as background task
-    # deployment_task = asyncio.create_task(
-    #     monitor_deployment_instructions(doc, node, peer_id)
-    # )
 
     try:
-        # Wait until this peer is included in the pipeline configuration
-        print("⏳ Waiting to be included in the pipeline...")
-        while True:
-            pipeline = await get_active_peers()
-            print(pipeline)
-            if peer_id in pipeline:
-                break
-            await asyncio.sleep(2)
+        # # Wait until this peer is included in the pipeline configuration
+        # print("⏳ Waiting to be included in the pipeline...")
+        # while True:
+        #     pipeline = await get_active_peers()
+        #     print(f"🔗 Pipeline: {pipeline}")
+        #     if current_peer_ticket in pipeline:
+        #         print(f"✅ Included in pipeline as {current_peer_ticket}")
+        #         break
+        #     await asyncio.sleep(2)
 
-        # Determine this peer's position and role in the pipeline
-        index = pipeline.index(peer_id)
-        is_first = index == 0
-        is_last = index == len(pipeline) - 1
-        next_peer = pipeline[index + 1] if not is_last else None
-        # local_matrix = MATRIX_MAP.get(index)
-        # if local_matrix is None:
-        #     print(f"❌ No matrix found for pipeline index {index}")
-        #     return
+        # # Determine this peer's position and role in the pipeline
+        # index = pipeline.index(current_peer_ticket)
+        # is_first = index == 0
+        # is_last = index == len(pipeline) - 1
+        # next_peer = pipeline[index + 1] if not is_last else None
 
         # print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
 
@@ -1029,14 +748,11 @@ async def main():
         except asyncio.CancelledError:
             pass
             
-        # try:
-        #     await deployment_task
-        # except asyncio.CancelledError:
-        #     pass
-        
         # Deregister peer when shutting down
-        await deregister_peer(peer_id)
-        print(f"👋 Deregistered {peer_id} from pipeline")
+        # await deregister_peer(current_peer_ticket)
+        print(f"👋 Deregistered {current_peer_ticket} from pipeline")
+
+    #########################################################################
 
 if __name__ == "__main__":
     asyncio.run(main()) 

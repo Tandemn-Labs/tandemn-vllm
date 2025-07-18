@@ -4,8 +4,6 @@ import torch
 import json
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, Response
-from iroh.iroh_ffi import uniffi_set_event_loop
-from iroh import PublicKey, NodeAddr
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import uuid
@@ -16,6 +14,9 @@ from colorama import Fore, Style, init as colorama_init  # ADD
 from src.utils.sharding_utils import shard_model_by_layers_safetensors
 from transformers import AutoTokenizer
 import os
+## Tensor_Iroh Starts here ###########################
+from src.utils.tensor_protocol_adapter import TensorTransport
+######################################################
 
 from src.config.settings import (
     SERVER_HOST,
@@ -45,19 +46,18 @@ from src.utils.model_utils import (
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandemn Server")
 
-SERVER_IP = "172.16.1.249"
+# SERVER_IP = "172.16.1.249"
 # Global Variables for Iroh Node and Gossip Management
+
 # IROH STARTS HERE
-node = None  # Iroh node instance
-trigger_gossip_sink = None
-deployment_gossip_sink = None
 active_inferences = {}
-TRIGGER_TOPIC = bytes("trigger_topic".ljust(32), "utf-8")[:32]
-DEPLOYMENT_TOPIC = bytes("deployment_topic".ljust(32), "utf-8")[:32]
+central_server_ticket = None
+# TRIGGER_TOPIC = bytes("trigger_topic".ljust(32), "utf-8")[:32]
+# DEPLOYMENT_TOPIC = bytes("deployment_topic".ljust(32), "utf-8")[:32]
 # IROH ENDS HERE
 
-peer_table: Dict[str,NodeAddr] = {}
-server_id = None  # Unique identifier for this server instance
+peer_table: Dict[str,str] = {}
+# server_id = None  # Unique identifier for this server instance
 # Peer tracking for topology changes
 active_peer_ids = set()  # Currently active peer node_ids
 peer_last_seen = {}  # Track when each peer was last seen
@@ -89,9 +89,9 @@ def _get_peer_color(peer_id: str):
 class HeartbeatRequest(BaseModel):
     """Schema for heartbeat POSTs from peers."""
     peer_id: str
-    node_id: str #iroh_node_id
-    addresses: List[str] #addresses
-    relay_url: Optional[str] = None #relay_url
+    # node_id: str #iroh_node_id
+    # addresses: List[str] #addresses
+    # relay_url: Optional[str] = None #relay_url
     cpu: float
     ram: float
     gpu_count: int
@@ -131,88 +131,33 @@ class ModelDeploymentRequest(BaseModel):
     model_name: str
     shard_folder: str
 
-# IROH STARTS HERE
-async def refresh_trigger_sink():
-    """(Re)create the trigger gossip sink with current peer list."""
-    global trigger_gossip_sink
-    peer_ids = list(peer_table.keys())  # list of node_id strings
-    # Recreate sink each time to update peer set
-    trigger_gossip_sink = await node.gossip().subscribe(TRIGGER_TOPIC, peer_ids, NoopCallback())
-    print(f"📡 Trigger sink refreshed with peers: {peer_ids}")
-
-async def refresh_deployment_sink():
-    """(Re)create the deployment gossip sink with current peer list."""
-    global deployment_gossip_sink
-    peer_ids = list(peer_table.keys())  # list of node_id strings
-    # Recreate sink each time to update peer set
-    deployment_gossip_sink = await node.gossip().subscribe(
-        DEPLOYMENT_TOPIC,
-        peer_ids,
-        NoopCallback())
-    print(f"📡 Deployment sink refreshed with peers: {peer_ids}")
-# IROH ENDS HERE
 
 @app.on_event("startup")
 async def startup():
     """Initialize the Iroh node and document on server startup"""
     # global node, doc, ticket, server_peer_id
-    global node, server_id, trigger_gossip_sink, active_inferences, TRIGGER_TOPIC, peer_table
-
+    # global node, server_id, trigger_gossip_sink, active_inferences, TRIGGER_TOPIC, peer_table, central_server_ticket
+    global central_server_ticket
     print("🚀 Starting Iroh Tandemn server...")
-    # Configure async event loop for Iroh
-    uniffi_set_event_loop(asyncio.get_running_loop())
 
     # Set up MongoDB collections
-    await setup_collections()
+    # await setup_collections()
     print("✅ MongoDB collections configured")
 
     # Clear all peer records on fresh server start to prevent stale data; comment all this for prod
-    delete_result = await _db[PEERS_COLLECTION].delete_many({})
-    if delete_result.deleted_count > 0:
-        print(f"🧹 Cleared {delete_result.deleted_count} stale peer record(s) from previous sessions")
-    else:
-        print("🧹 No previous peer records found to clear")
+    # delete_result = await _db[PEERS_COLLECTION].delete_many({})
+    # if delete_result.deleted_count > 0:
+    #     print(f"🧹 Cleared {delete_result.deleted_count} stale peer record(s) from previous sessions")
+    # else:
+    #     print("🧹 No previous peer records found to clear")
     # only need to do this when we are testing ^^^
 
-    # IROH STARTS HERE
-    options = iroh.NodeOptions()
-    options.enable_gossip = True
-    node = await iroh.Iroh.memory_with_options(options)
-    server_id = await node.net().node_id()
-    print(f"✅ Iroh node started with server_id: {server_id}")
+    tensor_transport = TensorTransport()
+    await tensor_transport.start()
+    central_server_ticket = tensor_transport.ticket
+    print(f"🪪 TensorTransport for the central server started – ticket:\n{central_server_ticket}\n")
 
-    await refresh_trigger_sink()    
-    await refresh_deployment_sink()
-    # IROH ENDS HERE
     
-    # print("📡 Using HTTP for completions instead of gossip")    # options.enable_docs = True
-
-    # # Create and share document
-    # doc = await node.docs().create()
-    # ticket = await doc.share(iroh.ShareMode.WRITE, iroh.AddrInfoOptions.RELAY_AND_ADDRESSES)
-
-    # Record initial system metrics
-    # author = await node.authors().create()
-    # key = server_peer_id.encode()
-    # metrics = get_system_metrics()
-    # formatted_metrics = format_metrics_for_db(metrics)
-    # value = f"CPU: {metrics.cpu_percent}%\nRAM: {metrics.ram_percent}%".encode()
-
-    # try:
-    #     # Store system metrics in the document and MongoDB
-    #     await doc.set_bytes(author, key, value)
-    #     await update_peer_metrics(server_peer_id, formatted_metrics)
-    #     print(f"✅ Server metrics stored with key {server_peer_id}")
-    # except Exception as e:
-    #     print(f"❌ Failed to send server metrics: {e}")
-
-    # Join the document to enable updates
-    # doc = await node.docs().join(ticket)
-    # print("✅ Iroh node started")
-    # print("📎 SHARE THIS TICKET WITH ALL INTERNAL MACHINES:\n")
-    # print(str(ticket) + "\n")
-    
-
 @app.get("/health")
 async def health():
     """Endpoint to check health and status of all connected machines"""
@@ -254,23 +199,17 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
     """Receive heartbeat from a peer and store metrics in MongoDB."""
     try:
         peer_ip = request.client.host if request.client else "unknown"
-        
         # Track when this peer was last seen
         current_time = time.time()
-        peer_last_seen[hb.node_id] = current_time
+        peer_id_of_requester = hb.peer_id
+        peer_last_seen[peer_id_of_requester] = current_time
         
-        # Check if this is a new peer or if peer table needs updating
-        topology_changed = False
-        
-        if hb.node_id not in peer_table:
+        if peer_id_of_requester not in peer_table:
             # New peer - add to Iroh network
-            pk = PublicKey.from_string(hb.node_id)
-            addr = NodeAddr(pk, hb.relay_url, hb.addresses)
-            await node.net().add_node_addr(addr)
-            peer_table[hb.node_id] = addr
-            active_peer_ids.add(hb.node_id)
+            peer_table[peer_id_of_requester] = peer_ip
+            active_peer_ids.add(peer_id_of_requester)
             topology_changed = True
-            print(f"🗒️ New peer detected: {hb.peer_id}")
+            print(f"🗒️ New peer detected: {peer_id_of_requester}")
         
         # Check for dead peers (haven't sent heartbeat in PEER_TIMEOUT seconds)
         dead_peers = []
@@ -287,27 +226,7 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
                 topology_changed = True
                 print(f"💀 Peer {dead_node_id[:8]} timed out and removed")
         
-        # Only refresh sinks if topology actually changed
-        if topology_changed:
-            await refresh_trigger_sink()
-            await refresh_deployment_sink()
-            print(f"🔄 Network topology changed - sinks refreshed")
-        
-        print(f"🗒️ Active peers: {len(active_peer_ids)} ({list(p[:8] for p in active_peer_ids)})")
-        
-        # Get server address once
-        srv_addr = await node.net().node_addr()
-        
-        # Build peer list (excluding requester)
-        peers_payload = []
-        for pid, naddr in peer_table.items():
-            if pid == hb.node_id:
-                continue
-            peers_payload.append({
-                "node_id": pid,
-                "addresses": naddr.direct_addresses(),
-                "relay_url": naddr.relay_url()
-            })
+        print(f"🗒️ Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
         
         # Compact metrics object similar to previous format
         formatted_metrics = {
@@ -320,27 +239,23 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         }
 
         # Update MongoDB (time-series) using existing helper
-        await update_peer_metrics(hb.peer_id, formatted_metrics)
+        # await update_peer_metrics(hb.peer_id, formatted_metrics)
         # Upsert peer record
-        await _db[PEERS_COLLECTION].update_one(
-            {"peer_id": hb.peer_id},
-            {"$set": {"peer_id": hb.peer_id,
-                      "node_id": hb.node_id, 
-                      "ip": peer_ip,
-                       "is_active": True,
-                        "last_seen": datetime.utcnow()}},
-            upsert=True
-        )
+        # await _db[PEERS_COLLECTION].update_one(
+        #     {"peer_id": peer_id_of_requester},
+        #     {"$set": {"peer_id": peer_id_of_requester,
+        #               "ip": peer_ip,
+        #                "is_active": True,
+        #                 "last_seen": datetime.utcnow()}},
+        #     upsert=True
+        # )
         # Colored log
         color = _get_peer_color(hb.peer_id)
         print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
         
         return {
             "status": "ok",
-            "server_id": server_id,
-            "server_addresses": srv_addr.direct_addresses(),
-            "relay_url": srv_addr.relay_url(),
-            "peers": peers_payload
+            "central_server_ticket": central_server_ticket,
         }
     except Exception as e:
         print(f"❌ Heartbeat processing failed: {e}")
