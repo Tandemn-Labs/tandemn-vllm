@@ -1013,8 +1013,8 @@ async def infer(request: InferenceRequest):
     
 
     #5. Broadcast the instruction payload to the first peer
-    await refresh_trigger_sink() 
-    await trigger_gossip_sink.broadcast(instruction_payload)
+    # await refresh_trigger_sink() 
+    # await trigger_gossip_sink.broadcast(instruction_payload)
 
     print(f"🚀 Inference {request_id} started for model {request.model_name}")
     return InferenceResponse(
