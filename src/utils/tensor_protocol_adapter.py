@@ -64,12 +64,6 @@ class TensorTransport:
         else:
             raise TypeError("tensor must be torch.Tensor or numpy.ndarray")
         
-        # meta = tp.PyTensorMetadata(
-        #     shape=list(array.shape),
-        #     dtype=str(array.dtype),
-        #     requires_grad=False,
-        # )
-        # data = tp.PyTensorData(array.tobytes(), meta)
         data = tp.PyTensorData(array.tobytes(), list(array.shape), str(array.dtype), False)
         await self._node.send_tensor(peer_addr, name, data)
 
