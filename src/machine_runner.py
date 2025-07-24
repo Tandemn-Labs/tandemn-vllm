@@ -13,6 +13,7 @@ import aiofiles
 from colorama import Fore, Style, init as colorama_init
 from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT
 import pickle
+import numpy as np
 
 ## Tensor_Iroh Starts here ###########################
 from src.utils.tensor_protocol_adapter import TensorTransport
@@ -46,7 +47,7 @@ from src.utils.gpu_utils import (
 # hidden_state_gossip_sink = None # this is the gossip sink for the hidden states
 # token_gossip_sink = None # this is the gossip sink for sampler outputs
 
-# Global TensorTransport instance (lazy-started in main)########################
+# Global TensorTransport instance (lazy-started in main) #######################
 tensor_transport: TensorTransport | None = None
 peer_ticket_map: dict[str, str] = {}  # peer_id  → ticket string (filled in heartbeat)
 current_peer_ticket = None # this is the global variable for the current peer ticket
@@ -62,115 +63,222 @@ COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
 PEER_COLOR = COLORS[int(socket.gethostname().__hash__()) % len(COLORS)]  # deterministic per host
 
 
-# IROH STARTS HERE
-class DeploymentGossipCallback(iroh.GossipMessageCallback):
-    "Handle deployment instructions received via gossip"
-    def __init__(self, node, peer_id):
-        super().__init__()
-        self.node = node
-        self.peer_id = peer_id
+# # IROH STARTS HERE
+# class DeploymentGossipCallback(iroh.GossipMessageCallback):
+#     "Handle deployment instructions received via gossip"
+#     def __init__(self, node, peer_id):
+#         super().__init__()
+#         self.node = node
+#         self.peer_id = peer_id
 
-    async def on_message(self, msg):
-        print("="*100)
-        print(f"�� [DEBUG] DeploymentGossipCallback received message")
-        t = msg.type()  # ✅ Call the method
-        print(f"🔍 [DEBUG] Message type: {t}")
-        print("="*100)
+#     async def on_message(self, msg):
+#         print("="*100)
+#         print(f"�� [DEBUG] DeploymentGossipCallback received message")
+#         t = msg.type()  # ✅ Call the method
+#         print(f"🔍 [DEBUG] Message type: {t}")
+#         print("="*100)
         
-        if t == MessageType.JOINED:
-            print("🔎 Deployment mesh membership:", msg.as_joined())
-            return
+#         if t == MessageType.JOINED:
+#             print("🔎 Deployment mesh membership:", msg.as_joined())
+#             return
             
-        if t == MessageType.RECEIVED:
-            print(f"�� [DEBUG] Processing RECEIVED deployment message")
-            rc = msg.as_received()
-            print(f"🔍 [DEBUG] Message content length: {len(rc.content)} bytes")
+#         if t == MessageType.RECEIVED:
+#             print(f"�� [DEBUG] Processing RECEIVED deployment message")
+#             rc = msg.as_received()
+#             print(f"🔍 [DEBUG] Message content length: {len(rc.content)} bytes")
             
-            try:
-                payload = json.loads(rc.content.decode())  # ✅ Use content, not payload
-                print(f"🔍 [DEBUG] Parsed JSON payload: {list(payload.keys())}")
+#             try:
+#                 payload = json.loads(rc.content.decode())  # ✅ Use content, not payload
+#                 print(f"🔍 [DEBUG] Parsed JSON payload: {list(payload.keys())}")
                 
-                # Check if this is a deployment instruction
-                if payload.get("action") != "deploy_model":
-                    print(f"🔍 [DEBUG] Not a deployment instruction, skipping")
-                    return
+#                 # Check if this is a deployment instruction
+#                 if payload.get("action") != "deploy_model":
+#                     print(f"🔍 [DEBUG] Not a deployment instruction, skipping")
+#                     return
                 
-                # check if the target peer is this peer
-                target_peer_id = payload.get("target_peer_id")
-                if target_peer_id != self.peer_id:
-                    print(f"🔍 [DEBUG] Not a deployment instruction for this peer, skipping, {target_peer_id}")
-                    return
+#                 # check if the target peer is this peer
+#                 target_peer_id = payload.get("target_peer_id")
+#                 if target_peer_id != self.peer_id:
+#                     print(f"🔍 [DEBUG] Not a deployment instruction for this peer, skipping, {target_peer_id}")
+#                     return
                     
-                instructions = payload.get("instructions", {})
-                print(f"📨 Received deployment instructions for {self.peer_id}: {instructions}")
+#                 instructions = payload.get("instructions", {})
+#                 print(f"📨 Received deployment instructions for {self.peer_id}: {instructions}")
                 
-                # Deploy model in background
-                asyncio.create_task(deploy_model_from_instructions(instructions))
+#                 # Deploy model in background
+#                 asyncio.create_task(deploy_model_from_instructions(instructions))
                 
+#             except Exception as e:
+#                 print(f"❌ Error handling deployment instruction: {e}")
+#                 print(f"❌ Exception type: {type(e)}")
+#                 import traceback
+#                 traceback.print_exc()
+
+
+# IROH STARTS HERE
+# class TriggerCallback(iroh.GossipMessageCallback):
+#     """Handles the initial inference trigger from the server"""
+#     async def on_message(self, msg):
+#         if msg.type() != MessageType.RECEIVED:
+#             print(f"🔍 [DEBUG] TriggerCallback received non-RECEIVED message")
+#             return
+        
+#         try:
+#             payload = json.loads(msg.as_received().content.decode())
+#             if payload.get("action") != "start_inference":
+#                 print(f"🔍 [DEBUG] TriggerCallback received non-start_inference message")
+#                 return
+            
+#             pipeline = payload.get("pipeline")
+#             request_id = payload.get("request_id")
+            
+#             # This peer is not in the pipeline, ignore
+#             if not (request_id and current_peer_id in pipeline):
+#                 return
+
+#             # only the first peer gets to start the inference
+#             is_first_peer = pipeline[0] == current_peer_id
+#             print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id} (is_first_peer: {is_first_peer})")
+
+#             # Initialize context for this request (no futures needed anymore)
+#             if request_id not in INFERENCE_CONTEXT:
+#                 INFERENCE_CONTEXT[request_id] = {}
+            
+#             if not start_inference_run:
+#                 print(f"🔍 [DEBUG] start_inference_run is not set, cannot proceed.")
+#                 return
+            
+#             # Start the inference run in a background thread
+#             input_text = payload.get("input_text")
+
+#             # Import SamplingParams locally to avoid top-level import issues
+#             from vllm import SamplingParams
+
+#             loop = asyncio.get_running_loop()
+#             loop.run_in_executor(
+#                 None,
+#                 start_inference_run,
+#                 payload["request_id"],
+#                 payload["pipeline"],
+#                 input_text,
+#                 SamplingParams(**payload["sampling_params"]),
+#                 payload["assigned_layers"],
+#             )
+
+#         except Exception as e:
+#             print(f"❌ Error in TriggerCallback: {e}")
+#             import traceback
+#             traceback.print_exc()
+
+#         print(f"🔍 [DEBUG] TriggerCallback completed for {payload.get('request_id')}")
+# IROH ENDS HERE
+
+
+async def monitor_inference_tensors():
+    """Monitor for incoming hidden states, residuals, and sampler outputs during inference"""
+    global tensor_transport
+    print("🎯 Starting inference tensor monitor...")
+    
+    while True:
+        try:
+            msg = await tensor_transport.recv()
+            if msg is None:
+                await asyncio.sleep(0.01)
+                continue
+                
+            name = msg.get("name", "")
+            tensor = msg.get("tensor")
+            
+            # Parse the tensor name to determine type
+            if "_hidden_state" in name or "_residual" in name:
+                # Extract request_id and step from name
+                parts = name.split("_")
+                request_id = parts[0]
+                step_idx = int(parts[1].replace("step", ""))
+                
+                # Store in INFERENCE_CONTEXT
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                if step_idx not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][step_idx] = {}
+                
+                if "_residual" in name:
+                    INFERENCE_CONTEXT[request_id][step_idx]["residual"] = tensor
+                else:
+                    INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = tensor
+                    
+            elif "_sampler_output" in name:
+                # Handle sampler output from last peer
+                parts = name.split("_")
+                request_id = parts[0]
+                step_idx = int(parts[1].replace("step", ""))
+                
+                # Unpickle the sampler output
+                sampler_output = pickle.loads(tensor.tobytes())
+                
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                if step_idx not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][step_idx] = {}
+                    
+                INFERENCE_CONTEXT[request_id][step_idx]["sampler_output"] = sampler_output
+                
+        except Exception as e:
+            print(f"❌ Error in inference tensor monitor: {e}")
+            await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            print("monitor_inference_tensors cancelled, exiting cleanly.")
+            return
+
+
+async def monitor_tensor_transport_for_deployment():
+    """
+    Continuously monitor tensor_transport for incoming deployment instructions.
+    When a deployment instruction is received, handle it accordingly.
+    """
+    global tensor_transport
+    print("🚦 Starting tensor_transport deployment instruction monitor loop...")
+    while True:
+        try:
+            # Wait for any tensor to arrive
+            msg = await tensor_transport.recv()
+            if msg is None:
+                await asyncio.sleep(0.1)
+                continue
+
+            # Expecting: {"tensor": torch.Tensor}
+            tensor = msg.get("tensor")
+            if tensor is None:
+                print("⚠️ Received message without tensor payload")
+                continue
+
+            # Convert tensor (np.uint8) back to bytes
+            if hasattr(tensor, "numpy"):
+                arr = tensor.numpy()
+            else:
+                arr = tensor
+            if arr.dtype != np.uint8:
+                print(f"⚠️ Received tensor with unexpected dtype: {arr.dtype}")
+                continue
+            instruction_data = arr.tobytes()
+
+            # Parse and handle deployment instruction
+            try:
+                instruction = json.loads(instruction_data.decode())
+                if instruction.get("action") == "deploy_model":
+                    instructions = instruction.get("instructions", {})
+                    print(f"📨 Received deployment instruction for {instructions.get('model_name', 'unknown')}")
+                    # Deploy model in background (non-blocking)
+                    asyncio.create_task(deploy_model_from_instructions(instructions))
+                else:
+                    print(f"⚠️  Unknown instruction action: {instruction.get('action')}")
             except Exception as e:
                 print(f"❌ Error handling deployment instruction: {e}")
-                print(f"❌ Exception type: {type(e)}")
-                import traceback
-                traceback.print_exc()
-
-
-# IROH STARTS HERE
-class TriggerCallback(iroh.GossipMessageCallback):
-    """Handles the initial inference trigger from the server"""
-    async def on_message(self, msg):
-        if msg.type() != MessageType.RECEIVED:
-            print(f"🔍 [DEBUG] TriggerCallback received non-RECEIVED message")
-            return
-        
-        try:
-            payload = json.loads(msg.as_received().content.decode())
-            if payload.get("action") != "start_inference":
-                print(f"🔍 [DEBUG] TriggerCallback received non-start_inference message")
-                return
-            
-            pipeline = payload.get("pipeline")
-            request_id = payload.get("request_id")
-            
-            # This peer is not in the pipeline, ignore
-            if not (request_id and current_peer_id in pipeline):
-                return
-
-            # only the first peer gets to start the inference
-            is_first_peer = pipeline[0] == current_peer_id
-            print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id} (is_first_peer: {is_first_peer})")
-
-            # Initialize context for this request (no futures needed anymore)
-            if request_id not in INFERENCE_CONTEXT:
-                INFERENCE_CONTEXT[request_id] = {}
-            
-            if not start_inference_run:
-                print(f"🔍 [DEBUG] start_inference_run is not set, cannot proceed.")
-                return
-            
-            # Start the inference run in a background thread
-            input_text = payload.get("input_text")
-
-            # Import SamplingParams locally to avoid top-level import issues
-            from vllm import SamplingParams
-
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(
-                None,
-                start_inference_run,
-                payload["request_id"],
-                payload["pipeline"],
-                input_text,
-                SamplingParams(**payload["sampling_params"]),
-                payload["assigned_layers"],
-            )
 
         except Exception as e:
-            print(f"❌ Error in TriggerCallback: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ Error in tensor_transport monitor loop: {e}")
+            await asyncio.sleep(1)
 
-        print(f"🔍 [DEBUG] TriggerCallback completed for {payload.get('request_id')}")
-# IROH ENDS HERE
 # ============================================================================
 # SELECTIVE LAYER LOADING IMPLEMENTATION  
 # ============================================================================
@@ -290,25 +398,22 @@ async def download_file(url: str, local_path: Path, chunk_size: int = 16*1024*10
 
 async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
     """Deploy model based on deployment instructions received from server."""
-    global deployed_model, deployment_status, start_inference_run, hidden_state_gossip_sink, current_node, current_peer_id
-    
+    global deployed_model, deployment_status, start_inference_run, tensor_transport
+    # get the model name
     model_name = instructions.get('model_name', 'unknown')
     
     # Check if model is already successfully deployed
     if deployment_status == "ready" and deployed_model is not None:
         print(f"✅ Model {model_name} already successfully deployed, skipping new deployment")
         return True
-    
+
     # Prevent multiple concurrent deployments
     if deployment_status in ["downloading", "loading"]:
         print(f"⚠️ Deployment already in progress ({deployment_status}), skipping...")
         return False
-    
     # Track deployment attempts to prevent infinite retries
-    global deployment_attempts
     if not hasattr(deploy_model_from_instructions, 'deployment_attempts'):
         deploy_model_from_instructions.deployment_attempts = {}
-    
     attempt_key = f"{model_name}_{hash(str(instructions['assigned_layers']))}"
     current_attempts = deploy_model_from_instructions.deployment_attempts.get(attempt_key, 0)
     
@@ -327,6 +432,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         print(f"   Is first peer: {instructions['is_first_peer']}")
         print(f"   Is last peer: {instructions['is_last_peer']}")
         print(f"   Required files: {len(instructions['required_files'])}")
+        print(f"   Next peer ticket: {instructions['next_peer_ticket']}")
         
         # Create local model directory
         model_dir = Path(f"./deployed_models/{instructions['model_name']}")
@@ -394,13 +500,14 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         # If loading is successful, prepare the inference function.
         print("✅ Model loaded successfully, registering inference hooks...")
         server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
+        # Pass the full pipeline of peer tickets to register_inference_hooks
         start_inference_run = register_inference_hooks(
             llm=deployed_model,
-            node=current_node,
-            hidden_state_gossip_sink=hidden_state_gossip_sink,
-            token_gossip_sink=token_gossip_sink,
-            peer_id=current_peer_id,
-            server_url=server_url
+            node=tensor_transport,
+            peer_id=current_peer_ticket,
+            server_url=server_url,
+            next_peer_ticket=instructions.get("next_peer_ticket"),
+            pipeline=instructions.get("pipeline")  # Send all peer tickets
         )
         assigned_layers_global = instructions['assigned_layers']
 
@@ -451,23 +558,6 @@ async def report_deployment_completion(model_name: str, success: bool):
     except Exception as e:
         print(f"❌ Failed to report deployment completion: {e}")
 
-# async def handle_deployment_instruction(doc, node, instruction_data: bytes):
-#     """Handle deployment instruction received via Iroh."""
-#     try:
-#         instruction = json.loads(instruction_data.decode())
-        
-#         if instruction.get("action") == "deploy_model":
-#             instructions = instruction.get("instructions", {})
-#             print(f"📨 Received deployment instruction for {instructions.get('model_name', 'unknown')}")
-            
-#             # Deploy model in background (non-blocking)
-#             asyncio.create_task(deploy_model_from_instructions(instructions))
-            
-#         else:
-#             print(f"⚠️  Unknown instruction action: {instruction.get('action')}")
-            
-#     except Exception as e:
-#         print(f"❌ Error handling deployment instruction: {e}")
 
 # async def monitor_deployment_instructions(doc, node, peer_id: str):
 #     """Monitor for deployment instructions sent to this peer."""
@@ -689,10 +779,12 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
                 os._exit(1)
             await asyncio.sleep(interval_s)
 
-async def main():
 
+
+
+async def main():
     """Main function to run the distributed computation node"""
-    global current_node, current_peer_id, node_id_obj, node_addr_obj, current_peer_ticket, peer_ticket_map
+    global current_node, current_peer_id, node_id_obj, node_addr_obj, current_peer_ticket, peer_ticket_map, tensor_transport
     
     # bootstrap_peers=[]
 
@@ -707,28 +799,31 @@ async def main():
     peer_ticket_map[ticket_and_hostname] = current_peer_ticket # check if we even need ticket_and_hostname
     print(f"🤖 Running as peer: {current_peer_ticket}")
     heartbeat_task = asyncio.create_task(http_heartbeat_loop(current_peer_ticket))
-    # await register_peer(current_peer_ticket, hostname)
+    await register_peer(current_peer_ticket, hostname)
     print(f"✅ Registered in MongoDB as {current_peer_ticket}")
+    print("Starting deployment listener...")
+    deployment_listener_task = asyncio.create_task(monitor_tensor_transport_for_deployment())
     await asyncio.sleep(1)
 
+
     try:
-        # # Wait until this peer is included in the pipeline configuration
-        # print("⏳ Waiting to be included in the pipeline...")
-        # while True:
-        #     pipeline = await get_active_peers()
-        #     print(f"🔗 Pipeline: {pipeline}")
-        #     if current_peer_ticket in pipeline:
-        #         print(f"✅ Included in pipeline as {current_peer_ticket}")
-        #         break
-        #     await asyncio.sleep(2)
+        # Wait until this peer is included in the pipeline configuration
+        print("⏳ Waiting to be included in the pipeline...")
+        while True:
+            pipeline = await get_active_peers()
+            print(f"🔗 Pipeline: {pipeline}")
+            if current_peer_ticket in pipeline:
+                print(f"✅ Included in pipeline as {current_peer_ticket}")
+                break
+            await asyncio.sleep(2)
 
-        # # Determine this peer's position and role in the pipeline
-        # index = pipeline.index(current_peer_ticket)
-        # is_first = index == 0
-        # is_last = index == len(pipeline) - 1
-        # next_peer = pipeline[index + 1] if not is_last else None
+        # Determine this peer's position and role in the pipeline
+        index = pipeline.index(current_peer_ticket)
+        is_first = index == 0
+        is_last = index == len(pipeline) - 1
+        next_peer = pipeline[index + 1] if not is_last else None
 
-        # print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
+        print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
 
         # Main processing loop - continuously process computation jobs
         while True:
@@ -741,7 +836,7 @@ async def main():
     finally:
         # Cancel background tasks
         heartbeat_task.cancel()
-        # deployment_task.cancel()
+        deployment_listener_task.cancel()
         
         try:
             await heartbeat_task
