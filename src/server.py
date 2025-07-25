@@ -1010,12 +1010,11 @@ async def infer(request: InferenceRequest):
         "timestamp": time.time()
     }
     instruction_payload = json.dumps(inference_payload).encode()
-    
+    instruction_payload = np.frombuffer(instruction_payload, dtype=np.uint8)
 
     #5. Broadcast the instruction payload to the first peer
-    
-    # await refresh_trigger_sink() 
-    # await trigger_gossip_sink.broadcast(instruction_payload)
+    first_peer_ticket = pipeline[0]
+    await tensor_transport.send(first_peer_ticket, "inference", instruction_payload)
 
     print(f"🚀 Inference {request_id} started for model {request.model_name}")
     return InferenceResponse(
