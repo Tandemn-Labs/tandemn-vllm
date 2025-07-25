@@ -3,13 +3,13 @@ import iroh
 import pickle
 import httpx  # type: ignore
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import time
 from vllm import LLM, SamplingParams, TokensPrompt  # type: ignore
 import torch
 import threading
 import uuid
-
+from src.utils.tensor_protocol_adapter import TensorTransport
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
@@ -26,78 +26,6 @@ def cleanup_request_context(request_id: str):
         if request_id in INFERENCE_CONTEXT:
             del INFERENCE_CONTEXT[request_id]
             print(f"🧹 Cleaned up context for {request_id}")
-
-
-async def send_hidden_state_blob(
-    node: iroh.Node,
-    hidden_state_gossip_sink: iroh.Gossip,
-    request_id: str,
-    next_peer_id: str,
-    pipeline: List[str],
-    data_to_send: Any,
-    is_residual: bool = False,
-    step_idx: int = 0
-):
-    "Serializes the data, stores it as a blob, and sends it to the next peer"
-    try:
-        # serialize the data
-        serialized_data = pickle.dumps(data_to_send)
-        # add the data to a blob store
-        blob_output = await node.blobs().add_bytes(serialized_data)
-        blob_hash = blob_output.hash
-        # create a blob ticket
-        blob_ticket = await node.blobs().share(blob_hash, iroh.BlobFormat.RAW, iroh.AddrInfoOptions.RELAY_AND_ADDRESSES)
-
-        # now that the data is added to the blob, create a pointer for it that is sent as a chatter over the gossip network
-        reference={
-            "request_id": request_id,
-            "blob_ticket": str(blob_ticket),
-            "tensor_shape": list(data_to_send.shape),
-            "tensor_dtype": str(data_to_send.dtype),
-            "next_peer_id": next_peer_id,
-            "pipeline": pipeline,
-            "is_residual": is_residual,
-            "step_idx": step_idx
-        }
-        reference_bytes = json.dumps(reference).encode()
-        # send it over gossip network
-        await hidden_state_gossip_sink.broadcast(reference_bytes)
-        print(f"📤 Sent {'residual' if is_residual else 'hidden_state'} blob ticket for {request_id} to {next_peer_id}")
-    except Exception as e:
-        print(f"❌ [DEBUG] Failed to send hidden state blob for {request_id} to {next_peer_id}: {e}")
-
-
-async def send_token_output_blob(
-    node: iroh.Node,
-    token_gossip_sink: iroh.Gossip,
-    request_id: str,
-    pipeline: List[str],
-    sampler_output: Any,
-    step_idx: int
-):
-    "Serializes the sampler output, stores it as a blob, and sends it to all peers"
-    try:
-        # serialize the data
-        serialized_data = pickle.dumps(sampler_output)
-        # add the data to a blob store
-        blob_output = await node.blobs().add_bytes(serialized_data)
-        blob_hash = blob_output.hash
-        # create a blob ticket
-        blob_ticket = await node.blobs().share(blob_hash, iroh.BlobFormat.RAW, iroh.AddrInfoOptions.RELAY_AND_ADDRESSES)
-
-        # now that the data is added to the blob, create a pointer for it that is sent as a chatter over the gossip network
-        reference={
-            "request_id": request_id,
-            "blob_ticket": str(blob_ticket),
-            "pipeline": pipeline,
-            "step_idx": step_idx
-        }
-        reference_bytes = json.dumps(reference).encode()
-        # send it over gossip network
-        await token_gossip_sink.broadcast(reference_bytes)
-        print(f"📤 Sent sampler output blob ticket for {request_id} step {step_idx}")
-    except Exception as e:
-        print(f"❌ [DEBUG] Failed to send token output blob for {request_id}: {e}")
 
 
 async def send_final_result_to_server(
@@ -142,11 +70,11 @@ async def send_final_result_to_server(
 
 def register_inference_hooks(
     llm:"LLM",
-    node: iroh.Node,
-    hidden_state_gossip_sink: iroh.Gossip,
-    token_gossip_sink: iroh.Gossip,
+    node: TensorTransport,
     peer_id: str,
-    server_url: str = "http://{SERVER_IP}:8000"
+    server_url: str = "http://{SERVER_IP}:8000",
+    next_peer_ticket: Optional[str] = None,
+    pipeline: Optional[List[str]] = None
 ):
     """
     Create pre and post hooks for the inference pipeline, to transfer hidden states
@@ -404,9 +332,8 @@ def register_inference_hooks(
         print(f"   Hidden states: {hidden_states.shape}")
         print(f"   Residual: {residual.shape}")
         
-        pipeline = hook_context["pipeline"]
-        current_idx = pipeline.index(peer_id)
-        next_peer_id = pipeline[current_idx + 1]
+        next_peer_id = hook_context["next_peer_id"]
+        next_peer_ticket = hook_context["next_peer_ticket"]
 
         # MATRIX MANIPULATION STARTS HERE - IMPROVED VERSION
         
@@ -435,28 +362,26 @@ def register_inference_hooks(
 
         # Schedule sends asynchronously (non-blocking)
         asyncio.run_coroutine_threadsafe(
-            send_hidden_state_blob(
+            send_hidden_state_tensor(
                 node,
-                hidden_state_gossip_sink,
                 request_id,
                 next_peer_id,
-                pipeline,
                 hidden_states.cpu(),
                 is_residual=False, 
-                step_idx=current_step
+                step_idx=current_step,
+                next_peer_ticket=next_peer_ticket
             ),
             main_loop
         )
         asyncio.run_coroutine_threadsafe(
-            send_hidden_state_blob(
+            send_hidden_state_tensor(
                 node,
-                hidden_state_gossip_sink,
                 request_id,
                 next_peer_id,
-                pipeline,
                 residual.cpu(),
                 is_residual=True,
-                step_idx=current_step
+                step_idx=current_step,
+                next_peer_ticket=next_peer_ticket
             ),
             main_loop
         )
@@ -485,19 +410,35 @@ def register_inference_hooks(
             pipeline = hook_context["pipeline"]
 
         if is_last_peer:
-            # This peer is the decider. Broadcast the result.
-            print(f"📢 Last peer broadcasting sampler output for step {current_step}")
-            asyncio.run_coroutine_threadsafe(
-                send_token_output_blob(
-                    node,
-                    token_gossip_sink,
-                    request_id,
-                    pipeline,
-                    output,
-                    current_step
-                ),
-                main_loop
-            )
+            for peer_ticket in pipeline:
+                if peer_ticket!=peer_id:
+                    asyncio.run_coroutine_threadsafe(
+                        send_hidden_state_tensor(
+                            node,
+                            request_id,
+                            peer_ticket,
+                            output.cpu().numpy(),
+                            is_residual=False,
+                            step_idx=current_step,
+                            next_peer_ticket=peer_ticket
+                        ),
+                        main_loop
+                    )
+                    
+            # # This peer is the decider. Broadcast the result.
+            # print(f"📢 Last peer broadcasting sampler output for step {current_step}")
+            # asyncio.run_coroutine_threadsafe(
+            #     send_hidden_state_tensor(
+            #         node,
+            #         request_id,
+            #         pipeline[0],
+            #         output.cpu().numpy(),
+            #         is_residual=False,
+            #         step_idx=current_step,
+            #         next_peer_ticket=pipeline[0]
+            #     ),
+            #     main_loop
+            # )
             
             # CRITICAL FIX: Increment step on ALL peers, including last peer
             with context_lock:
@@ -617,12 +558,34 @@ def register_inference_hooks(
     # return the start_inference_run function
     return start_inference_run
 
+async def send_hidden_state_tensor(
+    tensor_transport: "TensorTransport",
+    request_id: str,
+    next_peer_id: str,
+    data_to_send: "np.ndarray",
+    is_residual: bool = False,
+    step_idx: int = 0,
+    next_peer_ticket: str = "",
+):
+    """
+    Sends the tensor directly to the next peer using TensorTransport.
+    No gossip, no blobs.
+    """
+    try:
+        if not next_peer_ticket:
+            raise ValueError("next_peer_ticket must be provided for tensor transport send.")
+
+        # Compose a name for the tensor message
+        tensor_name = f"{request_id}_step{step_idx}_{'residual' if is_residual else 'hidden_state'}"
+
+        await tensor_transport.send(
+            next_peer_ticket,
+            name=tensor_name,
+            tensor=data_to_send
+        )
+
+        print(f"📤 Sent {'residual' if is_residual else 'hidden_state'} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport")
+    except Exception as e:
+        print(f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}")
 
 
-
-
-
-
-
-        
- 

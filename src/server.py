@@ -4,8 +4,6 @@ import torch
 import json
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, Response
-from iroh.iroh_ffi import uniffi_set_event_loop
-from iroh import PublicKey, NodeAddr
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import uuid
@@ -14,8 +12,13 @@ from datetime import datetime
 from pathlib import Path
 from colorama import Fore, Style, init as colorama_init  # ADD
 from src.utils.sharding_utils import shard_model_by_layers_safetensors
+from src.utils.deployment_utils import load_model_metadata, get_peers_with_vram,   create_distribution_plan, create_deployment_instructions
 from transformers import AutoTokenizer
 import os
+import numpy as np
+## Tensor_Iroh Starts here ###########################
+from src.utils.tensor_protocol_adapter import TensorTransport
+######################################################
 
 from src.config.settings import (
     SERVER_HOST,
@@ -47,25 +50,20 @@ app = FastAPI(title="Iroh Tandemn Server")
 
 SERVER_IP = "172.16.1.249"
 # Global Variables for Iroh Node and Gossip Management
+
 # IROH STARTS HERE
-node = None  # Iroh node instance
-trigger_gossip_sink = None
-deployment_gossip_sink = None
 active_inferences = {}
-TRIGGER_TOPIC = bytes("trigger_topic".ljust(32), "utf-8")[:32]
-DEPLOYMENT_TOPIC = bytes("deployment_topic".ljust(32), "utf-8")[:32]
+central_server_ticket = None
+# TRIGGER_TOPIC = bytes("trigger_topic".ljust(32), "utf-8")[:32]
+# DEPLOYMENT_TOPIC = bytes("deployment_topic".ljust(32), "utf-8")[:32]
 # IROH ENDS HERE
 
-peer_table: Dict[str,NodeAddr] = {}
-server_id = None  # Unique identifier for this server instance
+peer_table: Dict[str,str] = {}
+# server_id = None  # Unique identifier for this server instance
 # Peer tracking for topology changes
 active_peer_ids = set()  # Currently active peer node_ids
 peer_last_seen = {}  # Track when each peer was last seen
 PEER_TIMEOUT = 30  # Seconds before considering a peer dead
-
-
-# doc = None   # Iroh document instance
-# ticket = None  # Document sharing ticket
 
 # Task tracking for background operations
 background_tasks = {}  # Dict to track running background tasks
@@ -89,9 +87,6 @@ def _get_peer_color(peer_id: str):
 class HeartbeatRequest(BaseModel):
     """Schema for heartbeat POSTs from peers."""
     peer_id: str
-    node_id: str #iroh_node_id
-    addresses: List[str] #addresses
-    relay_url: Optional[str] = None #relay_url
     cpu: float
     ram: float
     gpu_count: int
@@ -131,36 +126,14 @@ class ModelDeploymentRequest(BaseModel):
     model_name: str
     shard_folder: str
 
-# IROH STARTS HERE
-async def refresh_trigger_sink():
-    """(Re)create the trigger gossip sink with current peer list."""
-    global trigger_gossip_sink
-    peer_ids = list(peer_table.keys())  # list of node_id strings
-    # Recreate sink each time to update peer set
-    trigger_gossip_sink = await node.gossip().subscribe(TRIGGER_TOPIC, peer_ids, NoopCallback())
-    print(f"📡 Trigger sink refreshed with peers: {peer_ids}")
-
-async def refresh_deployment_sink():
-    """(Re)create the deployment gossip sink with current peer list."""
-    global deployment_gossip_sink
-    peer_ids = list(peer_table.keys())  # list of node_id strings
-    # Recreate sink each time to update peer set
-    deployment_gossip_sink = await node.gossip().subscribe(
-        DEPLOYMENT_TOPIC,
-        peer_ids,
-        NoopCallback())
-    print(f"📡 Deployment sink refreshed with peers: {peer_ids}")
-# IROH ENDS HERE
 
 @app.on_event("startup")
 async def startup():
     """Initialize the Iroh node and document on server startup"""
     # global node, doc, ticket, server_peer_id
-    global node, server_id, trigger_gossip_sink, active_inferences, TRIGGER_TOPIC, peer_table
-
+    # global node, server_id, trigger_gossip_sink, active_inferences, TRIGGER_TOPIC, peer_table, central_server_ticket
+    global central_server_ticket, tensor_transport
     print("🚀 Starting Iroh Tandemn server...")
-    # Configure async event loop for Iroh
-    uniffi_set_event_loop(asyncio.get_running_loop())
 
     # Set up MongoDB collections
     await setup_collections()
@@ -174,45 +147,14 @@ async def startup():
         print("🧹 No previous peer records found to clear")
     # only need to do this when we are testing ^^^
 
-    # IROH STARTS HERE
-    options = iroh.NodeOptions()
-    options.enable_gossip = True
-    node = await iroh.Iroh.memory_with_options(options)
-    server_id = await node.net().node_id()
-    print(f"✅ Iroh node started with server_id: {server_id}")
+    # Start the TensorTransport for the central server ##############################################
+    tensor_transport = TensorTransport()
+    await tensor_transport.start()
+    central_server_ticket = tensor_transport.ticket
+    print(f"🪪 TensorTransport for the central server started – ticket:\n{central_server_ticket}\n")
+    #################################################################################################
 
-    await refresh_trigger_sink()    
-    await refresh_deployment_sink()
-    # IROH ENDS HERE
     
-    # print("📡 Using HTTP for completions instead of gossip")    # options.enable_docs = True
-
-    # # Create and share document
-    # doc = await node.docs().create()
-    # ticket = await doc.share(iroh.ShareMode.WRITE, iroh.AddrInfoOptions.RELAY_AND_ADDRESSES)
-
-    # Record initial system metrics
-    # author = await node.authors().create()
-    # key = server_peer_id.encode()
-    # metrics = get_system_metrics()
-    # formatted_metrics = format_metrics_for_db(metrics)
-    # value = f"CPU: {metrics.cpu_percent}%\nRAM: {metrics.ram_percent}%".encode()
-
-    # try:
-    #     # Store system metrics in the document and MongoDB
-    #     await doc.set_bytes(author, key, value)
-    #     await update_peer_metrics(server_peer_id, formatted_metrics)
-    #     print(f"✅ Server metrics stored with key {server_peer_id}")
-    # except Exception as e:
-    #     print(f"❌ Failed to send server metrics: {e}")
-
-    # Join the document to enable updates
-    # doc = await node.docs().join(ticket)
-    # print("✅ Iroh node started")
-    # print("📎 SHARE THIS TICKET WITH ALL INTERNAL MACHINES:\n")
-    # print(str(ticket) + "\n")
-    
-
 @app.get("/health")
 async def health():
     """Endpoint to check health and status of all connected machines"""
@@ -254,61 +196,35 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
     """Receive heartbeat from a peer and store metrics in MongoDB."""
     try:
         peer_ip = request.client.host if request.client else "unknown"
-        
-        # Track when this peer was last seen
         current_time = time.time()
-        peer_last_seen[hb.node_id] = current_time
-        
-        # Check if this is a new peer or if peer table needs updating
-        topology_changed = False
-        
-        if hb.node_id not in peer_table:
+        peer_id_of_requester = hb.peer_id
+        peer_last_seen[peer_id_of_requester] = current_time
+
+        if peer_id_of_requester not in peer_table:
             # New peer - add to Iroh network
-            pk = PublicKey.from_string(hb.node_id)
-            addr = NodeAddr(pk, hb.relay_url, hb.addresses)
-            await node.net().add_node_addr(addr)
-            peer_table[hb.node_id] = addr
-            active_peer_ids.add(hb.node_id)
+            peer_table[peer_id_of_requester] = peer_ip
+            active_peer_ids.add(peer_id_of_requester)
             topology_changed = True
-            print(f"🗒️ New peer detected: {hb.peer_id}")
-        
-        # Check for dead peers (haven't sent heartbeat in PEER_TIMEOUT seconds)
-        dead_peers = []
-        for node_id, last_seen in list(peer_last_seen.items()):
-            if current_time - last_seen > PEER_TIMEOUT:
-                dead_peers.append(node_id)
-        
-        # Remove dead peers from tracking
+            print(f"🗒️ New peer detected: {peer_id_of_requester}")
+
+        # Optimize dead peer detection using a list comprehension and direct hash lookups
+        # peer_last_seen is a dict: {peer_id: last_seen_time}
+        # Only check those whose last_seen is too old
+        dead_peers = [peer_id for peer_id, last_seen in peer_last_seen.items()
+                      if current_time - last_seen > PEER_TIMEOUT]
+
+        # Remove dead peers from all relevant hashmaps/sets
         for dead_node_id in dead_peers:
             if dead_node_id in peer_table:
                 del peer_table[dead_node_id]
-                active_peer_ids.discard(dead_node_id)
+            active_peer_ids.discard(dead_node_id)
+            if dead_node_id in peer_last_seen:
                 del peer_last_seen[dead_node_id]
-                topology_changed = True
-                print(f"💀 Peer {dead_node_id[:8]} timed out and removed")
-        
-        # Only refresh sinks if topology actually changed
-        if topology_changed:
-            await refresh_trigger_sink()
-            await refresh_deployment_sink()
-            print(f"🔄 Network topology changed - sinks refreshed")
-        
-        print(f"🗒️ Active peers: {len(active_peer_ids)} ({list(p[:8] for p in active_peer_ids)})")
-        
-        # Get server address once
-        srv_addr = await node.net().node_addr()
-        
-        # Build peer list (excluding requester)
-        peers_payload = []
-        for pid, naddr in peer_table.items():
-            if pid == hb.node_id:
-                continue
-            peers_payload.append({
-                "node_id": pid,
-                "addresses": naddr.direct_addresses(),
-                "relay_url": naddr.relay_url()
-            })
-        
+            topology_changed = True
+            print(f"💀 Peer {dead_node_id[:8]} timed out and removed")
+
+        print(f"🗒️ Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
+
         # Compact metrics object similar to previous format
         formatted_metrics = {
             "cpu_percent": hb.cpu,
@@ -318,14 +234,13 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
             "gpu_info": hb.gpu_info or [],
             "timestamp": datetime.fromtimestamp(hb.timestamp)
         }
-
+        # uncomment when we need to do things with the database
         # Update MongoDB (time-series) using existing helper
         await update_peer_metrics(hb.peer_id, formatted_metrics)
         # Upsert peer record
         await _db[PEERS_COLLECTION].update_one(
-            {"peer_id": hb.peer_id},
-            {"$set": {"peer_id": hb.peer_id,
-                      "node_id": hb.node_id, 
+            {"peer_id": peer_id_of_requester},
+            {"$set": {"peer_id": peer_id_of_requester,
                       "ip": peer_ip,
                        "is_active": True,
                         "last_seen": datetime.utcnow()}},
@@ -334,13 +249,11 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         # Colored log
         color = _get_peer_color(hb.peer_id)
         print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
+        print(f"🔗 Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
         
         return {
             "status": "ok",
-            "server_id": server_id,
-            "server_addresses": srv_addr.direct_addresses(),
-            "relay_url": srv_addr.relay_url(),
-            "peers": peers_payload
+            "central_server_ticket": central_server_ticket,
         }
     except Exception as e:
         print(f"❌ Heartbeat processing failed: {e}")
@@ -876,13 +789,15 @@ async def deploy_model(request: ModelDeploymentRequest):
     Returns:
         Deployment status and peer assignments
     """
-    global active_deployments, deployment_gossip_sink
+    global active_deployments, tensor_transport
     
     try:
         # Check if deployment is already in progress
         if request.model_name in active_deployments:
             # Check if deployment is stale (older than 5 minutes)
             deployment_age = time.time() - active_deployments[request.model_name]["started_at"]
+
+            # implement the logic for deployment timeout
             if deployment_age > 300:  # 5 minutes
                 print(f"🧹 Cleaning up stale deployment (age: {deployment_age:.1f}s)")
                 del active_deployments[request.model_name]
@@ -903,135 +818,32 @@ async def deploy_model(request: ModelDeploymentRequest):
         print(f"🚀 Starting deployment for {request.model_name}")
         
         # 1. Validate shard folder exists and read metadata
-        shard_path = Path(request.shard_folder)
-        if not shard_path.exists():
-            raise HTTPException(status_code=404, detail=f"Shard folder not found: {request.shard_folder}")
-        
-        metadata_file = shard_path / "layer_metadata.json"
-        if not metadata_file.exists():
-            raise HTTPException(status_code=404, detail="layer_metadata.json not found in shard folder")
-        
-        with open(metadata_file, "r") as f:
-            metadata = json.load(f)
-        
-        print(f"📊 Model metadata: {metadata['num_layers']} layers, type: {metadata['model_type']}")
-        
+        metadata = load_model_metadata(request.shard_folder)
         # 2. Get active peers and their VRAM availability
-        active_peers = await get_active_peers()
-        if len(active_peers) < 1:
-            raise HTTPException(status_code=400, detail="No active peers available for deployment")
-        
-        peers_vram = {}
-        for peer_id in active_peers:
-            try:
-                metrics_history = await get_peer_metrics(peer_id, time_window=60)
-                if metrics_history:
-                    latest_metrics = metrics_history[0]["metrics"]
-                if "total_free_vram_gb" in latest_metrics:
-                    peers_vram[peer_id] = latest_metrics["total_free_vram_gb"]
-            except Exception as e:
-                print(f"❌ Error getting metrics for peer {peer_id}: {e}")
-
-        if not peers_vram:
-            raise HTTPException(status_code=400, detail="No peers with VRAM information available")
-        
-        print(f"👥 Found {len(peers_vram)} peers with VRAM data")
-
+        peers_vram = await get_peers_with_vram()
         # 3. Create distribution plan using existing logic
-        # Create a dummy config for distribution planning
-        config = {
-            "num_hidden_layers": metadata['num_layers'],
-            "hidden_size": metadata['hidden_size'],
-            "vocab_size": 32000,  # Default for demo
-            "num_attention_heads": 32,  # Default for demo  
-            "num_key_value_heads": 32,  # Default for demo
-            "intermediate_size": metadata['hidden_size'] * 4,  # Standard ratio
-        }
-        
-        distribution_plan = distribute_layers_across_peers(
-            config=config,
-            peers_vram=peers_vram,
-            q_bits=32  # Default quantization, for testing for now
-        )
-        print(f"📋 Distribution plan created:")
-        print(f"   • Model can fit: {distribution_plan['can_fit_model']}")
-        print(f"   • Total VRAM needed: {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB")
-        print(f"   • Available VRAM: {distribution_plan['total_available_vram_gb']:.1f}GB")
-        print(f"   • Peers involved: {len(distribution_plan['distribution'])}")
-        for peer_id, peer_info in distribution_plan['distribution'].items():
-            print(f"   • {peer_id}: {peer_info['assigned_layers']} layers, {peer_info['estimated_vram_usage']:.1f}GB")
-
-        if not distribution_plan["can_fit_model"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Model cannot fit in available VRAM. Need {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB, have {distribution_plan['total_available_vram_gb']:.1f}GB"
-            )
-
+        distribution_plan = create_distribution_plan(metadata, peers_vram)
         # 4. Create optimized deployment instructions for each peer
-        deployment_instructions = {}
-        peer_list = list(distribution_plan["distribution"].keys())
-        
-        for i, (peer_id, peer_info) in enumerate(distribution_plan["distribution"].items()):
-            is_first_peer = (i == 0)
-            is_last_peer = (i == len(peer_list) - 1)
-            
-            assigned_layers = list(range(
-                sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i]),
-                sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i+1])
-            ))
-
-            # Determine required files based on peer position
-            required_files = []
-            
-            # Config files (all peers need these)
-            required_files.extend([
-                "config/config.json",
-                "config/tokenizer.json", 
-                "config/tokenizer_config.json",
-                # "config/model.safetensors"  # Dummy model file
-            ])
-            
-            # Essential components based on position
-            if is_first_peer:
-                required_files.append("embedding/layer.safetensors")
-                
-            if is_last_peer:
-                required_files.extend([
-                    "lm_head/layer.safetensors",
-                    "norm/layer.safetensors"
-                ])
-            
-            # Assigned layer files
-            for layer_idx in assigned_layers:
-                required_files.append(f"layers/layer_{layer_idx}.safetensors")
-            
-            deployment_instructions[peer_id] = {
-                "model_name": request.model_name,
-                "assigned_layers": assigned_layers,
-                "is_first_peer": is_first_peer,
-                "is_last_peer": is_last_peer,
-                "required_files": required_files,
-                "server_download_url": f"http://{SERVER_IP}:8000/download_file/{request.model_name.replace('/', '_')}", #TODO: change to server ip
-                "vram_allocation": peer_info
-            }
-        
+        deployment_instructions = create_deployment_instructions(request, distribution_plan, peer_table, SERVER_IP)
         # 5. Persist deployment tracking information BEFORE broadcasting
         active_deployments[request.model_name].update({
             "instructions_sent_at": time.time(),
             "deployment_map": {pid: instr["assigned_layers"] for pid, instr in deployment_instructions.items()},
             "completion_status": {pid: "pending" for pid in deployment_instructions.keys()},
         })
-
         # 6. Send deployment instructions to each peer via Iroh
-        # IROH STARTS HERE
         for peer_id, instructions in deployment_instructions.items():
             try:
-                payload = json.dumps({
+                payload_dict = {
                     "action": "deploy_model",
-                    "target_peer_id": peer_id, # fix this if needed
+                    "target_peer_id": peer_id,  # fix this if needed
                     "instructions": instructions
-                }).encode()
-                await deployment_gossip_sink.broadcast(payload)
+                }
+                payload_bytes = json.dumps(payload_dict).encode()
+                payload = np.frombuffer(payload_bytes, dtype=np.uint8)
+
+                await tensor_transport.send(peer_id, "deploy", payload)
+
                 print(f"📤 Sent deployment instructions to {peer_id}")
             except Exception as e:
                 print(f"❌ Failed to send instructions to {peer_id}: {e}")
@@ -1055,42 +867,6 @@ async def deploy_model(request: ModelDeploymentRequest):
             "deployment_instructions": deployment_instructions,
             "message": f"Deployment instructions sent to {len(deployment_instructions)} peers. Peers will download required files and load model."
         }
-        # global doc, node
-        # author = await node.authors().create()
-        
-        # for peer_id, instructions in deployment_instructions.items():
-        #     try:
-        #         instruction_key = f"deploy_instruction_{peer_id}_{int(time.time())}"
-        #         instruction_data = json.dumps({
-        #             "action": "deploy_model",
-        #             "instructions": instructions
-        #         }).encode()
-                
-        #         await doc.set_bytes(author, instruction_key.encode(), instruction_data)
-        #         print(f"📤 Sent deployment instructions to {peer_id}")
-                
-        #     except Exception as e:
-        #         print(f"❌ Failed to send instructions to {peer_id}: {e}")
-        
-        # print(f"✅ Deployment initiated for {request.model_name}")
-        # print(f"📊 Distribution: {len(deployment_instructions)} peers")
-        
-        # # Keep deployment as in_progress - peers will update status when done
-        # # DON'T mark as completed here - instructions were just sent, not completed!
-        # active_deployments[request.model_name].update({
-        #     "instructions_sent_at": time.time(),
-        #     "deployment_map": {peer_id: info["assigned_layers"] for peer_id, info in deployment_instructions.items()},
-        #     "completion_status": {peer_id: "pending" for peer_id in deployment_instructions.keys()}
-        # })
-
-        # return {
-        #     "status": "deployment_initiated",
-        #     "model_name": request.model_name,
-        #     "total_peers": len(deployment_instructions),
-        #     "distribution_plan": distribution_plan,
-        #     "deployment_instructions": deployment_instructions,
-        #     "message": f"Deployment instructions sent to {len(deployment_instructions)} peers. Peers will download required files and load model."
-        # }
 
     except HTTPException:
         # Clean up deployment tracking on error
@@ -1234,11 +1010,11 @@ async def infer(request: InferenceRequest):
         "timestamp": time.time()
     }
     instruction_payload = json.dumps(inference_payload).encode()
-    
+    instruction_payload = np.frombuffer(instruction_payload, dtype=np.uint8)
 
     #5. Broadcast the instruction payload to the first peer
-    await refresh_trigger_sink() 
-    await trigger_gossip_sink.broadcast(instruction_payload)
+    first_peer_ticket = pipeline[0]
+    await tensor_transport.send(first_peer_ticket, "inference", instruction_payload)
 
     print(f"🚀 Inference {request_id} started for model {request.model_name}")
     return InferenceResponse(
