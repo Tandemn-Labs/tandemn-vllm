@@ -67,10 +67,10 @@ class TensorTransport:
         data = tp.PyTensorData(array.tobytes(), list(array.shape), str(array.dtype), False)
         await self._node.send_tensor(peer_addr, name, data)
 
-    async def recv(self) -> Dict[str, Any]:
+    async def recv(self) -> Optional[Dict[str, Any]]:
         """
         Blocks until *any* tensor arrives.
-        Returns: {"name": str, "tensor": torch.Tensor}
+        Returns: {"name": str, "tensor": torch.Tensor} or None if no tensor available
         """
         import numpy as np
         import torch
@@ -78,9 +78,20 @@ class TensorTransport:
         if self._node is None:
             raise RuntimeError("TensorTransport.start() not called")
 
-        # Updated to receive both name and tensor data
-        name, pdata = await self._node.receive_tensor()
+        # Receive tensor data - returns None if no tensor available, or (name, data) tuple
+        result = await self._node.receive_tensor()
         
+        if result is None:
+            return None
+            
+        # Check if we got a tuple (name, data) or just data
+        if isinstance(result, tuple) and len(result) == 2:
+            name, pdata = result
+        else:
+            # Fallback for old API - assume result is just the data
+            name = "unknown"
+            pdata = result
+            
         if pdata is None:
             return None
             
