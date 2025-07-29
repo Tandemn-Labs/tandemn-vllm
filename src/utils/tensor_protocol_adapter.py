@@ -3,7 +3,7 @@ import asyncio
 from typing import Any, Dict, Optional
 
 # The wheel you built with build_pyo3_bindings.sh
-import tensor_protocol as tp  
+import tensor_iroh as tp  
 
 
 class TensorTransport:
@@ -83,7 +83,6 @@ class TensorTransport:
         
         if result is None:
             return None
-            
         # Check if we got a tuple (name, data) or just data
         if isinstance(result, tuple) and len(result) == 2:
             name, pdata = result

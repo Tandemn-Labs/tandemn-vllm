@@ -57,155 +57,155 @@ PEER_COLOR = COLORS[int(socket.gethostname().__hash__()) % len(COLORS)]  # deter
 
 
 
-async def monitor_inference_tensors():
-    """Monitor for incoming hidden states, residuals, and sampler outputs during inference"""
-    global tensor_transport
-    print("🎯 Starting inference tensor monitor...")
+# async def monitor_inference_tensors():
+#     """Monitor for incoming hidden states, residuals, and sampler outputs during inference"""
+#     global tensor_transport
+#     print("🎯 Starting inference tensor monitor...")
     
-    while True:
-        try:
-            msg = await tensor_transport.recv()
-            if msg is None:
-                await asyncio.sleep(0.01)
-                continue
+#     while True:
+#         try:
+#             msg = await tensor_transport.recv()
+#             if msg is None:
+#                 await asyncio.sleep(0.01)
+#                 continue
                 
-            name = msg.get("name", "")
-            tensor = msg.get("tensor")
+#             name = msg.get("name", "")
+#             tensor = msg.get("tensor")
             
-            # Parse the tensor name to determine type
-            if "_hidden_state" in name or "_residual" in name:
-                # Extract request_id and step from name
-                parts = name.split("_")
-                request_id = parts[0]
-                step_idx = int(parts[1].replace("step", ""))
+#             # Parse the tensor name to determine type
+#             if "_hidden_state" in name or "_residual" in name:
+#                 # Extract request_id and step from name
+#                 parts = name.split("_")
+#                 request_id = parts[0]
+#                 step_idx = int(parts[1].replace("step", ""))
                 
-                # Store in INFERENCE_CONTEXT
-                if request_id not in INFERENCE_CONTEXT:
-                    INFERENCE_CONTEXT[request_id] = {}
-                if step_idx not in INFERENCE_CONTEXT[request_id]:
-                    INFERENCE_CONTEXT[request_id][step_idx] = {}
+#                 # Store in INFERENCE_CONTEXT
+#                 if request_id not in INFERENCE_CONTEXT:
+#                     INFERENCE_CONTEXT[request_id] = {}
+#                 if step_idx not in INFERENCE_CONTEXT[request_id]:
+#                     INFERENCE_CONTEXT[request_id][step_idx] = {}
                 
-                if "_residual" in name:
-                    INFERENCE_CONTEXT[request_id][step_idx]["residual"] = tensor
-                else:
-                    INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = tensor
+#                 if "_residual" in name:
+#                     INFERENCE_CONTEXT[request_id][step_idx]["residual"] = tensor
+#                 else:
+#                     INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = tensor
                     
-            elif "_sampler_output" in name:
-                # Handle sampler output from last peer
-                parts = name.split("_")
-                request_id = parts[0]
-                step_idx = int(parts[1].replace("step", ""))
+#             elif "_sampler_output" in name:
+#                 # Handle sampler output from last peer
+#                 parts = name.split("_")
+#                 request_id = parts[0]
+#                 step_idx = int(parts[1].replace("step", ""))
                 
-                # Unpickle the sampler output
-                sampler_output = pickle.loads(tensor.tobytes())
+#                 # Unpickle the sampler output
+#                 sampler_output = pickle.loads(tensor.tobytes())
                 
-                if request_id not in INFERENCE_CONTEXT:
-                    INFERENCE_CONTEXT[request_id] = {}
-                if step_idx not in INFERENCE_CONTEXT[request_id]:
-                    INFERENCE_CONTEXT[request_id][step_idx] = {}
+#                 if request_id not in INFERENCE_CONTEXT:
+#                     INFERENCE_CONTEXT[request_id] = {}
+#                 if step_idx not in INFERENCE_CONTEXT[request_id]:
+#                     INFERENCE_CONTEXT[request_id][step_idx] = {}
                     
-                INFERENCE_CONTEXT[request_id][step_idx]["sampler_output"] = sampler_output
+#                 INFERENCE_CONTEXT[request_id][step_idx]["sampler_output"] = sampler_output
                 
-        except Exception as e:
-            print(f"❌ Error in inference tensor monitor: {e}")
-            await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
-            print("monitor_inference_tensors cancelled, exiting cleanly.")
-            return
+#         except Exception as e:
+#             print(f"❌ Error in inference tensor monitor: {e}")
+#             await asyncio.sleep(0.1)
+#         except asyncio.CancelledError:
+#             print("monitor_inference_tensors cancelled, exiting cleanly.")
+#             return
 
 
-async def monitor_tensor_transport_for_deployment():
-    """
-    Continuously monitor tensor_transport for incoming deployment instructions.
-    When a deployment instruction is received, handle it accordingly.
-    """
-    global tensor_transport
-    print("🚦 Starting tensor_transport deployment instruction monitor loop...")
-    while True:
-        try:
-            # Wait for any tensor to arrive
-            msg = await tensor_transport.recv()
-            if msg is None:
-                await asyncio.sleep(0.1)
-                continue
+# async def monitor_tensor_transport_for_deployment():
+#     """
+#     Continuously monitor tensor_transport for incoming deployment instructions.
+#     When a deployment instruction is received, handle it accordingly.
+#     """
+#     global tensor_transport
+#     print("🚦 Starting tensor_transport deployment instruction monitor loop...")
+#     while True:
+#         try:
+#             # Wait for any tensor to arrive
+#             msg = await tensor_transport.recv()
+#             if msg is None:
+#                 await asyncio.sleep(0.1)
+#                 continue
 
-            # Expecting: {"tensor": torch.Tensor}
-            tensor = msg.get("tensor")
-            if tensor is None:
-                print("⚠️ Received message without tensor payload")
-                continue
+#             # Expecting: {"tensor": torch.Tensor}
+#             tensor = msg.get("tensor")
+#             if tensor is None:
+#                 print("⚠️ Received message without tensor payload")
+#                 continue
 
-            # Convert tensor (np.uint8) back to bytes
-            if hasattr(tensor, "numpy"):
-                arr = tensor.numpy()
-            else:
-                arr = tensor
-            if arr.dtype != np.uint8:
-                print(f"⚠️ Received tensor with unexpected dtype: {arr.dtype}")
-                continue
-            instruction_data = arr.tobytes()
+#             # Convert tensor (np.uint8) back to bytes
+#             if hasattr(tensor, "numpy"):
+#                 arr = tensor.numpy()
+#             else:
+#                 arr = tensor
+#             if arr.dtype != np.uint8:
+#                 print(f"⚠️ Received tensor with unexpected dtype: {arr.dtype}")
+#                 continue
+#             instruction_data = arr.tobytes()
 
-            # Parse and handle deployment instruction
-            try:
-                instruction = json.loads(instruction_data.decode())
-                if instruction.get("action") == "deploy_model":
-                    instructions = instruction.get("instructions", {})
-                    print("\n" + "="*80)
-                    print("🌟🌟🌟 [DEPLOYMENT INSTRUCTION TENSOR RECEIVED] 🌟🌟🌟")
-                    print(f"🟣 Raw tensor payload (full): {tensor}")
-                    print(f"🟣 Numpy array (full): {arr}")
-                    print(f"🟣 Numpy array (as list, full): {arr.tolist() if hasattr(arr, 'tolist') else arr}")
-                    print(f"📨 Received deployment instruction for {instructions.get('model_name', 'unknown')}")
-                    print("="*80 + "\n")
-                    # Deploy model in background (non-blocking)
-                    asyncio.create_task(deploy_model_from_instructions(instructions))
-                else:
-                    print(f"⚠️  Unknown instruction action: {instruction.get('action')}")
-            except Exception as e:
-                print(f"❌ Error handling deployment instruction: {e}")
+#             # Parse and handle deployment instruction
+#             try:
+#                 instruction = json.loads(instruction_data.decode())
+#                 if instruction.get("action") == "deploy_model":
+#                     instructions = instruction.get("instructions", {})
+#                     print("\n" + "="*80)
+#                     print("🌟🌟🌟 [DEPLOYMENT INSTRUCTION TENSOR RECEIVED] 🌟🌟🌟")
+#                     print(f"🟣 Raw tensor payload (full): {tensor}")
+#                     print(f"🟣 Numpy array (full): {arr}")
+#                     print(f"🟣 Numpy array (as list, full): {arr.tolist() if hasattr(arr, 'tolist') else arr}")
+#                     print(f"📨 Received deployment instruction for {instructions.get('model_name', 'unknown')}")
+#                     print("="*80 + "\n")
+#                     # Deploy model in background (non-blocking)
+#                     asyncio.create_task(deploy_model_from_instructions(instructions))
+#                 else:
+#                     print(f"⚠️  Unknown instruction action: {instruction.get('action')}")
+#             except Exception as e:
+#                 print(f"❌ Error handling deployment instruction: {e}")
 
-        except Exception as e:
-            print(f"❌ Error in tensor_transport monitor loop: {e}")
-            await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            print("monitor_tensor_transport_for_deployment cancelled, exiting cleanly.")
-            return
+#         except Exception as e:
+#             print(f"❌ Error in tensor_transport monitor loop: {e}")
+#             await asyncio.sleep(1)
+#         except asyncio.CancelledError:
+#             print("monitor_tensor_transport_for_deployment cancelled, exiting cleanly.")
+#             return
 
 
-async def monitor_inference_context():
-    """Debug monitor for INFERENCE_CONTEXT - shows what data is being stored"""
-    print("📊 Starting INFERENCE_CONTEXT monitor (debug)...")
+# async def monitor_inference_context():
+#     """Debug monitor for INFERENCE_CONTEXT - shows what data is being stored"""
+#     print("📊 Starting INFERENCE_CONTEXT monitor (debug)...")
     
-    while True:
-        try:
-            if INFERENCE_CONTEXT:
-                print(f"\n{'='*60}")
-                print(f"📊 INFERENCE_CONTEXT Status @ {time.strftime('%H:%M:%S')}")
-                print(f"{'='*60}")
+#     while True:
+#         try:
+#             if INFERENCE_CONTEXT:
+#                 print(f"\n{'='*60}")
+#                 print(f"📊 INFERENCE_CONTEXT Status @ {time.strftime('%H:%M:%S')}")
+#                 print(f"{'='*60}")
                 
-                for req_id, req_data in INFERENCE_CONTEXT.items():
-                    print(f"\n📋 Request: {req_id}")
-                    for step_idx, step_data in req_data.items():
-                        if isinstance(step_data, dict):
-                            print(f"   Step {step_idx}:")
-                            for key, value in step_data.items():
-                                if hasattr(value, 'shape'):
-                                    print(f"     - {key}: tensor with shape {value.shape}")
-                                else:
-                                    print(f"     - {key}: {type(value).__name__}")
-                        else:
-                            print(f"   {step_idx}: {type(step_data).__name__}")
+#                 for req_id, req_data in INFERENCE_CONTEXT.items():
+#                     print(f"\n📋 Request: {req_id}")
+#                     for step_idx, step_data in req_data.items():
+#                         if isinstance(step_data, dict):
+#                             print(f"   Step {step_idx}:")
+#                             for key, value in step_data.items():
+#                                 if hasattr(value, 'shape'):
+#                                     print(f"     - {key}: tensor with shape {value.shape}")
+#                                 else:
+#                                     print(f"     - {key}: {type(value).__name__}")
+#                         else:
+#                             print(f"   {step_idx}: {type(step_data).__name__}")
                 
-                print(f"{'='*60}\n")
+#                 print(f"{'='*60}\n")
             
-            await asyncio.sleep(5)  # Check every 5 seconds
+#             await asyncio.sleep(5)  # Check every 5 seconds
             
-        except asyncio.CancelledError:
-            print("monitor_inference_context cancelled, exiting cleanly.")
-            return
-        except Exception as e:
-            print(f"❌ Error in INFERENCE_CONTEXT monitor: {e}")
-            await asyncio.sleep(5)
+#         except asyncio.CancelledError:
+#             print("monitor_inference_context cancelled, exiting cleanly.")
+#             return
+#         except Exception as e:
+#             print(f"❌ Error in INFERENCE_CONTEXT monitor: {e}")
+#             await asyncio.sleep(5)
 
 
 # ============================================================================
@@ -401,10 +401,31 @@ async def handle_inference_data_message(name: str, tensor):
         
         # Parse the tensor name to determine type
         if "_hidden_state" in name or "_residual" in name:
+            # Name format: {request_id}_step{step_idx}_{hidden_state|residual}
+            # Example: req_1753809548666_0_step0_hidden_state
+
             # Extract request_id and step from name
-            parts = name.split("_")
-            request_id = parts[0]
-            step_idx = int(parts[1].replace("step", ""))
+            step_marker_idx = name.find("_step")
+            if step_marker_idx == -1:
+                print(f"❌ Invalid tensor name format: {name}")
+                return
+
+            # Extract request_id (everything before _step)
+            request_id = name[:step_marker_idx]
+
+            # Extract the rest after _step
+            rest = name[step_marker_idx + 5:]  # Skip "_step"
+
+            # Split the rest to get step number and tensor type
+            rest_parts = rest.split("_", 1)
+            if len(rest_parts) < 2:
+                print(f"❌ Invalid tensor name format: {name}")
+                return
+            
+            step_idx = int(rest_parts[0])
+            tensor_type = rest_parts[1]  # "hidden_state" or "residual"
+
+            print(f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='{tensor_type}'")
             
             # Store in INFERENCE_CONTEXT
             if request_id not in INFERENCE_CONTEXT:
@@ -412,18 +433,23 @@ async def handle_inference_data_message(name: str, tensor):
             if step_idx not in INFERENCE_CONTEXT[request_id]:
                 INFERENCE_CONTEXT[request_id][step_idx] = {}
             
-            if "_residual" in name:
-                INFERENCE_CONTEXT[request_id][step_idx]["residual"] = tensor
-                print(f"✅ Stored residual for {request_id} step {step_idx}")
-            else:
+            if tensor_type == "hidden_state":
                 INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = tensor
                 print(f"✅ Stored hidden_state for {request_id} step {step_idx}")
-                
+            elif tensor_type == "residual":
+                INFERENCE_CONTEXT[request_id][step_idx]["residual"] = tensor
+                print(f"✅ Stored residual for {request_id} step {step_idx}")
+            
         elif "_sampler_output" in name:
             # Handle sampler output from last peer
-            parts = name.split("_")
-            request_id = parts[0]
-            step_idx = int(parts[1].replace("step", ""))
+            step_marker_idx = name.find("_step")
+            if step_marker_idx == -1:
+                print(f"❌ Invalid sampler output name format: {name}")
+                return
+                
+            request_id = name[:step_marker_idx]
+            rest = name[step_marker_idx + 5:]
+            step_idx = int(rest.split("_")[0])
             
             # Unpickle the sampler output
             sampler_output = pickle.loads(tensor.tobytes())

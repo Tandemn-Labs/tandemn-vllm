@@ -190,7 +190,7 @@ def register_inference_hooks(
                     return args
                     
                 # Sleep briefly before checking again
-                time.sleep(0.01)
+                time.sleep(0.001)
 
             # Process the received tensors with improved shape handling
             orig_positions = args[0]
@@ -596,5 +596,3 @@ async def send_hidden_state_tensor(
         print(f"📤 Sent {'residual' if is_residual else 'hidden_state'} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport")
     except Exception as e:
         print(f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}")
-
-
