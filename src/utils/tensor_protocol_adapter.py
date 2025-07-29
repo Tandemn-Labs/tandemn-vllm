@@ -78,19 +78,14 @@ class TensorTransport:
         if self._node is None:
             raise RuntimeError("TensorTransport.start() not called")
 
-        #TODO - Make SURE the PYO3 bindings are updated so that the 
-        # name of the tensor is ALSO returned. The reason is that, 
-        # it would be required to get it when we are serving MULTIPLE
-        # requests at the same amount of time. 
-        # name, pdata = await self._node.receive_tensor()
-    
-        pdata = await self._node.receive_tensor()
+        # Updated to receive both name and tensor data
+        name, pdata = await self._node.receive_tensor()
+        
         if pdata is None:
             return None
+            
         arr = np.frombuffer(pdata.as_bytes(), dtype=pdata.dtype).reshape(pdata.shape)
-        # arr = np.frombuffer(pdata.data, dtype=pdata.dtype).reshape(pdata.shape)
-        # return {"name": name, "tensor": torch.from_numpy(arr)}
-        return {"tensor": torch.from_numpy(arr)}
+        return {"name": name, "tensor": torch.from_numpy(arr)}
 
     # -------- diagnostics -------------------------------------------------
 
