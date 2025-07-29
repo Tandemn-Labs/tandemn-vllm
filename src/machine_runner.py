@@ -403,28 +403,33 @@ async def handle_inference_data_message(name: str, tensor):
         if "_hidden_state" in name or "_residual" in name:
             # Name format: {request_id}_step{step_idx}_{hidden_state|residual}
             # Example: req_1753809548666_0_step0_hidden_state
-
-            # Extract request_id and step from name
-            step_marker_idx = name.find("_step")
+            
+            # Find the last occurrence of "_step" to handle request_ids with underscores
+            step_marker_idx = name.rfind("_step")
             if step_marker_idx == -1:
-                print(f"❌ Invalid tensor name format: {name}")
+                print(f"❌ Invalid tensor name format (no _step found): {name}")
                 return
-
-            # Extract request_id (everything before _step)
+            
+            # Extract request_id (everything before the last _step)
             request_id = name[:step_marker_idx]
-
+            
             # Extract the rest after _step
             rest = name[step_marker_idx + 5:]  # Skip "_step"
-
+            
             # Split the rest to get step number and tensor type
             rest_parts = rest.split("_", 1)
             if len(rest_parts) < 2:
-                print(f"❌ Invalid tensor name format: {name}")
+                print(f"❌ Invalid tensor name format (incomplete after _step): {name}")
                 return
             
-            step_idx = int(rest_parts[0])
+            try:
+                step_idx = int(rest_parts[0])
+            except ValueError:
+                print(f"❌ Invalid step number: {rest_parts[0]}")
+                return
+                
             tensor_type = rest_parts[1]  # "hidden_state" or "residual"
-
+            
             print(f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='{tensor_type}'")
             
             # Store in INFERENCE_CONTEXT
@@ -439,10 +444,10 @@ async def handle_inference_data_message(name: str, tensor):
             elif tensor_type == "residual":
                 INFERENCE_CONTEXT[request_id][step_idx]["residual"] = tensor
                 print(f"✅ Stored residual for {request_id} step {step_idx}")
-            
+                
         elif "_sampler_output" in name:
             # Handle sampler output from last peer
-            step_marker_idx = name.find("_step")
+            step_marker_idx = name.rfind("_step")  # Use rfind here too
             if step_marker_idx == -1:
                 print(f"❌ Invalid sampler output name format: {name}")
                 return
@@ -1346,10 +1351,3 @@ if __name__ == "__main__":
 #                 print(f"❌ Error handling inference trigger: {e}")
 #                 import traceback
 #                 traceback.print_exc()
-                
-#         except asyncio.CancelledError:
-#             print("monitor_tensor_transport_for_inference_trigger cancelled, exiting cleanly.")
-#             return
-#         except Exception as e:
-#             print(f"❌ Error in inference trigger monitor: {e}")
-#             await asyncio.sleep(0.1)
