@@ -39,13 +39,6 @@ from src.utils.gpu_utils import (
     get_total_free_vram
 )
 
-# Global variables for deployed model
-
-# Global Iroh objects for completion reporting
-# current_node = None 
-# current_peer_id = None
-# hidden_state_gossip_sink = None # this is the gossip sink for the hidden states
-# token_gossip_sink = None # this is the gossip sink for sampler outputs
 
 # Global TensorTransport instance (lazy-started in main) #######################
 tensor_transport: TensorTransport | None = None
@@ -858,7 +851,7 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
 
 async def main():
     """Main function to run the distributed computation node"""
-    global current_node, current_peer_id, node_id_obj, node_addr_obj, current_peer_ticket, peer_ticket_map, tensor_transport
+    global current_peer_ticket, peer_ticket_map, tensor_transport
     # Set up Tensor_Iroh and get the ticket #################################
     tensor_transport = TensorTransport()
     await tensor_transport.start()

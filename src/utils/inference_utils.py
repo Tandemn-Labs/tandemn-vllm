@@ -484,6 +484,13 @@ def register_inference_hooks(
             is_first = (idx == 0)
             is_last = (idx == len(pipeline) - 1)
             
+            # Determine next peer info if not last
+            next_peer_id = None
+            next_peer_ticket = None
+            if not is_last:
+                next_peer_id = pipeline[idx + 1]
+                next_peer_ticket = pipeline[idx + 1]  # In this implementation, peer_id and ticket are the same
+            
             # Initialize thread-safe context for this request
             with context_lock:
                 hook_contexts[execution_id] = {
@@ -493,6 +500,8 @@ def register_inference_hooks(
                     "is_first_peer": is_first,
                     "is_last_peer": is_last,
                     "peer_id": peer_id,
+                    "next_peer_id": next_peer_id,
+                    "next_peer_ticket": next_peer_ticket,
                     "current_step": 0,
                     "active": True
                 }
