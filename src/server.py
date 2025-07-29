@@ -16,6 +16,9 @@ from src.utils.deployment_utils import load_model_metadata, get_peers_with_vram,
 from transformers import AutoTokenizer
 import os
 import numpy as np
+
+from fastapi.responses import HTMLResponse
+
 ## Tensor_Iroh Starts here ###########################
 from src.utils.tensor_protocol_adapter import TensorTransport
 ######################################################
@@ -962,6 +965,11 @@ class InferenceRequest(BaseModel):
     model_name: str
     input_text: str
     max_tokens: int = 100
+
+
+@app.get("/", response_class=HTMLResponse)
+async def hello_world():
+    return "<html><body><h1>Hello, World!</h1><p>This is a bare debug page.</p></body></html>"
 
 #IROH STARTS HERE
 @app.post("/infer")
