@@ -10,6 +10,7 @@ import torch
 import threading
 import uuid
 from src.utils.tensor_protocol_adapter import TensorTransport
+import numpy as np
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
@@ -360,26 +361,14 @@ def register_inference_hooks(
         
         # MATRIX MANIPULATION ENDS HERE
 
-        # Schedule sends asynchronously (non-blocking)
+        # Send both tensors together in one message
         asyncio.run_coroutine_threadsafe(
-            send_hidden_state_tensor(
+            send_inference_tensors(
                 node,
                 request_id,
                 next_peer_id,
-                hidden_states.cpu(),
-                is_residual=False, 
-                step_idx=current_step,
-                next_peer_ticket=next_peer_ticket
-            ),
-            main_loop
-        )
-        asyncio.run_coroutine_threadsafe(
-            send_hidden_state_tensor(
-                node,
-                request_id,
-                next_peer_id,
-                residual.cpu(),
-                is_residual=True,
+                hidden_states.cpu().numpy(),
+                residual.cpu().numpy(),
                 step_idx=current_step,
                 next_peer_ticket=next_peer_ticket
             ),
@@ -596,3 +585,38 @@ async def send_hidden_state_tensor(
         print(f"📤 Sent {'residual' if is_residual else 'hidden_state'} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport")
     except Exception as e:
         print(f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}")
+
+
+async def send_inference_tensors(
+    tensor_transport: "TensorTransport",
+    request_id: str,
+    next_peer_id: str,
+    hidden_states: "np.ndarray",
+    residual: "np.ndarray",
+    step_idx: int = 0,
+    next_peer_ticket: str = "",
+):
+    """
+    Sends both hidden states and residual tensors in a single message.
+    Leverages tensor-iroh's built-in serialization.
+    """
+    try:
+        if not next_peer_ticket:
+            raise ValueError("next_peer_ticket must be provided for tensor transport send.")
+
+        # Stack both tensors together - tensor-iroh handles serialization
+        # Format: [hidden_states, residual] concatenated along a new dimension
+        combined_tensor = np.stack([hidden_states, residual], axis=0)
+        
+        # Compose a name for the tensor message
+        tensor_name = f"{request_id}_step{step_idx}_combined"
+
+        await tensor_transport.send(
+            next_peer_ticket,
+            name=tensor_name,
+            tensor=combined_tensor
+        )
+
+        print(f"📤 Sent combined tensors for {request_id} step {step_idx} to {next_peer_id} via TensorTransport")
+    except Exception as e:
+        print(f"❌ Failed to send tensors for {request_id} to {next_peer_id}: {e}")
