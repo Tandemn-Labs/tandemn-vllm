@@ -250,7 +250,7 @@ async def unified_message_gateway():
                     await handle_inference_trigger_message(tensor)
                     
                 # 3. INFERENCE DATA (hidden states, residuals, sampler outputs)
-                elif any(keyword in name for keyword in ["_hidden_state", "_residual", "_sampler_output"]):
+                elif any(keyword in name for keyword in ["_hidden_state", "_residual", "_sampler_output", "_combined"]):
                     await handle_inference_data_message(name, tensor)
                     
                 # 4. UNKNOWN MESSAGE TYPE
@@ -344,49 +344,54 @@ async def handle_inference_trigger_message(tensor):
         print(f"📝 Input: {trigger.get('input_text', '')[:50]}...")
         print(f"{'='*80}\n")
         
-        # Check if this peer is the first in the pipeline
-        if current_peer_ticket == pipeline[0]:
-            print(f"✅ This peer ({current_peer_ticket}) is FIRST in pipeline - starting inference!")
+        # Initialize INFERENCE_CONTEXT for this request
+        if request_id not in INFERENCE_CONTEXT:
+            INFERENCE_CONTEXT[request_id] = {}
+        
+        # Check if inference runner is initialized
+        if not start_inference_run:
+            print("❌ start_inference_run not initialized! Cannot start inference.")
+            return
+        
+        # ALL PEERS should start inference!
+        peer_position = pipeline.index(current_peer_ticket) if current_peer_ticket in pipeline else -1
+        
+        if peer_position == -1:
+            print(f"❌ This peer ({current_peer_ticket}) is not in the pipeline!")
+            return
             
-            # Initialize INFERENCE_CONTEXT for this request
-            if request_id not in INFERENCE_CONTEXT:
-                INFERENCE_CONTEXT[request_id] = {}
+        is_first_peer = (peer_position == 0)
+        
+        print(f"📍 This peer is {'FIRST' if is_first_peer else f'#{peer_position+1}'} in the pipeline")
+        print(f"{'✅ Starting inference as FIRST peer' if is_first_peer else '⏳ Starting inference and waiting for tensors from previous peer'}")
+        
+        # Start inference in background thread for ALL peers
+        try:
+            from vllm import SamplingParams
+            loop = asyncio.get_running_loop()
             
-            # Check if inference runner is initialized
-            if not start_inference_run:
-                print("❌ start_inference_run not initialized! Cannot start inference.")
-                return
+            # Extract parameters
+            input_text = trigger.get("input_text", "")
+            sampling_params = SamplingParams(**trigger.get("sampling_params", {}))
+            assigned_layers = trigger.get("assigned_layers", {})
             
-            # Start inference in background thread
-            try:
-                from vllm import SamplingParams
-                loop = asyncio.get_running_loop()
-                
-                # Extract parameters
-                input_text = trigger.get("input_text", "")
-                sampling_params = SamplingParams(**trigger.get("sampling_params", {}))
-                assigned_layers = trigger.get("assigned_layers", {})
-                
-                print(f"🏃 Starting inference run in background thread...")
-                future = loop.run_in_executor(
-                    None,
-                    start_inference_run,
-                    request_id,
-                    pipeline,
-                    input_text,
-                    sampling_params,
-                    assigned_layers,
-                )
-                
-                print(f"✅ Inference started for request {request_id}")
-                
-            except Exception as e:
-                print(f"❌ Failed to start inference: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            print(f"ℹ️ This peer ({current_peer_ticket}) is NOT first in pipeline - ignoring trigger")
-            print(f"   First peer should be: {pipeline[0]}")
+            print(f"🏃 Starting inference run in background thread...")
+            future = loop.run_in_executor(
+                None,
+                start_inference_run,
+                request_id,
+                pipeline,
+                input_text,
+                sampling_params,
+                assigned_layers,
+            )
+            
+            print(f"✅ Inference started for request {request_id}")
+            
+        except Exception as e:
+            print(f"❌ Failed to start inference: {e}")
+            import traceback
+            traceback.print_exc()
             
     except Exception as e:
         print(f"❌ Error handling inference trigger: {e}")
@@ -395,14 +400,14 @@ async def handle_inference_trigger_message(tensor):
 
 
 async def handle_inference_data_message(name: str, tensor):
-    """Handle inference data messages (hidden states, residuals, sampler outputs)"""
+    """Handle inference data messages (combined tensors or sampler outputs)"""
     try:
         print(f"📊 Processing inference data: {name}")
         
         # Parse the tensor name to determine type
-        if "_hidden_state" in name or "_residual" in name:
-            # Name format: {request_id}_step{step_idx}_{hidden_state|residual}
-            # Example: req_1753809548666_0_step0_hidden_state
+        if "_combined" in name:
+            # Name format: {request_id}_step{step_idx}_combined
+            # Example: req_1753809548666_0_step0_combined
             
             # Find the last occurrence of "_step" to handle request_ids with underscores
             step_marker_idx = name.rfind("_step")
@@ -413,24 +418,19 @@ async def handle_inference_data_message(name: str, tensor):
             # Extract request_id (everything before the last _step)
             request_id = name[:step_marker_idx]
             
-            # Extract the rest after _step
+            # Extract the step number
             rest = name[step_marker_idx + 5:]  # Skip "_step"
+            step_idx = int(rest.split("_")[0])
             
-            # Split the rest to get step number and tensor type
-            rest_parts = rest.split("_", 1)
-            if len(rest_parts) < 2:
-                print(f"❌ Invalid tensor name format (incomplete after _step): {name}")
-                return
+            print(f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='combined'")
             
-            try:
-                step_idx = int(rest_parts[0])
-            except ValueError:
-                print(f"❌ Invalid step number: {rest_parts[0]}")
+            # Unstack the combined tensor
+            if tensor.shape[0] != 2:
+                print(f"❌ Invalid combined tensor shape: {tensor.shape}")
                 return
                 
-            tensor_type = rest_parts[1]  # "hidden_state" or "residual"
-            
-            print(f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='{tensor_type}'")
+            hidden_state = tensor[0]
+            residual = tensor[1]
             
             # Store in INFERENCE_CONTEXT
             if request_id not in INFERENCE_CONTEXT:
@@ -438,12 +438,9 @@ async def handle_inference_data_message(name: str, tensor):
             if step_idx not in INFERENCE_CONTEXT[request_id]:
                 INFERENCE_CONTEXT[request_id][step_idx] = {}
             
-            if tensor_type == "hidden_state":
-                INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = tensor
-                print(f"✅ Stored hidden_state for {request_id} step {step_idx}")
-            elif tensor_type == "residual":
-                INFERENCE_CONTEXT[request_id][step_idx]["residual"] = tensor
-                print(f"✅ Stored residual for {request_id} step {step_idx}")
+            INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = hidden_state
+            INFERENCE_CONTEXT[request_id][step_idx]["residual"] = residual
+            print(f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}")
                 
         elif "_sampler_output" in name:
             # Handle sampler output from last peer
@@ -473,7 +470,7 @@ async def handle_inference_data_message(name: str, tensor):
         traceback.print_exc()
 
 async def handle_unknown_message(name: str, tensor):
-    """Handle unknown message types by attempting to parse as JSON"""
+    """Handle unknown message types by attempting to parse Was JSON"""
     try:
         # Convert tensor to bytes and try to parse as JSON
         if hasattr(tensor, "numpy"):
