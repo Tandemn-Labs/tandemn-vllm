@@ -1020,9 +1020,10 @@ async def infer(request: InferenceRequest):
     instruction_payload = json.dumps(inference_payload).encode()
     instruction_payload = np.frombuffer(instruction_payload, dtype=np.uint8)
 
-    #5. Broadcast the instruction payload to the first peer
-    first_peer_ticket = pipeline[0]
-    await tensor_transport.send(first_peer_ticket, "inference", instruction_payload)
+    #5. Broadcast the instruction payload to ALL peers in the pipeline
+    for peer_ticket in pipeline:
+        await tensor_transport.send(peer_ticket, "inference", instruction_payload)
+        print(f"📤 Sent inference trigger to peer: {peer_ticket[:8]}...")
 
     print(f"🚀 Inference {request_id} started for model {request.model_name}")
     return InferenceResponse(
