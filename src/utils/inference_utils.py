@@ -176,7 +176,7 @@ def register_inference_hooks(
             while True:
                 # Thread-safe check for data availability
                 with CONTEXT_LOCK:
-                    step_data = INFERENCE_CONTEXT.get(request_id, {}).get(current_step)
+                    step_data = INFERENCE_CONTEXT.get(request_id, {}).get(str(current_step))
                     if step_data and "hidden_state" in step_data and "residual" in step_data:
                         # Data is ready!
                         hidden_states = step_data["hidden_state"]
@@ -382,8 +382,9 @@ def register_inference_hooks(
 
     def sampler_post_hook(module, args, output):
         """
-        Runs after the sampler. Last peer broadcasts the chosen token.
-        Other peers wait for it and substitute their own sampler output.
+        Post-hook for the sampler module.
+        - For the last peer: broadcasts sampler output to all other peers
+        - For non-last peers: waits for sampler output from the last peer
         """
         # Get request-specific context safely
         with context_lock:
@@ -394,73 +395,65 @@ def register_inference_hooks(
             
             hook_context = active_contexts[0]
             request_id = hook_context["request_id"]
-            current_step = hook_context["current_step"]
-            is_last_peer = hook_context["is_last_peer"]
+            current_step = hook_context.get("current_step", 0)
+            is_last_peer = hook_context.get("is_last_peer", False)
             pipeline = hook_context["pipeline"]
-
+            peer_id = hook_context["peer_id"]
+            
         if is_last_peer:
+            # Serialize the entire SamplerOutput object
+            sampler_output_bytes = pickle.dumps(output)
+            sampler_output_np = np.frombuffer(sampler_output_bytes, dtype=np.uint8)
+            
+            # Send to all OTHER peers (not ourselves)
             for peer_ticket in pipeline:
-                if peer_ticket!=peer_id:
+                if peer_ticket != peer_id:
                     asyncio.run_coroutine_threadsafe(
-                        send_hidden_state_tensor(
+                        send_sampler_output(
                             node,
                             request_id,
                             peer_ticket,
-                            output.cpu().numpy(),
-                            is_residual=False,
+                            sampler_output_np,
                             step_idx=current_step,
                             next_peer_ticket=peer_ticket
                         ),
                         main_loop
                     )
-                    
-            # # This peer is the decider. Broadcast the result.
-            # print(f"📢 Last peer broadcasting sampler output for step {current_step}")
-            # asyncio.run_coroutine_threadsafe(
-            #     send_hidden_state_tensor(
-            #         node,
-            #         request_id,
-            #         pipeline[0],
-            #         output.cpu().numpy(),
-            #         is_residual=False,
-            #         step_idx=current_step,
-            #         next_peer_ticket=pipeline[0]
-            #     ),
-            #     main_loop
-            # )
             
-            # CRITICAL FIX: Increment step on ALL peers, including last peer
+            print(f"📢 Last peer sent sampler output to all peers for step {current_step}")
+            
+            # Increment step for last peer too
             with context_lock:
                 hook_context["current_step"] = current_step + 1
                 
             return output
         else:
-            # Not the last peer, must wait for the definitive sampler output.
+            # Non-last peer: wait for sampler output
             print(f"⏳ Non-last peer waiting for sampler output for step {current_step}")
+            
             max_wait_time = 30.0
             start_time = time.time()
             
             while True:
                 with CONTEXT_LOCK:
-                    step_data = INFERENCE_CONTEXT.get(request_id, {}).get(current_step)
+                    step_data = INFERENCE_CONTEXT.get(request_id, {}).get(str(current_step))
                     if step_data and "sampler_output" in step_data:
                         received_output = step_data["sampler_output"]
-                        print(f"✅ Received sampler output for {request_id} (step {current_step}).")
+                        print(f"✅ Received sampler output for step {current_step}")
+                        break
                         
-                        # CRITICAL FIX: Increment step on non-last peers too
-                        with context_lock:
-                            hook_context["current_step"] = current_step + 1
-                            
-                        # Here, we are replacing this peer's sampler output with the one from the last peer
-                        return received_output
-                
                 if time.time() - start_time > max_wait_time:
-                    print(f"❌ Timeout waiting for sampler output for {request_id} step {current_step}")
                     cleanup_request_context(request_id)
-                    # Fail loudly to prevent divergence
                     raise RuntimeError(f"Timeout waiting for sampler output for {request_id} step {current_step}")
                     
-                time.sleep(0.01)
+                time.sleep(0.001)
+            
+            # Increment step after receiving
+            with context_lock:
+                hook_context["current_step"] = current_step + 1
+                
+            return received_output
+
 
     def start_inference_run(request_id: str, pipeline: List[str], input_text: str, sampling_params: Any, assigned_layers: Dict[str, List[int]]):
         """The main inference runner"""
@@ -620,3 +613,32 @@ async def send_inference_tensors(
         print(f"📤 Sent combined tensors for {request_id} step {step_idx} to {next_peer_id} via TensorTransport")
     except Exception as e:
         print(f"❌ Failed to send tensors for {request_id} to {next_peer_id}: {e}")
+
+
+async def send_sampler_output(
+    tensor_transport: "TensorTransport",
+    request_id: str,
+    next_peer_id: str,
+    sampler_output_bytes: "np.ndarray",
+    step_idx: int = 0,
+    next_peer_ticket: str = "",
+):
+    """
+    Sends the pickled sampler output to the next peer.
+    """
+    try:
+        if not next_peer_ticket:
+            raise ValueError("next_peer_ticket must be provided for tensor transport send.")
+
+        # Compose a name for the tensor message
+        tensor_name = f"{request_id}_step{step_idx}_sampler_output"
+
+        await tensor_transport.send(
+            next_peer_ticket,
+            name=tensor_name,
+            tensor=sampler_output_bytes
+        )
+
+        print(f"📤 Sent sampler_output for {request_id} step {step_idx} to {next_peer_id[:8]}...")
+    except Exception as e:
+        print(f"❌ Failed to send sampler output for {request_id} to {next_peer_id}: {e}")
