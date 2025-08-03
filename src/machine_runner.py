@@ -435,11 +435,11 @@ async def handle_inference_data_message(name: str, tensor):
             # Store in INFERENCE_CONTEXT
             if request_id not in INFERENCE_CONTEXT:
                 INFERENCE_CONTEXT[request_id] = {}
-            if step_idx not in INFERENCE_CONTEXT[request_id]:
-                INFERENCE_CONTEXT[request_id][step_idx] = {}
+            if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
+                INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
             
-            INFERENCE_CONTEXT[request_id][step_idx]["hidden_state"] = hidden_state
-            INFERENCE_CONTEXT[request_id][step_idx]["residual"] = residual
+            INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = hidden_state
+            INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
             print(f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}")
                 
         elif "_sampler_output" in name:
@@ -453,15 +453,23 @@ async def handle_inference_data_message(name: str, tensor):
             rest = name[step_marker_idx + 5:]
             step_idx = int(rest.split("_")[0])
             
+            # Convert tensor to numpy array first, then unpickle
+            if hasattr(tensor, "numpy"):
+                # PyTorch tensor - convert to numpy
+                arr = tensor.numpy()
+            else:
+                # Already numpy
+                arr = tensor
+            
             # Unpickle the sampler output
-            sampler_output = pickle.loads(tensor.tobytes())
+            sampler_output = pickle.loads(arr.tobytes())
             
             if request_id not in INFERENCE_CONTEXT:
                 INFERENCE_CONTEXT[request_id] = {}
-            if step_idx not in INFERENCE_CONTEXT[request_id]:
-                INFERENCE_CONTEXT[request_id][step_idx] = {}
+            if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
+                INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
                 
-            INFERENCE_CONTEXT[request_id][step_idx]["sampler_output"] = sampler_output
+            INFERENCE_CONTEXT[request_id][str(step_idx)]["sampler_output"] = sampler_output
             print(f"✅ Stored sampler_output for {request_id} step {step_idx}")
             
     except Exception as e:
