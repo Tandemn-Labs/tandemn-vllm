@@ -11,6 +11,7 @@ import threading
 import uuid
 from src.utils.tensor_protocol_adapter import TensorTransport
 import numpy as np
+from collections import defaultdict
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
@@ -20,6 +21,11 @@ INFERENCE_CONTEXT: Dict[str, Dict[str, Any]] = {}
 # the above is just a payload that is sent from one peer to another. 
 CONTEXT_LOCK = threading.RLock()  # Thread-safe access to INFERENCE_CONTEXT
 
+# ------------------------------------------------------------------
+#  Per–request / per-step Events that tell a waiting peer "data ready"
+# ------------------------------------------------------------------
+STEP_EVENTS: Dict[str, Dict[int, threading.Event]] = defaultdict(dict)
+
 
 def cleanup_request_context(request_id: str):
     """Thread-safe cleanup of request context"""
@@ -27,6 +33,9 @@ def cleanup_request_context(request_id: str):
         if request_id in INFERENCE_CONTEXT:
             del INFERENCE_CONTEXT[request_id]
             print(f"🧹 Cleaned up context for {request_id}")
+        if request_id in STEP_EVENTS:
+            del STEP_EVENTS[request_id]
+            print(f"🧹 Cleaned up step events for {request_id}")
 
 
 async def send_final_result_to_server(
@@ -169,29 +178,20 @@ def register_inference_hooks(
         if not hook_context["is_first_peer"]:
             print(f"🔍 Detected a non-first peer, waiting for hidden state from previous peer (step {current_step})...")
             
-            # Wait for data to arrive for this step (blocking)
-            max_wait_time = 30.0  # 30 seconds timeout
-            start_time = time.time()
+            # Wait for data to arrive for this step using threading.Event
+            event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
             
-            while True:
-                # Thread-safe check for data availability
-                with CONTEXT_LOCK:
-                    step_data = INFERENCE_CONTEXT.get(request_id, {}).get(str(current_step))
-                    if step_data and "hidden_state" in step_data and "residual" in step_data:
-                        # Data is ready!
-                        hidden_states = step_data["hidden_state"]
-                        residual = step_data["residual"]
-                        print(f"✅ Received hidden state and residual for {request_id} (step {current_step}). Injecting into the next layer.")
-                        break
-                
-                # Check timeout
-                if time.time() - start_time > max_wait_time:
-                    print(f"❌ Timeout waiting for hidden state for {request_id} step {current_step}")
-                    cleanup_request_context(request_id)
-                    return args
-                    
-                # Sleep briefly before checking again
-                time.sleep(0.001)
+            if not event.wait(timeout=30.0):  # blocks without GIL churn
+                print(f"❌ Timeout waiting for hidden state for {request_id} step {current_step}")
+                cleanup_request_context(request_id)
+                return args
+            
+            # Data is ready!
+            with CONTEXT_LOCK:
+                step_data = INFERENCE_CONTEXT[request_id][str(current_step)]
+                hidden_states = step_data["hidden_state"]
+                residual = step_data["residual"]
+                print(f"✅ Received hidden state and residual for {request_id} (step {current_step}). Injecting into the next layer.")
 
             # Process the received tensors with improved shape handling
             orig_positions = args[0]
@@ -296,6 +296,12 @@ def register_inference_hooks(
             print(f"   Residual: {residual_to_inject.shape}")
 
             # MATRIX MANIPULATION ENDS HERE
+
+            # Clean up consumed data to prevent memory growth
+            with CONTEXT_LOCK:
+                if current_step > 0:
+                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                    STEP_EVENTS[request_id].pop(current_step - 1, None)
 
             return (positions_to_inject, hidden_states_to_inject, residual_to_inject)
         
@@ -425,28 +431,35 @@ def register_inference_hooks(
             # Increment step for last peer too
             with context_lock:
                 hook_context["current_step"] = current_step + 1
+            
+            # Clean up old data to prevent memory growth
+            with CONTEXT_LOCK:
+                if current_step > 0:
+                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                    STEP_EVENTS[request_id].pop(current_step - 1, None)
                 
             return output
         else:
             # Non-last peer: wait for sampler output
             print(f"⏳ Non-last peer waiting for sampler output for step {current_step}")
             
-            max_wait_time = 30.0
-            start_time = time.time()
+            # Wait for sampler output using threading.Event
+            event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
             
-            while True:
-                with CONTEXT_LOCK:
-                    step_data = INFERENCE_CONTEXT.get(request_id, {}).get(str(current_step))
-                    if step_data and "sampler_output" in step_data:
-                        received_output = step_data["sampler_output"]
-                        print(f"✅ Received sampler output for step {current_step}")
-                        break
-                        
-                if time.time() - start_time > max_wait_time:
-                    cleanup_request_context(request_id)
-                    raise RuntimeError(f"Timeout waiting for sampler output for {request_id} step {current_step}")
-                    
-                time.sleep(0.001)
+            if not event.wait(timeout=30.0):
+                cleanup_request_context(request_id)
+                raise RuntimeError(f"Timeout waiting for sampler output for {request_id} step {current_step}")
+            
+            # Data is ready!
+            with CONTEXT_LOCK:
+                received_output = INFERENCE_CONTEXT[request_id][str(current_step)]["sampler_output"]
+                print(f"✅ Received sampler output for step {current_step}")
+            
+            # Clean up consumed data to prevent memory growth
+            with CONTEXT_LOCK:
+                if current_step > 0:
+                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                    STEP_EVENTS[request_id].pop(current_step - 1, None)
             
             # Increment step after receiving
             with context_lock:
