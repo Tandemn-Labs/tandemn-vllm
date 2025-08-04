@@ -11,9 +11,10 @@ from typing import List, Dict, Any, Optional
 import time
 import aiofiles
 from colorama import Fore, Style, init as colorama_init
-from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT
+from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT, STEP_EVENTS
 import pickle
 import numpy as np
+import threading
 
 ## Tensor_Iroh Starts here ###########################
 from src.utils.tensor_protocol_adapter import TensorTransport
@@ -226,7 +227,7 @@ async def unified_message_gateway():
             # Single point of message reception
             msg = await tensor_transport.recv()
             if msg is None:
-                await asyncio.sleep(0.01)
+                # await asyncio.sleep(0.00001)
                 continue
                 
             # Get message metadata
@@ -441,6 +442,10 @@ async def handle_inference_data_message(name: str, tensor):
             INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = hidden_state
             INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
             print(f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}")
+            
+            # NEW: wake anybody waiting for this step
+            event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
+            event.set()
                 
         elif "_sampler_output" in name:
             # Handle sampler output from last peer
@@ -472,6 +477,10 @@ async def handle_inference_data_message(name: str, tensor):
             INFERENCE_CONTEXT[request_id][str(step_idx)]["sampler_output"] = sampler_output
             print(f"✅ Stored sampler_output for {request_id} step {step_idx}")
             
+            # NEW: wake anybody waiting for this step
+            event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
+            event.set()
+                
     except Exception as e:
         print(f"❌ Error handling inference data '{name}': {e}")
         import traceback
@@ -960,399 +969,3 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main()) 
 
-
-
-
-
-# # IROH STARTS HERE
-# class DeploymentGossipCallback(iroh.GossipMessageCallback):
-#     "Handle deployment instructions received via gossip"
-#     def __init__(self, node, peer_id):
-#         super().__init__()
-#         self.node = node
-#         self.peer_id = peer_id
-
-#     async def on_message(self, msg):
-#         print("="*100)
-#         print(f"�� [DEBUG] DeploymentGossipCallback received message")
-#         t = msg.type()  # ✅ Call the method
-#         print(f"🔍 [DEBUG] Message type: {t}")
-#         print("="*100)
-        
-#         if t == MessageType.JOINED:
-#             print("🔎 Deployment mesh membership:", msg.as_joined())
-#             return
-            
-#         if t == MessageType.RECEIVED:
-#             print(f"�� [DEBUG] Processing RECEIVED deployment message")
-#             rc = msg.as_received()
-#             print(f"🔍 [DEBUG] Message content length: {len(rc.content)} bytes")
-            
-#             try:
-#                 payload = json.loads(rc.content.decode())  # ✅ Use content, not payload
-#                 print(f"🔍 [DEBUG] Parsed JSON payload: {list(payload.keys())}")
-                
-#                 # Check if this is a deployment instruction
-#                 if payload.get("action") != "deploy_model":
-#                     print(f"🔍 [DEBUG] Not a deployment instruction, skipping")
-#                     return
-                
-#                 # check if the target peer is this peer
-#                 target_peer_id = payload.get("target_peer_id")
-#                 if target_peer_id != self.peer_id:
-#                     print(f"🔍 [DEBUG] Not a deployment instruction for this peer, skipping, {target_peer_id}")
-#                     return
-                    
-#                 instructions = payload.get("instructions", {})
-#                 print(f"📨 Received deployment instructions for {self.peer_id}: {instructions}")
-                
-#                 # Deploy model in background
-#                 asyncio.create_task(deploy_model_from_instructions(instructions))
-                
-#             except Exception as e:
-#                 print(f"❌ Error handling deployment instruction: {e}")
-#                 print(f"❌ Exception type: {type(e)}")
-#                 import traceback
-#                 traceback.print_exc()
-
-
-# IROH STARTS HERE
-# class TriggerCallback(iroh.GossipMessageCallback):
-#     """Handles the initial inference trigger from the server"""
-#     async def on_message(self, msg):
-#         if msg.type() != MessageType.RECEIVED:
-#             print(f"🔍 [DEBUG] TriggerCallback received non-RECEIVED message")
-#             return
-        
-#         try:
-#             payload = json.loads(msg.as_received().content.decode())
-#             if payload.get("action") != "start_inference":
-#                 print(f"🔍 [DEBUG] TriggerCallback received non-start_inference message")
-#                 return
-            
-#             pipeline = payload.get("pipeline")
-#             request_id = payload.get("request_id")
-            
-#             # This peer is not in the pipeline, ignore
-#             if not (request_id and current_peer_id in pipeline):
-#                 return
-
-#             # only the first peer gets to start the inference
-#             is_first_peer = pipeline[0] == current_peer_id
-#             print(f"🔍 [DEBUG] TriggerCallback initializing INFERENCE_CONTEXT for {request_id} (is_first_peer: {is_first_peer})")
-
-#             # Initialize context for this request (no futures needed anymore)
-#             if request_id not in INFERENCE_CONTEXT:
-#                 INFERENCE_CONTEXT[request_id] = {}
-            
-#             if not start_inference_run:
-#                 print(f"🔍 [DEBUG] start_inference_run is not set, cannot proceed.")
-#                 return
-            
-#             # Start the inference run in a background thread
-#             input_text = payload.get("input_text")
-
-#             # Import SamplingParams locally to avoid top-level import issues
-#             from vllm import SamplingParams
-
-#             loop = asyncio.get_running_loop()
-#             loop.run_in_executor(
-#                 None,
-#                 start_inference_run,
-#                 payload["request_id"],
-#                 payload["pipeline"],
-#                 input_text,
-#                 SamplingParams(**payload["sampling_params"]),
-#                 payload["assigned_layers"],
-#             )
-
-#         except Exception as e:
-#             print(f"❌ Error in TriggerCallback: {e}")
-#             import traceback
-#             traceback.print_exc()
-
-#         print(f"🔍 [DEBUG] TriggerCallback completed for {payload.get('request_id')}")
-# IROH ENDS HERE
-
-
-
-# async def get_shared_ticket():
-#     """
-#     Fetch the shared ticket from the server.
-    
-#     Returns:
-#         str: The shared ticket for joining the Iroh document
-        
-#     Raises:
-#         Exception: If unable to fetch the ticket from the server
-#     """
-#     try:
-#         server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
-#         async with httpx.AsyncClient() as client:
-#             response = await client.get(f'{server_url}/ticket')
-#             response.raise_for_status()
-#             ticket_data = response.json()
-#             ticket = ticket_data["ticket"]
-#             print(f"✅ Fetched shared ticket from server at {server_url}")
-#             return ticket
-#     except httpx.RequestError as e:
-#         raise Exception(f"Failed to connect to server: {e}")
-#     except httpx.HTTPStatusError as e:
-#         raise Exception(f"Server returned error {e.response.status_code}: {e.response.text}")
-#     except json.JSONDecodeError as e:
-#         raise Exception(f"Invalid ticket format received: {e}")
-#     except KeyError as e:
-#         raise Exception(f"Missing 'ticket' field in server response")
-#     except Exception as e:
-#         raise Exception(f"Unexpected error fetching ticket: {e}")
-
-# async def send_blob(doc, author, peer_id: str, data: torch.Tensor):
-#     """
-#     Send a tensor to another peer in the network.
-    
-#     Args:
-#         doc: Iroh document
-#         author: Iroh author for writing
-#         peer_id: ID of the recipient peer
-#         data: Tensor data to send
-#     """
-#     try:
-#         encoded = json.dumps(data.tolist()).encode()
-#         await doc.set_bytes(author, peer_id.encode(), encoded)
-#         print(f"📤 Sent to {peer_id}: {data}")
-#     except Exception as e:
-#         print(f"❌ Failed to send to {peer_id}: {e}")
-
-# async def receive_blob(doc, peer_id: str, node):
-#     """
-#     Wait for and receive a tensor addressed to this peer.
-    
-#     Args:
-#         doc: Iroh document
-#         peer_id: This peer's ID
-#         node: Iroh node
-        
-#     Returns:
-#         The received tensor
-#     """
-#     seen = set()  # Track already processed content hashes
-#     while True:
-#         try:
-#             entries = await doc.get_many(iroh.Query.all(None))
-#             for entry in entries:
-#                 key = entry.key().decode()
-#                 if key != peer_id:
-#                     continue
-#                 hash = entry.content_hash()
-#                 if hash in seen:
-#                     continue
-#                 seen.add(hash)
-#                 content = await node.blobs().read_to_bytes(hash)
-#                 tensor = torch.tensor(json.loads(content.decode()))
-#                 return tensor
-#         except Exception as e:
-#             print(f"❌ Polling error for {peer_id}: {e}")
-#         await asyncio.sleep(2)  # Poll every 2 seconds
-
-# async def process_once(doc, author, peer_id: str, next_peer: Optional[str], is_first: bool, is_last: bool, local_matrix: torch.Tensor, node):
-#     """
-#     Process one computation job in the pipeline.
-    
-#     Args:
-#         doc: Iroh document
-#         author: Iroh author for writing
-#         peer_id: This peer's ID
-#         next_peer: ID of the next peer in the pipeline
-#         is_first: Whether this is the first machine in the pipeline
-#         is_last: Whether this is the last machine in the pipeline
-#         local_matrix: The matrix assigned to this peer
-#         node: Iroh node
-#     """
-#     try:
-#         if is_first:
-#             # First machine waits for job trigger
-#             trigger = await receive_blob(doc, TRIGGER_KEY, node)
-#             print(f"📥 Received trigger: {trigger}")
-#             input_matrix = trigger
-#         else:
-#             # Other machines wait for input from previous machine
-#             input_matrix = await receive_blob(doc, peer_id, node)
-#             print(f"📥 Received input: {input_matrix}")
-        
-#         # Perform matrix multiplication
-#         result = torch.matmul(input_matrix, local_matrix)
-#         print(f"🔢 Computed result: {result}")
-        
-#         if is_last:
-#             # Last machine stores final result
-#             await send_blob(doc, author, FINAL_RESULT_KEY, result)
-#             print("✅ Stored final result")
-#         elif next_peer:
-#             # Pass result to next machine
-#             await send_blob(doc, author, next_peer, result)
-#             print(f"📤 Sent result to {next_peer}")
-#         else:
-#             print("⚠️ No next peer specified, cannot send result")
-            
-#     except Exception as e:
-#         print(f"❌ Error in computation: {e}")
-
-
-
-
-# async def monitor_deployment_instructions(doc, node, peer_id: str):
-#     """Monitor for deployment instructions sent to this peer."""
-#     seen_hashes = set()
-    
-#     while True:
-#         try:
-#             # Look for deployment instructions addressed to this peer
-#             entries = await doc.get_many(iroh.Query.all(None))
-            
-#             for entry in entries:
-#                 key = entry.key().decode()
-#                 hash_value = entry.content_hash()
-                
-#                 # Skip if we've already processed this entry
-#                 if hash_value in seen_hashes:
-#                     continue
-                
-#                 # Check if this is a deployment instruction for us
-#                 if key.startswith(f"deploy_instruction_{peer_id}_"):
-#                     seen_hashes.add(hash_value)
-#                     content = await node.blobs().read_to_bytes(hash_value)
-                    
-#                     # Add timestamp check to ignore old instructions
-#                     try:
-#                         # Extract timestamp from key: deploy_instruction_{peer_id}_{timestamp}
-#                         timestamp_str = key.split("_")[-1]
-#                         instruction_time = int(timestamp_str)
-#                         current_time = int(time.time())
-                        
-#                         # Ignore instructions older than 30 seconds
-#                         if current_time - instruction_time > 30:
-#                             print(f"⏰ Ignoring old deployment instruction from {instruction_time}")
-#                             continue
-#                     except (ValueError, IndexError):
-#                         # If timestamp parsing fails, process the instruction anyway
-#                         pass
-                    
-#                     await handle_deployment_instruction(doc, node, content)
-            
-#         except Exception as e:
-#             print(f"❌ Error monitoring deployment instructions: {e}")
-        
-#         await asyncio.sleep(2)  # Check every 2 seconds
-
-
-
-
-# async def monitor_tensor_transport_for_inference_trigger():
-#     """
-#     Dedicated monitor for inference trigger messages from the server.
-#     Only the first peer in the pipeline will actually start the inference.
-#     """
-#     global tensor_transport, start_inference_run, current_peer_ticket
-#     print("🎯 Starting inference trigger monitor...")
-    
-#     while True:
-#         try:
-#             # Wait for any message to arrive
-#             msg = await tensor_transport.recv()
-#             if msg is None:
-#                 await asyncio.sleep(0.01)
-#                 continue
-                
-#             # Check if this is an inference trigger by name
-#             name = msg.get("name", "")
-#             if "inference" not in name.lower():
-#                 continue  # Not an inference message, skip
-                
-#             # Get the tensor payload
-#             tensor = msg.get("tensor")
-#             if tensor is None:
-#                 print("⚠️ Received inference message without tensor payload")
-#                 continue
-                
-#             # Convert tensor (np.uint8) back to bytes
-#             if hasattr(tensor, "numpy"):
-#                 arr = tensor.numpy()
-#             else:
-#                 arr = tensor
-#             if arr.dtype != np.uint8:
-#                 print(f"⚠️ Received inference tensor with unexpected dtype: {arr.dtype}")
-#                 continue
-                
-#             trigger_data = arr.tobytes()
-            
-#             # Parse the inference trigger
-#             try:
-#                 trigger = json.loads(trigger_data.decode())
-#                 if trigger.get("action") != "start_inference":
-#                     continue  # Not a start_inference action
-                    
-#                 request_id = trigger.get("request_id")
-#                 pipeline = trigger.get("pipeline")
-                
-#                 if not request_id or not pipeline:
-#                     print(f"❌ Invalid inference trigger: missing request_id or pipeline")
-#                     continue
-                
-#                 print(f"\n{'='*80}")
-#                 print(f"🚀 INFERENCE TRIGGER RECEIVED 🚀")
-#                 print(f"📋 Request ID: {request_id}")
-#                 print(f"🔗 Pipeline: {pipeline}")
-#                 print(f"📝 Input: {trigger.get('input_text', '')[:50]}...")
-#                 print(f"{'='*80}\n")
-                
-#                 # Check if this peer is the first in the pipeline
-#                 if current_peer_ticket == pipeline[0]:
-#                     print(f"✅ This peer ({current_peer_ticket}) is FIRST in pipeline - starting inference!")
-                    
-#                     # Initialize INFERENCE_CONTEXT for this request
-#                     if request_id not in INFERENCE_CONTEXT:
-#                         INFERENCE_CONTEXT[request_id] = {}
-                    
-#                     # Check if inference runner is initialized
-#                     if not start_inference_run:
-#                         print("❌ start_inference_run not initialized! Cannot start inference.")
-#                         continue
-                    
-#                     # Start inference in background thread
-#                     try:
-#                         from vllm import SamplingParams
-#                         loop = asyncio.get_running_loop()
-                        
-#                         # Extract parameters
-#                         input_text = trigger.get("input_text", "")
-#                         sampling_params = SamplingParams(**trigger.get("sampling_params", {}))
-#                         assigned_layers = trigger.get("assigned_layers", {})
-                        
-#                         print(f"🏃 Starting inference run in background thread...")
-#                         future = loop.run_in_executor(
-#                             None,
-#                             start_inference_run,
-#                             request_id,
-#                             pipeline,
-#                             input_text,
-#                             sampling_params,
-#                             assigned_layers,
-#                         )
-                        
-#                         # Optionally, you can track the future
-#                         print(f"✅ Inference started for request {request_id}")
-                        
-#                     except Exception as e:
-#                         print(f"❌ Failed to start inference: {e}")
-#                         import traceback
-#                         traceback.print_exc()
-#                 else:
-#                     print(f"ℹ️ This peer ({current_peer_ticket}) is NOT first in pipeline - ignoring trigger")
-#                     print(f"   First peer should be: {pipeline[0]}")
-                    
-#             except json.JSONDecodeError as e:
-#                 print(f"❌ Failed to parse inference trigger JSON: {e}")
-#             except Exception as e:
-#                 print(f"❌ Error handling inference trigger: {e}")
-#                 import traceback
-#                 traceback.print_exc()
