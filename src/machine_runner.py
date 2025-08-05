@@ -511,10 +511,6 @@ async def debug_inference_context_monitor():
             await asyncio.sleep(5)
 
 # ============================================================================
-# SELECTIVE LAYER LOADING IMPLEMENTATION  
-# ============================================================================
-
-# ============================================================================
 # FILE DOWNLOAD AND DEPLOYMENT LOGIC - MOVED TO deployment_utils.py
 # ============================================================================
 
@@ -613,8 +609,6 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
 
 
 # report_deployment_completion moved to deployment_utils.py
-
-
 
 def get_model_status() -> Dict[str, Any]:
     """Get current model deployment status."""

@@ -325,7 +325,10 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
             gpu_memory_utilization=0.8,  # Use much less memory
             use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
             load_format="dummy",     # ← this is the magic flag
-            dtype="float16"
+            dtype="float16",
+            # adding chunked prefill options
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=1024
         )
         
         print(f"✅ Successfully created vLLM model with selective layers!")
