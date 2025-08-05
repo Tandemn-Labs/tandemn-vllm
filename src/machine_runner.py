@@ -27,6 +27,26 @@ import pickle
 import numpy as np
 import threading
 
+# ADD TIMING UTILITIES
+def log_timing(operation: str, duration_ms: float, extra_info: str = ""):
+    """Log timing information with consistent formatting"""
+    print(f"⏱️ [TIMING] {operation}: {duration_ms:.2f}ms {extra_info}")
+
+def timing_context(operation: str, extra_info: str = ""):
+    """Context manager for timing operations"""
+    import contextlib
+    
+    @contextlib.contextmanager
+    def timer():
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = (time.perf_counter() - start_time) * 1000
+            log_timing(operation, elapsed, extra_info)
+    
+    return timer()
+
 ## Tensor_Iroh Starts here ###########################
 from src.utils.tensor_protocol_adapter import TensorTransport
 ######################################################
@@ -311,141 +331,147 @@ async def handle_inference_trigger_message(tensor):
     """Handle inference trigger messages"""
     global start_inference_run, current_peer_ticket
     
-    try:
-        # Parse inference trigger message using utility function
-        trigger = parse_inference_trigger_message(tensor)
-        if not trigger:
-            print("❌ Invalid inference trigger message format")
-            return
-            
-        request_id = trigger.get("request_id")
-        pipeline = trigger.get("pipeline")
-        
-        # Log inference trigger received
-        extra_info = f"Request ID: {request_id}, Input: {trigger.get('input_text', '')[:50]}..."
-        log_message_received("inference_trigger", trigger, extra_info)
-        
-        # Initialize INFERENCE_CONTEXT for this request
-        if request_id not in INFERENCE_CONTEXT:
-            INFERENCE_CONTEXT[request_id] = {}
-        
-        # Check if inference runner is initialized
-        if not start_inference_run:
-            print("❌ start_inference_run not initialized! Cannot start inference.")
-            return
-        
-        # ALL PEERS should start inference!
-        peer_position = pipeline.index(current_peer_ticket) if current_peer_ticket in pipeline else -1
-        
-        if peer_position == -1:
-            print(f"❌ This peer ({current_peer_ticket}) is not in the pipeline!")
-            return
-            
-        is_first_peer = (peer_position == 0)
-        
-        print(f"📍 This peer is {'FIRST' if is_first_peer else f'#{peer_position+1}'} in the pipeline")
-        print(f"{'✅ Starting inference as FIRST peer' if is_first_peer else '⏳ Starting inference and waiting for tensors from previous peer'}")
-        
-        # Start inference in background thread for ALL peers
+    # TIME THE ENTIRE INFERENCE TRIGGER HANDLING
+    with timing_context("Inference Trigger Handling", f"tensor_size={tensor.size if hasattr(tensor, 'size') else 'unknown'}"):
         try:
-            from vllm import SamplingParams
-            loop = asyncio.get_running_loop()
+            # Parse inference trigger message using utility function
+            with timing_context("Parse Inference Trigger"):
+                trigger = parse_inference_trigger_message(tensor)
+                if not trigger:
+                    print("❌ Invalid inference trigger message format")
+                    return
+                
+            request_id = trigger.get("request_id")
+            pipeline = trigger.get("pipeline")
+        
+            # Log inference trigger received
+            extra_info = f"Request ID: {request_id}, Input: {trigger.get('input_text', '')[:50]}..."
+            log_message_received("inference_trigger", trigger, extra_info)
             
-            # Extract parameters
-            input_text = trigger.get("input_text", "")
-            sampling_params = SamplingParams(**trigger.get("sampling_params", {}))
-            assigned_layers = trigger.get("assigned_layers", {})
+            # Initialize INFERENCE_CONTEXT for this request
+            if request_id not in INFERENCE_CONTEXT:
+                INFERENCE_CONTEXT[request_id] = {}
             
-            print(f"🏃 Starting inference run in background thread...")
-            future = loop.run_in_executor(
-                None,
-                start_inference_run,
-                request_id,
-                pipeline,
-                input_text,
-                sampling_params,
-                assigned_layers,
-            )
+            # Check if inference runner is initialized
+            if not start_inference_run:
+                print("❌ start_inference_run not initialized! Cannot start inference.")
+                return
             
-            print(f"✅ Inference started for request {request_id}")
+            # ALL PEERS should start inference!
+            peer_position = pipeline.index(current_peer_ticket) if current_peer_ticket in pipeline else -1
             
+            if peer_position == -1:
+                print(f"❌ This peer ({current_peer_ticket}) is not in the pipeline!")
+                return
+                
+            is_first_peer = (peer_position == 0)
+            
+            print(f"📍 This peer is {'FIRST' if is_first_peer else f'#{peer_position+1}'} in the pipeline")
+            print(f"{'✅ Starting inference as FIRST peer' if is_first_peer else '⏳ Starting inference and waiting for tensors from previous peer'}")
+            
+            # Start inference in background thread for ALL peers
+            try:
+                from vllm import SamplingParams
+                loop = asyncio.get_running_loop()
+                
+                # Extract parameters
+                input_text = trigger.get("input_text", "")
+                sampling_params = SamplingParams(**trigger.get("sampling_params", {}))
+                assigned_layers = trigger.get("assigned_layers", {})
+                
+                print(f"🏃 Starting inference run in background thread...")
+                future = loop.run_in_executor(
+                    None,
+                    start_inference_run,
+                    request_id,
+                    pipeline,
+                    input_text,
+                    sampling_params,
+                    assigned_layers,
+                )
+                
+                print(f"✅ Inference started for request {request_id}")
+                
+            except Exception as e:
+                print(f"❌ Failed to start inference: {e}")
+                import traceback
+                traceback.print_exc()
+                
         except Exception as e:
-            print(f"❌ Failed to start inference: {e}")
+            print(f"❌ Error handling inference trigger: {e}")
             import traceback
             traceback.print_exc()
-            
-    except Exception as e:
-        print(f"❌ Error handling inference trigger: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 async def handle_inference_data_message(name: str, tensor):
     """Handle inference data messages (combined tensors or sampler outputs)"""
-    try:
-        print(f"📊 Processing inference data: {name}")
+    # TIME THE INFERENCE DATA PROCESSING
+    with timing_context("Inference Data Processing", f"name={name}, tensor_shape={tensor.shape if hasattr(tensor, 'shape') else 'unknown'}"):
+        try:
+            print(f"📊 Processing inference data: {name}")
+            
+            # Parse the tensor name using utility function
+            with timing_context("Parse Tensor Metadata"):
+                metadata = extract_request_metadata(name)
+                if not metadata:
+                    print(f"❌ Invalid tensor name format: {name}")
+                    return
+                
+            request_id, step_idx, message_type = metadata
+            print(f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='{message_type}'")
         
-        # Parse the tensor name using utility function
-        metadata = extract_request_metadata(name)
-        if not metadata:
-            print(f"❌ Invalid tensor name format: {name}")
-            return
-            
-        request_id, step_idx, message_type = metadata
-        print(f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='{message_type}'")
-        
-        if message_type == "combined":
-            
-            # Unstack the combined tensor
-            if tensor.shape[0] != 2:
-                print(f"❌ Invalid combined tensor shape: {tensor.shape}")
-                return
+            if message_type == "combined":
                 
-            hidden_state = tensor[0]
-            residual = tensor[1]
-            
-            # Store in INFERENCE_CONTEXT
-            if request_id not in INFERENCE_CONTEXT:
-                INFERENCE_CONTEXT[request_id] = {}
-            if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
-                INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
-            
-            INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = hidden_state
-            INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
-            print(f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}")
-            
-            # NEW: wake anybody waiting for this step
-            event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
-            event.set()
+                # Unstack the combined tensor
+                if tensor.shape[0] != 2:
+                    print(f"❌ Invalid combined tensor shape: {tensor.shape}")
+                    return
+                    
+                hidden_state = tensor[0]
+                residual = tensor[1]
                 
-        elif message_type == "sampler_output":
-            # Convert tensor to numpy array first, then unpickle
-            if hasattr(tensor, "numpy"):
-                # PyTorch tensor - convert to numpy
-                arr = tensor.numpy()
-            else:
-                # Already numpy
-                arr = tensor
-            
-            # Unpickle the sampler output
-            sampler_output = pickle.loads(arr.tobytes())
-            
-            if request_id not in INFERENCE_CONTEXT:
-                INFERENCE_CONTEXT[request_id] = {}
-            if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
-                INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
+                # Store in INFERENCE_CONTEXT
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
                 
-            INFERENCE_CONTEXT[request_id][str(step_idx)]["sampler_output"] = sampler_output
-            print(f"✅ Stored sampler_output for {request_id} step {step_idx}")
-            
-            # NEW: wake anybody waiting for this step
-            event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
-            event.set()
+                INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = hidden_state
+                INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
+                print(f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}")
                 
-    except Exception as e:
-        print(f"❌ Error handling inference data '{name}': {e}")
-        import traceback
-        traceback.print_exc()
+                # NEW: wake anybody waiting for this step
+                event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
+                event.set()
+                    
+            elif message_type == "sampler_output":
+                # Convert tensor to numpy array first, then unpickle
+                if hasattr(tensor, "numpy"):
+                    # PyTorch tensor - convert to numpy
+                    arr = tensor.numpy()
+                else:
+                    # Already numpy
+                    arr = tensor
+                
+                # Unpickle the sampler output
+                sampler_output = pickle.loads(arr.tobytes())
+                
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
+                    
+                INFERENCE_CONTEXT[request_id][str(step_idx)]["sampler_output"] = sampler_output
+                print(f"✅ Stored sampler_output for {request_id} step {step_idx}")
+                
+                # NEW: wake anybody waiting for this step
+                event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
+                event.set()
+                    
+        except Exception as e:
+            print(f"❌ Error handling inference data '{name}': {e}")
+            import traceback
+            traceback.print_exc()
 
 async def handle_unknown_message(name: str, tensor):
     """Handle unknown message types by attempting to parse as JSON"""

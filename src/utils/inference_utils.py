@@ -13,6 +13,114 @@ from src.utils.tensor_protocol_adapter import TensorTransport
 import numpy as np
 from collections import defaultdict
 
+# ADD PROFILING IMPORTS AND GLOBALS
+import contextlib
+from dataclasses import dataclass, field
+from typing import DefaultDict
+
+@dataclass
+class ProfileMetrics:
+    """Store timing metrics for different pipeline components"""
+    pre_hook_wait_times: List[float] = field(default_factory=list)
+    pre_hook_processing_times: List[float] = field(default_factory=list)
+    post_hook_processing_times: List[float] = field(default_factory=list)
+    tensor_send_times: List[float] = field(default_factory=list)
+    sampler_hook_times: List[float] = field(default_factory=list)
+    vllm_generate_times: List[float] = field(default_factory=list)
+    layer_forward_times: List[float] = field(default_factory=list)
+    tensor_manipulation_times: List[float] = field(default_factory=list)
+    total_step_times: List[float] = field(default_factory=list)
+
+# Global profiling storage per request
+PROFILE_METRICS: DefaultDict[str, ProfileMetrics] = defaultdict(ProfileMetrics)
+
+@contextlib.contextmanager
+def profile_timer(metric_name: str, request_id: str = "default"):
+    """Context manager for timing code blocks"""
+    start_time = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start_time
+        metrics = PROFILE_METRICS[request_id]
+        
+        if metric_name == "pre_hook_wait":
+            metrics.pre_hook_wait_times.append(elapsed)
+        elif metric_name == "pre_hook_processing":
+            metrics.pre_hook_processing_times.append(elapsed)
+        elif metric_name == "post_hook_processing":
+            metrics.post_hook_processing_times.append(elapsed)
+        elif metric_name == "tensor_send":
+            metrics.tensor_send_times.append(elapsed)
+        elif metric_name == "sampler_hook":
+            metrics.sampler_hook_times.append(elapsed)
+        elif metric_name == "vllm_generate":
+            metrics.vllm_generate_times.append(elapsed)
+        elif metric_name == "layer_forward":
+            metrics.layer_forward_times.append(elapsed)
+        elif metric_name == "tensor_manipulation":
+            metrics.tensor_manipulation_times.append(elapsed)
+        elif metric_name == "total_step":
+            metrics.total_step_times.append(elapsed)
+        
+        print(f"⏱️ [{request_id}] {metric_name}: {elapsed*1000:.2f}ms")
+
+def print_profile_summary(request_id: str):
+    """Print comprehensive timing summary for a request"""
+    metrics = PROFILE_METRICS.get(request_id)
+    if not metrics:
+        print(f"❌ No profile metrics found for {request_id}")
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"📊 PERFORMANCE PROFILE SUMMARY - {request_id}")
+    print(f"{'='*80}")
+    
+    def stats(times: List[float], name: str):
+        if not times:
+            return f"{name}: No data"
+        avg = sum(times) / len(times) * 1000
+        max_time = max(times) * 1000
+        min_time = min(times) * 1000
+        total = sum(times) * 1000
+        return f"{name:25}: avg={avg:7.2f}ms max={max_time:7.2f}ms min={min_time:7.2f}ms total={total:8.2f}ms count={len(times)}"
+    
+    print(stats(metrics.vllm_generate_times, "🚀 vLLM Generate"))
+    print(stats(metrics.pre_hook_wait_times, "⏳ Pre-hook Wait"))
+    print(stats(metrics.pre_hook_processing_times, "🔄 Pre-hook Processing"))
+    print(stats(metrics.post_hook_processing_times, "📤 Post-hook Processing"))
+    print(stats(metrics.tensor_send_times, "📡 Tensor Send"))
+    print(stats(metrics.sampler_hook_times, "🎯 Sampler Hook"))
+    print(stats(metrics.layer_forward_times, "🧠 Layer Forward"))
+    print(stats(metrics.tensor_manipulation_times, "🔧 Tensor Manipulation"))
+    print(stats(metrics.total_step_times, "📊 Total Step"))
+    
+    # Calculate bottlenecks
+    bottlenecks = []
+    if metrics.vllm_generate_times:
+        bottlenecks.append(("vLLM Generate", sum(metrics.vllm_generate_times)))
+    if metrics.pre_hook_wait_times:
+        bottlenecks.append(("Pre-hook Wait", sum(metrics.pre_hook_wait_times)))
+    if metrics.tensor_send_times:
+        bottlenecks.append(("Tensor Send", sum(metrics.tensor_send_times)))
+    if metrics.pre_hook_processing_times:
+        bottlenecks.append(("Pre-hook Processing", sum(metrics.pre_hook_processing_times)))
+    
+    bottlenecks.sort(key=lambda x: x[1], reverse=True)
+    
+    print(f"\n🔥 TOP BOTTLENECKS:")
+    for i, (name, total_time) in enumerate(bottlenecks[:5], 1):
+        percentage = (total_time / sum(t for _, t in bottlenecks)) * 100 if bottlenecks else 0
+        print(f"   {i}. {name}: {total_time*1000:.2f}ms ({percentage:.1f}%)")
+    
+    print(f"{'='*80}\n")
+
+def cleanup_profile_metrics(request_id: str):
+    """Clean up profiling data for completed request"""
+    if request_id in PROFILE_METRICS:
+        del PROFILE_METRICS[request_id]
+        print(f"🧹 Cleaned up profile metrics for {request_id}")
+
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
 # Value: A dictionary with step-indexed hidden states and residuals
@@ -163,6 +271,8 @@ def register_inference_hooks(
 
     def pre_hook(module, args):
         """This hook is called BEFORE a layer does its forward pass"""
+        step_start_time = time.perf_counter()
+        
         # Get request-specific context safely
         with context_lock:
             # Find the current request context (there should be exactly one active)
@@ -178,132 +288,134 @@ def register_inference_hooks(
         if not hook_context["is_first_peer"]:
             print(f"🔍 Detected a non-first peer, waiting for hidden state from previous peer (step {current_step})...")
             
-            # Wait for data to arrive for this step using threading.Event
-            event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+            # TIME THE WAITING PERIOD
+            with profile_timer("pre_hook_wait", request_id):
+                # Wait for data to arrive for this step using threading.Event
+                event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+                
+                if not event.wait(timeout=30.0):  # blocks without GIL churn
+                    print(f"❌ Timeout waiting for hidden state for {request_id} step {current_step}")
+                    cleanup_request_context(request_id)
+                    return args
             
-            if not event.wait(timeout=30.0):  # blocks without GIL churn
-                print(f"❌ Timeout waiting for hidden state for {request_id} step {current_step}")
-                cleanup_request_context(request_id)
-                return args
-            
-            # Data is ready!
-            with CONTEXT_LOCK:
-                step_data = INFERENCE_CONTEXT[request_id][str(current_step)]
-                hidden_states = step_data["hidden_state"]
-                residual = step_data["residual"]
-                print(f"✅ Received hidden state and residual for {request_id} (step {current_step}). Injecting into the next layer.")
+            # TIME THE TENSOR PROCESSING
+            with profile_timer("pre_hook_processing", request_id):
+                # Data is ready!
+                with CONTEXT_LOCK:
+                    step_data = INFERENCE_CONTEXT[request_id][str(current_step)]
+                    hidden_states = step_data["hidden_state"]
+                    residual = step_data["residual"]
+                    print(f"✅ Received hidden state and residual for {request_id} (step {current_step}). Injecting into the next layer.")
 
-            # Process the received tensors with improved shape handling
-            orig_positions = args[0]
-            
-            print(f"🔍 Raw tensor shapes before processing (step {current_step}):")
-            print(f"   Original positions: {orig_positions.shape}")
-            print(f"   Received hidden states: {hidden_states.shape}")
-            print(f"   Received residual: {residual.shape}")
+                # Process the received tensors with improved shape handling
+                orig_positions = args[0]
+                
+                print(f"🔍 Raw tensor shapes before processing (step {current_step}):")
+                print(f"   Original positions: {orig_positions.shape}")
+                print(f"   Received hidden states: {hidden_states.shape}")
+                print(f"   Received residual: {residual.shape}")
 
-            # MATRIX MANIPULATION STARTS HERE - IMPROVED VERSION
-            
-            # 1. Validate received tensors
-            if not _validate_tensor_shapes(orig_positions, hidden_states, residual, current_step):
-                print(f"❌ Tensor validation failed for step {current_step}, using original args")
-                return args
-            
-            # 2. Ensure that the hidden states and residuals have batch dimension
-            if hidden_states.dim() == 2:
-                hidden_states = hidden_states.unsqueeze(0)
-                print(f"🔧 Added batch dimension to hidden states: {hidden_states.shape}")
-            if residual.dim() == 2:
-                residual = residual.unsqueeze(0)
-                print(f"🔧 Added batch dimension to residual: {residual.shape}")
-            
-            # 3. Ensure the positions have batch dimension
-            if orig_positions.dim() == 1:
-                orig_positions = orig_positions.unsqueeze(0)
-                print(f"🔧 Added batch dimension to positions: {orig_positions.shape}")
-            elif orig_positions.dim() >= 2:
-                print(f"🔧 Adding batch dimension to positions: {orig_positions.shape}")
-                orig_positions = orig_positions.contiguous()
-                print(f"🔧 Contiguous positions: {orig_positions.shape}")
+                # MATRIX MANIPULATION STARTS HERE - IMPROVED VERSION
+                with profile_timer("tensor_manipulation", request_id):
+                    # 1. Validate received tensors
+                    if not _validate_tensor_shapes(orig_positions, hidden_states, residual, current_step):
+                        print(f"❌ Tensor validation failed for step {current_step}, using original args")
+                        return args
+                    
+                    # 2. Ensure that the hidden states and residuals have batch dimension
+                    if hidden_states.dim() == 2:
+                        hidden_states = hidden_states.unsqueeze(0)
+                        print(f"🔧 Added batch dimension to hidden states: {hidden_states.shape}")
+                    if residual.dim() == 2:
+                        residual = residual.unsqueeze(0)
+                        print(f"🔧 Added batch dimension to residual: {residual.shape}")
+                    
+                    # 3. Ensure the positions have batch dimension
+                    if orig_positions.dim() == 1:
+                        orig_positions = orig_positions.unsqueeze(0)
+                        print(f"🔧 Added batch dimension to positions: {orig_positions.shape}")
+                    elif orig_positions.dim() >= 2:
+                        print(f"🔧 Adding batch dimension to positions: {orig_positions.shape}")
+                        orig_positions = orig_positions.contiguous()
+                        print(f"🔧 Contiguous positions: {orig_positions.shape}")
 
-            # 4. Extract dimensions after normalization
-            batch_size, seq_len = hidden_states.shape[:2]
-            pos_batch_size, pos_seq_len = orig_positions.shape[:2]
-            
-            print(f"🔍 Normalized shapes:")
-            print(f"   Hidden states: {hidden_states.shape} (batch={batch_size}, seq={seq_len})")
-            print(f"   Positions: {orig_positions.shape} (batch={pos_batch_size}, seq={pos_seq_len})")
-            
-            # 5. Handle sequence length alignment - CRITICAL FIX
-            if current_step == 0:
-                # First step: Positions should match or be sliced to match hidden states
-                if pos_seq_len >= seq_len:
-                    positions_to_inject = orig_positions[:, -seq_len:]
-                    print(f"🔧 Sliced positions to match hidden states: {positions_to_inject.shape}")
-                else:
-                    # Pad positions if needed (shouldn't happen normally)
-                    padding_needed = seq_len - pos_seq_len
-                    padding = torch.zeros(pos_batch_size, padding_needed, dtype=orig_positions.dtype, device=orig_positions.device)
-                    positions_to_inject = torch.cat([padding, orig_positions], dim=1)
-                    print(f"🔧 Padded positions to match hidden states: {positions_to_inject.shape}")
-            else:
-                # Step 1+: Hidden states should be single token, but positions might be longer
-                if seq_len == 1:
-                    # Received single token as expected
-                    positions_to_inject = orig_positions[:, -1:] if pos_seq_len > 1 else orig_positions
-                    print(f"🔧 Using last position for single token: {positions_to_inject.shape}")
-                else:
-                    # Unexpected: received full sequence in step 1+
-                    print(f"⚠️ Step {current_step}: Received full sequence ({seq_len} tokens), expected single token")
-                    # Take the last seq_len positions to match
-                    positions_to_inject = orig_positions[:, -seq_len:]
-                    print(f"🔧 Aligned positions to received sequence: {positions_to_inject.shape}")
+                    # 4. Extract dimensions after normalization
+                    batch_size, seq_len = hidden_states.shape[:2]
+                    pos_batch_size, pos_seq_len = orig_positions.shape[:2]
+                    
+                    print(f"🔍 Normalized shapes:")
+                    print(f"   Hidden states: {hidden_states.shape} (batch={batch_size}, seq={seq_len})")
+                    print(f"   Positions: {orig_positions.shape} (batch={pos_batch_size}, seq={pos_seq_len})")
+                    
+                    # 5. Handle sequence length alignment - CRITICAL FIX
+                    if current_step == 0:
+                        # First step: Positions should match or be sliced to match hidden states
+                        if pos_seq_len >= seq_len:
+                            positions_to_inject = orig_positions[:, -seq_len:]
+                            print(f"🔧 Sliced positions to match hidden states: {positions_to_inject.shape}")
+                        else:
+                            # Pad positions if needed (shouldn't happen normally)
+                            padding_needed = seq_len - pos_seq_len
+                            padding = torch.zeros(pos_batch_size, padding_needed, dtype=orig_positions.dtype, device=orig_positions.device)
+                            positions_to_inject = torch.cat([padding, orig_positions], dim=1)
+                            print(f"🔧 Padded positions to match hidden states: {positions_to_inject.shape}")
+                    else:
+                        # Step 1+: Hidden states should be single token, but positions might be longer
+                        if seq_len == 1:
+                            # Received single token as expected
+                            positions_to_inject = orig_positions[:, -1:] if pos_seq_len > 1 else orig_positions
+                            print(f"🔧 Using last position for single token: {positions_to_inject.shape}")
+                        else:
+                            # Unexpected: received full sequence in step 1+
+                            print(f"⚠️ Step {current_step}: Received full sequence ({seq_len} tokens), expected single token")
+                            # Take the last seq_len positions to match
+                            positions_to_inject = orig_positions[:, -seq_len:]
+                            print(f"🔧 Aligned positions to received sequence: {positions_to_inject.shape}")
 
-            # 6. Handle batch size mismatches
-            if positions_to_inject.shape[0] != batch_size:
-                if batch_size == 1:
-                    positions_to_inject = positions_to_inject[:1]  # Take first batch
-                    print(f"🔧 Reduced position batch size to match: {positions_to_inject.shape}")
-                else:
-                    positions_to_inject = positions_to_inject.expand(batch_size, -1)
-                    print(f"🔧 Expanded position batch size to match: {positions_to_inject.shape}")
+                    # 6. Handle batch size mismatches
+                    if positions_to_inject.shape[0] != batch_size:
+                        if batch_size == 1:
+                            positions_to_inject = positions_to_inject[:1]  # Take first batch
+                            print(f"🔧 Reduced position batch size to match: {positions_to_inject.shape}")
+                        else:
+                            positions_to_inject = positions_to_inject.expand(batch_size, -1)
+                            print(f"🔧 Expanded position batch size to match: {positions_to_inject.shape}")
 
-            # 7. Move to correct device - ensure all tensors are on the same device
-            target_device = orig_positions.device
-            positions_to_inject = positions_to_inject.to(target_device, non_blocking=True)
-            hidden_states_to_inject = hidden_states.to(target_device, non_blocking=True)
-            residual_to_inject = residual.to(target_device, non_blocking=True)
+                    # 7. Move to correct device - ensure all tensors are on the same device
+                    target_device = orig_positions.device
+                    positions_to_inject = positions_to_inject.to(target_device, non_blocking=True)
+                    hidden_states_to_inject = hidden_states.to(target_device, non_blocking=True)
+                    residual_to_inject = residual.to(target_device, non_blocking=True)
 
-            # 8. Final validation and device consistency check
-            assert positions_to_inject.device == hidden_states_to_inject.device == residual_to_inject.device, \
-                f"Device mismatch: pos={positions_to_inject.device}, hidden={hidden_states_to_inject.device}, residual={residual_to_inject.device}"
-            
-            # Final shape check
-            final_batch_size = positions_to_inject.shape[0]
-            final_seq_len = positions_to_inject.shape[1]
-            hidden_batch_size = hidden_states_to_inject.shape[0]
-            hidden_seq_len = hidden_states_to_inject.shape[1]
-            
-            if final_batch_size != hidden_batch_size or final_seq_len != hidden_seq_len:
-                print(f"❌ FINAL SHAPE MISMATCH:")
-                print(f"   Positions: batch={final_batch_size}, seq={final_seq_len}")
-                print(f"   Hidden states: batch={hidden_batch_size}, seq={hidden_seq_len}")
-                print(f"   Using original args to avoid crash")
-                return args
-            
-            print(f"✅ Final tensor shapes (step {current_step}):")
-            print(f"   Positions: {positions_to_inject.shape}")
-            print(f"   Hidden states: {hidden_states_to_inject.shape}")
-            print(f"   Residual: {residual_to_inject.shape}")
+                    # 8. Final validation and device consistency check
+                    assert positions_to_inject.device == hidden_states_to_inject.device == residual_to_inject.device, \
+                        f"Device mismatch: pos={positions_to_inject.device}, hidden={hidden_states_to_inject.device}, residual={residual_to_inject.device}"
+                    
+                    # Final shape check
+                    final_batch_size = positions_to_inject.shape[0]
+                    final_seq_len = positions_to_inject.shape[1]
+                    hidden_batch_size = hidden_states_to_inject.shape[0]
+                    hidden_seq_len = hidden_states_to_inject.shape[1]
+                    
+                    if final_batch_size != hidden_batch_size or final_seq_len != hidden_seq_len:
+                        print(f"❌ FINAL SHAPE MISMATCH:")
+                        print(f"   Positions: batch={final_batch_size}, seq={final_seq_len}")
+                        print(f"   Hidden states: batch={hidden_batch_size}, seq={hidden_seq_len}")
+                        print(f"   Using original args to avoid crash")
+                        return args
+                    
+                    print(f"✅ Final tensor shapes (step {current_step}):")
+                    print(f"   Positions: {positions_to_inject.shape}")
+                    print(f"   Hidden states: {hidden_states_to_inject.shape}")
+                    print(f"   Residual: {residual_to_inject.shape}")
 
-            # MATRIX MANIPULATION ENDS HERE
+                # Clean up consumed data to prevent memory growth
+                with CONTEXT_LOCK:
+                    if current_step > 0:
+                        INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                        STEP_EVENTS[request_id].pop(current_step - 1, None)
 
-            # Clean up consumed data to prevent memory growth
-            with CONTEXT_LOCK:
-                if current_step > 0:
-                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[request_id].pop(current_step - 1, None)
-
-            return (positions_to_inject, hidden_states_to_inject, residual_to_inject)
+                return (positions_to_inject, hidden_states_to_inject, residual_to_inject)
         
         # If this is the first peer, just return the original args
         return args
@@ -321,16 +433,18 @@ def register_inference_hooks(
             request_id = hook_context["request_id"]
             current_step = hook_context["current_step"]
         
-        # For the last peer, we don't need to send anything
-        if hook_context["is_last_peer"]:
-            return
-            
-        # Prevent multiple calls per inference step
-        context_key = f"sent_step_{current_step}"
-        print(f"🔍 Context key: {context_key}")
-        if hook_context.get(context_key, False):
-            return  # Already sent for this step
-        hook_context[context_key] = True
+        # TIME THE ENTIRE POST-HOOK PROCESSING
+        with profile_timer("post_hook_processing", request_id):
+            # For the last peer, we don't need to send anything
+            if hook_context["is_last_peer"]:
+                return
+                
+            # Prevent multiple calls per inference step
+            context_key = f"sent_step_{current_step}"
+            print(f"🔍 Context key: {context_key}")
+            if hook_context.get(context_key, False):
+                return  # Already sent for this step
+            hook_context[context_key] = True
         
         print(f"↪️ POST-HOOK for {request_id}, step {current_step}: Sending hidden states...")
         hidden_states, residual = output
@@ -367,19 +481,21 @@ def register_inference_hooks(
         
         # MATRIX MANIPULATION ENDS HERE
 
-        # Send both tensors together in one message
-        asyncio.run_coroutine_threadsafe(
-            send_inference_tensors(
-                node,
-                request_id,
-                next_peer_id,
-                hidden_states.cpu().numpy(),
-                residual.cpu().numpy(),
-                step_idx=current_step,
-                next_peer_ticket=next_peer_ticket
-            ),
-            main_loop
-        )
+        # TIME THE TENSOR SENDING
+        with profile_timer("tensor_send", request_id):
+            # Send both tensors together in one message
+            asyncio.run_coroutine_threadsafe(
+                send_inference_tensors(
+                    node,
+                    request_id,
+                    next_peer_id,
+                    hidden_states.cpu().numpy(),
+                    residual.cpu().numpy(),
+                    step_idx=current_step,
+                    next_peer_ticket=next_peer_ticket
+                ),
+                main_loop
+            )
         
         # NOTE: Step increment moved to sampler_post_hook to ensure it happens on ALL peers
     
@@ -405,67 +521,69 @@ def register_inference_hooks(
             is_last_peer = hook_context.get("is_last_peer", False)
             pipeline = hook_context["pipeline"]
             peer_id = hook_context["peer_id"]
-            
-        if is_last_peer:
-            # Serialize the entire SamplerOutput object
-            sampler_output_bytes = pickle.dumps(output)
-            sampler_output_np = np.frombuffer(sampler_output_bytes, dtype=np.uint8)
-            
-            # Send to all OTHER peers (not ourselves)
-            for peer_ticket in pipeline:
-                if peer_ticket != peer_id:
-                    asyncio.run_coroutine_threadsafe(
-                        send_sampler_output(
-                            node,
-                            request_id,
-                            peer_ticket,
-                            sampler_output_np,
-                            step_idx=current_step,
-                            next_peer_ticket=peer_ticket
-                        ),
-                        main_loop
-                    )
-            
-            print(f"📢 Last peer sent sampler output to all peers for step {current_step}")
-            
-            # Increment step for last peer too
-            with context_lock:
-                hook_context["current_step"] = current_step + 1
-            
-            # Clean up old data to prevent memory growth
-            with CONTEXT_LOCK:
-                if current_step > 0:
-                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[request_id].pop(current_step - 1, None)
+        
+        # TIME THE SAMPLER HOOK PROCESSING
+        with profile_timer("sampler_hook", request_id):
+            if is_last_peer:
+                # Serialize the entire SamplerOutput object
+                sampler_output_bytes = pickle.dumps(output)
+                sampler_output_np = np.frombuffer(sampler_output_bytes, dtype=np.uint8)
                 
-            return output
-        else:
-            # Non-last peer: wait for sampler output
-            print(f"⏳ Non-last peer waiting for sampler output for step {current_step}")
-            
-            # Wait for sampler output using threading.Event
-            event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
-            
-            if not event.wait(timeout=30.0):
-                cleanup_request_context(request_id)
-                raise RuntimeError(f"Timeout waiting for sampler output for {request_id} step {current_step}")
-            
-            # Data is ready!
-            with CONTEXT_LOCK:
-                received_output = INFERENCE_CONTEXT[request_id][str(current_step)]["sampler_output"]
-                print(f"✅ Received sampler output for step {current_step}")
-            
-            # Clean up consumed data to prevent memory growth
-            with CONTEXT_LOCK:
-                if current_step > 0:
-                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[request_id].pop(current_step - 1, None)
-            
-            # Increment step after receiving
-            with context_lock:
-                hook_context["current_step"] = current_step + 1
+                # Send to all OTHER peers (not ourselves)
+                for peer_ticket in pipeline:
+                    if peer_ticket != peer_id:
+                        asyncio.run_coroutine_threadsafe(
+                            send_sampler_output(
+                                node,
+                                request_id,
+                                peer_ticket,
+                                sampler_output_np,
+                                step_idx=current_step,
+                                next_peer_ticket=peer_ticket
+                            ),
+                            main_loop
+                        )
                 
-            return received_output
+                print(f"📢 Last peer sent sampler output to all peers for step {current_step}")
+                
+                # Increment step for last peer too
+                with context_lock:
+                    hook_context["current_step"] = current_step + 1
+                
+                # Clean up old data to prevent memory growth
+                with CONTEXT_LOCK:
+                    if current_step > 0:
+                        INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                        STEP_EVENTS[request_id].pop(current_step - 1, None)
+                    
+                return output
+            else:
+                # Non-last peer: wait for sampler output
+                print(f"⏳ Non-last peer waiting for sampler output for step {current_step}")
+                
+                # Wait for sampler output using threading.Event
+                event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+                
+                if not event.wait(timeout=30.0):
+                    cleanup_request_context(request_id)
+                    raise RuntimeError(f"Timeout waiting for sampler output for {request_id} step {current_step}")
+                
+                # Data is ready!
+                with CONTEXT_LOCK:
+                    received_output = INFERENCE_CONTEXT[request_id][str(current_step)]["sampler_output"]
+                    print(f"✅ Received sampler output for step {current_step}")
+                
+                # Clean up consumed data to prevent memory growth
+                with CONTEXT_LOCK:
+                    if current_step > 0:
+                        INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                        STEP_EVENTS[request_id].pop(current_step - 1, None)
+                
+                # Increment step after receiving
+                with context_lock:
+                    hook_context["current_step"] = current_step + 1
+                    
+                return received_output
 
 
     def start_inference_run(request_id: str, pipeline: List[str], input_text: str, sampling_params: Any, assigned_layers: Dict[str, List[int]]):
@@ -518,8 +636,10 @@ def register_inference_hooks(
             sampler_hook_handle = sampler.register_forward_hook(sampler_post_hook)
 
             print("Starting the inference run...")
-            # Run vLLM inference (this is the blocking call)
-            completions = llm.generate([input_text], sampling_params=sampling_params)
+            # TIME THE MAIN vLLM GENERATE CALL
+            with profile_timer("vllm_generate", request_id):
+                # Run vLLM inference (this is the blocking call)
+                completions = llm.generate([input_text], sampling_params=sampling_params)
 
             # If last peer, send final result to server
             if is_last and completions:
@@ -545,6 +665,9 @@ def register_inference_hooks(
             sampler_hook_handle.remove()
             print(f"🎉 Inference run completed for {request_id}")
             
+            # PRINT PERFORMANCE PROFILE SUMMARY
+            print_profile_summary(request_id)
+            
         except Exception as e:
             print(f"❌ Error in inference run for {request_id}: {e}")
             import traceback
@@ -556,6 +679,8 @@ def register_inference_hooks(
                     hook_contexts[execution_id]["active"] = False
                     del hook_contexts[execution_id]
             cleanup_request_context(request_id)
+            # Clean up profiling data
+            cleanup_profile_metrics(request_id)
         
         return
     
