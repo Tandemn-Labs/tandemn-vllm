@@ -19,6 +19,10 @@ from src.utils.message_processing import (
     safe_parse_message,
     log_message_received
 )
+from src.utils.deployment_utils import (
+    deploy_model_orchestrator,
+    report_deployment_completion
+)
 import pickle
 import numpy as np
 import threading
@@ -276,7 +280,7 @@ async def unified_message_gateway():
             return
         except Exception as e:
             print(f"❌ Error in unified message gateway: {e}")
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.0001)
 
 
 async def handle_deployment_message(tensor):
@@ -510,123 +514,19 @@ async def debug_inference_context_monitor():
 # SELECTIVE LAYER LOADING IMPLEMENTATION  
 # ============================================================================
 
-def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
-    """Create vLLM model with only assigned layers loaded by monkey-patching make_layers."""
-    
-    # STEP 1: Monkey-patch vLLM's make_layers function (Prime Intellect's key insight)
-    def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
-        """Custom make_layers that creates real layers only for assigned indices."""
-        from vllm.model_executor.models.utils import PPMissingLayer, maybe_offload_to_cpu
-        
-        start_layer = min(assigned_layers) if assigned_layers else 0
-        end_layer = max(assigned_layers) + 1 if assigned_layers else 0
-        
-        modules = []
-        for i in range(num_hidden_layers):
-            if i in assigned_layers:
-                # Create real layer
-                layer = layer_fn(prefix=f"{prefix}.{i}")
-                modules.append(maybe_offload_to_cpu(layer))
-                print(f"  Created REAL layer {i}")
-            else:
-                # Create passthrough layer (Prime Intellect's memory optimization)
-                modules.append(PPMissingLayer())
-                print(f"  Created PPMissingLayer for layer {i}")
-        
-        return start_layer, end_layer, torch.nn.ModuleList(modules)
-    
-    # Apply the monkey patch
-    import vllm.model_executor.models.utils as model_utils
-    original_make_layers = model_utils.make_layers
-    model_utils.make_layers = _selective_make_layers
-    
-    try:
-        # STEP 2: Create vLLM model (will use our patched make_layers)
-        from vllm import LLM, SamplingParams
-        
-        llm = LLM(
-            model=model_dir,
-            tensor_parallel_size=1,
-            enforce_eager=True,  # Required for custom layer loading
-            max_model_len=128,   # Small for demo
-            disable_log_stats=True,
-            skip_tokenizer_init=False,
-            gpu_memory_utilization=0.8,  # Use much less memory
-            use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
-            load_format="dummy",     # ← this is the magic flag
-            dtype="float16"
-        )
-        
-        print(f"✅ Successfully created vLLM model with selective layers!")
-        print(f"   Our monkey-patch created real layers for: {assigned_layers}")
-        print(f"   All other layers are PPMissingLayer (passthrough)")
-        
-        return llm
-        
-    finally:
-        # Restore original function
-        model_utils.make_layers = original_make_layers
-
 # ============================================================================
-# FILE DOWNLOAD AND DEPLOYMENT LOGIC
+# FILE DOWNLOAD AND DEPLOYMENT LOGIC - MOVED TO deployment_utils.py
 # ============================================================================
-
-async def download_file(url: str, local_path: Path, chunk_size: int = 16*1024*1024) -> bool:  # 16MB chunks for maximum speed
-    """Download a file from server with progress tracking."""
-    try:
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Skip download if file already exists and has content
-        if local_path.exists() and local_path.stat().st_size > 0:
-            # Optional: Verify file size matches server (HEAD request)
-            try:
-                async with httpx.AsyncClient() as client:
-                    head_response = await client.head(url)
-                    if head_response.status_code == 200:
-                        remote_size = int(head_response.headers.get("content-length", 0))
-                        local_size = local_path.stat().st_size
-                        
-                        if local_size == remote_size:
-                            print(f"✅ File already exists with correct size, skipping: {local_path.name} ({local_size:,} bytes)")
-                            return True
-                        else:
-                            print(f"⚠️ File exists but size mismatch - redownloading: local={local_size:,}, remote={remote_size:,}")
-                    else:
-                        print(f"⚠️ Could not verify remote file size (HEAD {head_response.status_code}), downloading anyway")
-            except Exception as e:
-                print(f"⚠️ HEAD request failed: {e}, proceeding with download")
-                # If HEAD fails, just check local file exists and has content
-                print(f"✅ File exists locally, assuming valid: {local_path.name} ({local_path.stat().st_size:,} bytes)")
-                return True
-        
-        async with httpx.AsyncClient() as client:
-            async with client.stream("GET", url) as response:
-                response.raise_for_status()
-                
-                total_size = int(response.headers.get("content-length", 0))
-                downloaded = 0
-                
-                async with aiofiles.open(local_path, "wb") as f:
-                    async for chunk in response.aiter_bytes(chunk_size):
-                        await f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        # Progress logging (every 100MB or if total < 100MB for minimal I/O overhead)
-                        if total_size > 0 and (downloaded % (100 * 1024 * 1024) == 0 or downloaded == total_size):
-                            progress = (downloaded / total_size) * 100
-                            print(f"   📥 Downloading {local_path.name}: {progress:.1f}% ({downloaded:,}/{total_size:,} bytes)")
-        
-        print(f"✅ Downloaded {local_path.name} ({downloaded:,} bytes)")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Failed to download {url}: {e}")
-        return False
 
 async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
-    """Deploy model based on deployment instructions received from server."""
+    """
+    Deploy model based on deployment instructions received from server.
+    
+    This is now a simplified orchestrator that uses the specialized functions
+    from deployment_utils.py for actual implementation.
+    """
     global deployed_model, deployment_status, start_inference_run, tensor_transport
-    # get the model name
+    
     model_name = instructions.get('model_name', 'unknown')
     
     # Check if model is already successfully deployed
@@ -638,120 +538,59 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
     if deployment_status in ["downloading", "loading"]:
         print(f"⚠️ Deployment already in progress ({deployment_status}), skipping...")
         return False
-    # Track deployment attempts to prevent infinite retries
-    if not hasattr(deploy_model_from_instructions, 'deployment_attempts'):
-        deploy_model_from_instructions.deployment_attempts = {}
-    attempt_key = f"{model_name}_{hash(str(instructions['assigned_layers']))}"
-    current_attempts = deploy_model_from_instructions.deployment_attempts.get(attempt_key, 0)
-    
-    if current_attempts >= 3:
-        print(f"❌ Maximum deployment attempts (3) reached for {model_name}, giving up")
-        deployment_status = "failed"
-        return False
-    
-    deploy_model_from_instructions.deployment_attempts[attempt_key] = current_attempts + 1
-    print(f"🚀 Starting model deployment (attempt {current_attempts + 1}/3)...")
 
     try:
+        # Update status to indicate deployment started
         deployment_status = "downloading"
-        print(f"   Model: {model_name}")
-        print(f"   Assigned layers: {instructions['assigned_layers']}")
-        print(f"   Is first peer: {instructions['is_first_peer']}")
-        print(f"   Is last peer: {instructions['is_last_peer']}")
-        print(f"   Required files: {len(instructions['required_files'])}")
-        print(f"   Next peer ticket: {instructions['next_peer_ticket']}")
         
-        # Create local model directory
-        model_dir = Path(f"./deployed_models/{instructions['model_name']}")
-        model_dir.mkdir(parents=True, exist_ok=True)
+        # Use the new orchestrator to handle the deployment
+        success, loaded_model = await deploy_model_orchestrator(instructions)
         
-        # Download required files
-        base_url = instructions["server_download_url"]
-        successful_downloads = 0
-        total_files = len(instructions["required_files"])
-        
-        for file_path in instructions["required_files"]:
-            file_url = f"{base_url}/{file_path}"
-            local_file_path = model_dir / file_path
-            
-            print(f"📥 Downloading {file_path}...")
-            if await download_file(file_url, local_file_path):
-                successful_downloads += 1
-            else:
-                print(f"❌ Failed to download {file_path}")
-        
-        if successful_downloads != total_files:
-            print(f"❌ Only {successful_downloads}/{total_files} files downloaded successfully")
+        if not success or loaded_model is None:
+            print("❌ Model deployment orchestration failed")
             deployment_status = "failed"
+            await report_deployment_completion(
+                model_name=model_name,
+                peer_id=current_peer_ticket,
+                success=False,
+                server_host=SERVER_HOST,
+                server_port=SERVER_PORT
+            )
             return False
-        
-        print(f"✅ All {total_files} files downloaded successfully")
-        
-        # Load the model with selective layers
-        deployment_status = "loading"
-        print(f"🔧 Loading model with selective layers...")
-        
-        # Use config directory for vLLM initialization
-        config_dir = model_dir / "config"
-        if not config_dir.exists():
-            print(f"❌ Config directory not found: {config_dir}")
-            deployment_status = "failed"
-            return False
-        print("Loading only a partial model for vLLM Inference")
 
-        # running the blocking operation within the machine runner,
-        # in a different thread, so the heartbeat loop can continue
-        # and the peer does not STALL during a deployment.
-        loop_for_deployment = asyncio.get_running_loop()
-        
-        # AWAIT the result from the background thread. This pauses this function
-        # but allows the event loop to run other tasks (like heartbeats).
-        # Any exception from the background thread (like the out-of-memory error)
-        # will be raised here and caught by the outer try/except block.
-        loaded_model = await loop_for_deployment.run_in_executor(
-            None,
-            create_dynamic_vllm_model,
-            str(config_dir),
-            instructions["assigned_layers"],
-        )
-
-        # Explicitly update the global state ONLY after successful loading.
+        # Update global state with successfully loaded model
         deployed_model = loaded_model
-
-        # Now we can safely check if the model was loaded before proceeding.
-        if deployed_model is None:
-            print("❌ Model loading returned None. Deployment cannot continue.")
-            # Raise an exception to be caught by the main handler.
-            raise ValueError("Model loading failed in the background thread.")
-
-        # If loading is successful, prepare the inference function.
+        deployment_status = "loading"  # Update status before inference setup
+        
+        # Setup inference hooks
         print("✅ Model loaded successfully, registering inference hooks...")
         server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
-        # Pass the full pipeline of peer tickets to register_inference_hooks
         start_inference_run = register_inference_hooks(
             llm=deployed_model,
             node=tensor_transport,
             peer_id=current_peer_ticket,
             server_url=server_url,
             next_peer_ticket=instructions.get("next_peer_ticket"),
-            pipeline=instructions.get("pipeline")  # Send all peer tickets
+            pipeline=instructions.get("pipeline")
         )
+        
+        # Update global assigned layers
+        global assigned_layers_global
         assigned_layers_global = instructions['assigned_layers']
 
-        ##################################################
-        deployment_status = "ready"
-        print(f"✅ Model deployment completed successfully!")
-        print(f"   Peer role: {'First' if instructions['is_first_peer'] else 'Last' if instructions['is_last_peer'] else 'Middle'}")
-        print(f"   Loaded layers: {instructions['assigned_layers']}")
-        print(f"   Memory optimization: ~{100 * (28 - len(instructions['assigned_layers'])) / 28:.1f}% VRAM savings")
-        
-        # Clear attempts counter on success
-        deploy_model_from_instructions.deployment_attempts[attempt_key] = 0
+        # Mark deployment as ready
         deployment_status = "ready"
         print(f"🔍 [DEBUG] Deployment status set to ready")
         
-        # Report completion to server
-        await report_deployment_completion(instructions['model_name'], success=True)
+        # Report success to server
+        await report_deployment_completion(
+            model_name=model_name,
+            peer_id=current_peer_ticket,
+            success=True,
+            server_host=SERVER_HOST,
+            server_port=SERVER_PORT
+        )
+        
         return True
         
     except Exception as e:
@@ -760,30 +599,20 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         
         # Report failure to server  
         try:
-            await report_deployment_completion(instructions['model_name'], success=False)
+            await report_deployment_completion(
+                model_name=model_name,
+                peer_id=current_peer_ticket,
+                success=False,
+                server_host=SERVER_HOST,
+                server_port=SERVER_PORT
+            )
         except:
             pass  # Don't fail on reporting failure
         
         return False
 
 
-async def report_deployment_completion(model_name: str, success: bool):
-    """
-    Notify the central server that this peer has finished deploying.
-    """
-    url = f"http://{SERVER_HOST}:{SERVER_PORT}/deployment_complete"
-    payload = {
-        "model_name": model_name,
-        "peer_id": current_peer_ticket,
-        "success": success
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-        print(f"📤 Reported deployment completion: {payload}")
-    except Exception as e:
-        print(f"❌ Failed to report deployment completion: {e}")
+# report_deployment_completion moved to deployment_utils.py
 
 
 
