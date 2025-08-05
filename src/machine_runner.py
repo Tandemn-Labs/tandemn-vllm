@@ -12,6 +12,13 @@ import time
 import aiofiles
 from colorama import Fore, Style, init as colorama_init
 from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT, STEP_EVENTS
+from src.utils.message_processing import (
+    parse_deployment_message, 
+    parse_inference_trigger_message,
+    extract_request_metadata,
+    safe_parse_message,
+    log_message_received
+)
 import pickle
 import numpy as np
 import threading
@@ -275,33 +282,20 @@ async def unified_message_gateway():
 async def handle_deployment_message(tensor):
     """Handle deployment instruction messages"""
     try:
-        # Convert tensor to bytes
-        if hasattr(tensor, "numpy"):
-            arr = tensor.numpy()
-        else:
-            arr = tensor
-            
-        if arr.dtype != np.uint8:
-            print(f"⚠️ Deployment tensor has unexpected dtype: {arr.dtype}")
+        # Parse deployment message using utility function
+        instruction = parse_deployment_message(tensor)
+        if not instruction:
+            print("❌ Invalid deployment message format")
             return
-            
-        instruction_data = arr.tobytes()
-        instruction = json.loads(instruction_data.decode())
         
-        if instruction.get("action") == "deploy_model":
-            instructions = instruction.get("instructions", {})
-            print("\n" + "="*80)
-            print("🌟🌟🌟 [DEPLOYMENT INSTRUCTION RECEIVED] 🌟🌟🌟")
-            print(f"📨 Model: {instructions.get('model_name', 'unknown')}")
-            print(f"📋 Layers: {instructions.get('assigned_layers', [])}")
-            print(f"🔗 Is first: {instructions.get('is_first_peer', False)}")
-            print(f"🔗 Is last: {instructions.get('is_last_peer', False)}")
-            print("="*80 + "\n")
-            
-            # Deploy model in background
-            asyncio.create_task(deploy_model_from_instructions(instructions))
-        else:
-            print(f"⚠️ Unknown deployment action: {instruction.get('action')}")
+        instructions = instruction.get("instructions", {})
+        
+        # Log deployment message received
+        extra_info = f"Model: {instructions.get('model_name', 'unknown')}, Layers: {instructions.get('assigned_layers', [])}"
+        log_message_received("deployment", instruction, extra_info)
+        
+        # Deploy model in background
+        asyncio.create_task(deploy_model_from_instructions(instructions))
             
     except Exception as e:
         print(f"❌ Error handling deployment message: {e}")
@@ -314,36 +308,18 @@ async def handle_inference_trigger_message(tensor):
     global start_inference_run, current_peer_ticket
     
     try:
-        # Convert tensor to bytes
-        if hasattr(tensor, "numpy"):
-            arr = tensor.numpy()
-        else:
-            arr = tensor
-            
-        if arr.dtype != np.uint8:
-            print(f"⚠️ Inference trigger tensor has unexpected dtype: {arr.dtype}")
-            return
-            
-        trigger_data = arr.tobytes()
-        trigger = json.loads(trigger_data.decode())
-        
-        if trigger.get("action") != "start_inference":
-            print(f"⚠️ Not a start_inference action: {trigger.get('action')}")
+        # Parse inference trigger message using utility function
+        trigger = parse_inference_trigger_message(tensor)
+        if not trigger:
+            print("❌ Invalid inference trigger message format")
             return
             
         request_id = trigger.get("request_id")
         pipeline = trigger.get("pipeline")
         
-        if not request_id or not pipeline:
-            print(f"❌ Invalid inference trigger: missing request_id or pipeline")
-            return
-            
-        print(f"\n{'='*80}")
-        print(f"🚀 INFERENCE TRIGGER RECEIVED 🚀")
-        print(f"📋 Request ID: {request_id}")
-        print(f"🔗 Pipeline: {pipeline}")
-        print(f"📝 Input: {trigger.get('input_text', '')[:50]}...")
-        print(f"{'='*80}\n")
+        # Log inference trigger received
+        extra_info = f"Request ID: {request_id}, Input: {trigger.get('input_text', '')[:50]}..."
+        log_message_received("inference_trigger", trigger, extra_info)
         
         # Initialize INFERENCE_CONTEXT for this request
         if request_id not in INFERENCE_CONTEXT:
@@ -405,25 +381,16 @@ async def handle_inference_data_message(name: str, tensor):
     try:
         print(f"📊 Processing inference data: {name}")
         
-        # Parse the tensor name to determine type
-        if "_combined" in name:
-            # Name format: {request_id}_step{step_idx}_combined
-            # Example: req_1753809548666_0_step0_combined
+        # Parse the tensor name using utility function
+        metadata = extract_request_metadata(name)
+        if not metadata:
+            print(f"❌ Invalid tensor name format: {name}")
+            return
             
-            # Find the last occurrence of "_step" to handle request_ids with underscores
-            step_marker_idx = name.rfind("_step")
-            if step_marker_idx == -1:
-                print(f"❌ Invalid tensor name format (no _step found): {name}")
-                return
-            
-            # Extract request_id (everything before the last _step)
-            request_id = name[:step_marker_idx]
-            
-            # Extract the step number
-            rest = name[step_marker_idx + 5:]  # Skip "_step"
-            step_idx = int(rest.split("_")[0])
-            
-            print(f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='combined'")
+        request_id, step_idx, message_type = metadata
+        print(f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='{message_type}'")
+        
+        if message_type == "combined":
             
             # Unstack the combined tensor
             if tensor.shape[0] != 2:
@@ -447,17 +414,7 @@ async def handle_inference_data_message(name: str, tensor):
             event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
             event.set()
                 
-        elif "_sampler_output" in name:
-            # Handle sampler output from last peer
-            step_marker_idx = name.rfind("_step")  # Use rfind here too
-            if step_marker_idx == -1:
-                print(f"❌ Invalid sampler output name format: {name}")
-                return
-                
-            request_id = name[:step_marker_idx]
-            rest = name[step_marker_idx + 5:]
-            step_idx = int(rest.split("_")[0])
-            
+        elif message_type == "sampler_output":
             # Convert tensor to numpy array first, then unpickle
             if hasattr(tensor, "numpy"):
                 # PyTorch tensor - convert to numpy
@@ -487,21 +444,14 @@ async def handle_inference_data_message(name: str, tensor):
         traceback.print_exc()
 
 async def handle_unknown_message(name: str, tensor):
-    """Handle unknown message types by attempting to parse Was JSON"""
+    """Handle unknown message types by attempting to parse as JSON"""
     try:
-        # Convert tensor to bytes and try to parse as JSON
-        if hasattr(tensor, "numpy"):
-            arr = tensor.numpy()
-        else:
-            arr = tensor
-            
-        if arr.dtype != np.uint8:
-            print(f"⚠️ Unknown message tensor has unexpected dtype: {arr.dtype}")
+        # Parse message using utility function
+        parsed = safe_parse_message(tensor, "unknown")
+        if not parsed:
+            print(f"❌ Could not parse unknown message '{name}'")
             return
             
-        data = arr.tobytes()
-        parsed = json.loads(data.decode())
-        
         print(f"📋 Unknown message '{name}' parsed as JSON:")
         print(f"   Action: {parsed.get('action', 'unknown')}")
         print(f"   Keys: {list(parsed.keys())}")
@@ -937,7 +887,7 @@ async def main():
 
         # Main processing loop - continuously process computation jobs
         while True:
-            print("🔄 Processing...")
+            # print("🔄 Processing...")
             # await process_once(doc, author, peer_id, next_peer, is_first, is_last, local_matrix, node)
             await asyncio.sleep(2)  # Small delay between processing cycles
 
