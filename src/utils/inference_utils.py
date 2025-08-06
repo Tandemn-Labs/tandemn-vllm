@@ -148,283 +148,112 @@ def register_inference_hooks(
     hook_contexts = {}  # Per-request context storage
     context_lock = threading.RLock()
 
-    def _slice_last_token(t: torch.Tensor) -> torch.Tensor:
-        """Slices the last token from a tensor, handling multiple dimensions safely."""
-        print(f"Dimensions of the tensor: {t.dim()}")
-        if t.dim() == 2:
-            # Shape (seq_len, hidden_dim) -> (1, hidden_dim)
-            return t[-1:, :]
-        elif t.dim() == 3:
-            # Shape (batch, seq_len, hidden_dim) -> (batch, 1, hidden_dim)
-            return t[:, -1:, :]
-        elif t.dim() == 4:
-            # Shape (batch, seq_len, num_heads, head_dim) -> (batch, 1, num_heads, head_dim)
-            return t[:, -1:, :, :]
-        else:
-            print(f"⚠️ Unexpected tensor dimensions: {t.dim()}, returning unchanged")
-            return t
-
-    def _validate_tensor_shapes(positions: torch.Tensor, hidden_states: torch.Tensor, residual: torch.Tensor, step_idx: int) -> bool:
-        """Validate that all tensors have compatible shapes for injection."""
-        try:
-            print(f"Dimensions of the hidden states: {hidden_states.dim()}")
-            print(f"Dimensions of the residual: {residual.dim()}") 
-            print(f"Dimensions of the positions: {positions.dim()}")
-            # Basic dimension checks
-            if hidden_states.dim() < 2 or residual.dim() < 2:
-                print(f"❌ Hidden states or residual has insufficient dimensions: hidden={hidden_states.dim()}, residual={residual.dim()}")
-                return False
-            
-            # Check that hidden states and residual have same shape
-            if hidden_states.shape != residual.shape:
-                print(f"❌ Hidden states and residual shape mismatch: hidden={hidden_states.shape}, residual={residual.shape}")
-                return False
-            
-            # Extract sequence and batch dimensions
-            if hidden_states.dim() == 2:
-                seq_len, hidden_dim = hidden_states.shape
-                batch_size = 1
-            else:
-                batch_size, seq_len, hidden_dim = hidden_states.shape[:3]
-            
-            # Check positions compatibility
-            if positions.dim() == 1:
-                pos_batch, pos_seq = 1, positions.shape[0]
-            else:
-                pos_batch, pos_seq = positions.shape[:2]
-            
-            # For step 0, allow full sequence. For step 1+, expect single token
-            expected_seq_len = seq_len if step_idx == 0 else 1
-            
-            print(f"🔍 Shape validation for step {step_idx}:")
-            print(f"   Hidden states: {hidden_states.shape} (expected seq_len: {expected_seq_len})")
-            print(f"   Positions: {positions.shape}")
-            print(f"   Batch size: {batch_size}, Seq len: {seq_len}")
-            
-            # Allow some flexibility but warn about potential issues
-            if seq_len != expected_seq_len and step_idx > 0:
-                print(f"⚠️ Unexpected sequence length for step {step_idx}: got {seq_len}, expected {expected_seq_len}")
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Shape validation failed: {e}")
-            return False
-
     def pre_hook(module, args):
-        """This hook is called BEFORE a layer does its forward pass"""
-        # Get request-specific context safely
-        with context_lock:
-            # Find the current request context (there should be exactly one active)
-            active_contexts = [ctx for ctx in hook_contexts.values() if ctx.get("active", False)]
-            if not active_contexts:
-                print("❌ No active inference context found in pre_hook")
-                return args
-            
-            hook_context = active_contexts[0]  # Should be exactly one
-            request_id = hook_context["request_id"]
-            current_step = hook_context["current_step"]
-        
-        if not hook_context["is_first_peer"]:
-            print(f"🔍 Detected a non-first peer, waiting for hidden state from previous peer (step {current_step})...")
-            
-            # Wait for data to arrive for this step using threading.Event
-            event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
-            
-            if not event.wait(timeout=30.0):  # blocks without GIL churn
-                print(f"❌ Timeout waiting for hidden state for {request_id} step {current_step}")
-                cleanup_request_context(request_id)
-                return args
-            
-            # Data is ready!
-            with CONTEXT_LOCK:
-                step_data = INFERENCE_CONTEXT[request_id][str(current_step)]
-                hidden_states = step_data["hidden_state"]
-                residual = step_data["residual"]
-                print(f"✅ Received hidden state and residual for {request_id} (step {current_step}). Injecting into the next layer.")
-
-            # Process the received tensors with improved shape handling
-            orig_positions = args[0]
-            
-            print(f"🔍 Raw tensor shapes before processing (step {current_step}):")
-            print(f"   Original positions: {orig_positions.shape}")
-            print(f"   Received hidden states: {hidden_states.shape}")
-            print(f"   Received residual: {residual.shape}")
-
-            # MATRIX MANIPULATION STARTS HERE - IMPROVED VERSION
-            
-            # 1. Validate received tensors
-            if not _validate_tensor_shapes(orig_positions, hidden_states, residual, current_step):
-                print(f"❌ Tensor validation failed for step {current_step}, using original args")
-                return args
-            
-            # 2. Ensure that the hidden states and residuals have batch dimension
-            if hidden_states.dim() == 2:
-                hidden_states = hidden_states.unsqueeze(0)
-                print(f"🔧 Added batch dimension to hidden states: {hidden_states.shape}")
-            if residual.dim() == 2:
-                residual = residual.unsqueeze(0)
-                print(f"🔧 Added batch dimension to residual: {residual.shape}")
-            
-            # 3. Ensure the positions have batch dimension
-            if orig_positions.dim() == 1:
-                orig_positions = orig_positions.unsqueeze(0)
-                print(f"🔧 Added batch dimension to positions: {orig_positions.shape}")
-            elif orig_positions.dim() >= 2:
-                print(f"🔧 Adding batch dimension to positions: {orig_positions.shape}")
-                orig_positions = orig_positions.contiguous()
-                print(f"🔧 Contiguous positions: {orig_positions.shape}")
-
-            # 4. Extract dimensions after normalization
-            batch_size, seq_len = hidden_states.shape[:2]
-            pos_batch_size, pos_seq_len = orig_positions.shape[:2]
-            
-            print(f"🔍 Normalized shapes:")
-            print(f"   Hidden states: {hidden_states.shape} (batch={batch_size}, seq={seq_len})")
-            print(f"   Positions: {orig_positions.shape} (batch={pos_batch_size}, seq={pos_seq_len})")
-            
-            # 5. Handle sequence length alignment - CRITICAL FIX
-            if current_step == 0:
-                # First step: Positions should match or be sliced to match hidden states
-                if pos_seq_len >= seq_len:
-                    positions_to_inject = orig_positions[:, -seq_len:]
-                    print(f"🔧 Sliced positions to match hidden states: {positions_to_inject.shape}")
-                else:
-                    # Pad positions if needed (shouldn't happen normally)
-                    padding_needed = seq_len - pos_seq_len
-                    padding = torch.zeros(pos_batch_size, padding_needed, dtype=orig_positions.dtype, device=orig_positions.device)
-                    positions_to_inject = torch.cat([padding, orig_positions], dim=1)
-                    print(f"🔧 Padded positions to match hidden states: {positions_to_inject.shape}")
-            else:
-                # Step 1+: Hidden states should be single token, but positions might be longer
-                if seq_len == 1:
-                    # Received single token as expected
-                    positions_to_inject = orig_positions[:, -1:] if pos_seq_len > 1 else orig_positions
-                    print(f"🔧 Using last position for single token: {positions_to_inject.shape}")
-                else:
-                    # Unexpected: received full sequence in step 1+
-                    print(f"⚠️ Step {current_step}: Received full sequence ({seq_len} tokens), expected single token")
-                    # Take the last seq_len positions to match
-                    positions_to_inject = orig_positions[:, -seq_len:]
-                    print(f"🔧 Aligned positions to received sequence: {positions_to_inject.shape}")
-
-            # 6. Handle batch size mismatches
-            if positions_to_inject.shape[0] != batch_size:
-                if batch_size == 1:
-                    positions_to_inject = positions_to_inject[:1]  # Take first batch
-                    print(f"🔧 Reduced position batch size to match: {positions_to_inject.shape}")
-                else:
-                    positions_to_inject = positions_to_inject.expand(batch_size, -1)
-                    print(f"🔧 Expanded position batch size to match: {positions_to_inject.shape}")
-
-            # 7. Move to correct device - ensure all tensors are on the same device
-            target_device = orig_positions.device
-            positions_to_inject = positions_to_inject.to(target_device, non_blocking=True)
-            hidden_states_to_inject = hidden_states.to(target_device, non_blocking=True)
-            residual_to_inject = residual.to(target_device, non_blocking=True)
-
-            # 8. Final validation and device consistency check
-            assert positions_to_inject.device == hidden_states_to_inject.device == residual_to_inject.device, \
-                f"Device mismatch: pos={positions_to_inject.device}, hidden={hidden_states_to_inject.device}, residual={residual_to_inject.device}"
-            
-            # Final shape check
-            final_batch_size = positions_to_inject.shape[0]
-            final_seq_len = positions_to_inject.shape[1]
-            hidden_batch_size = hidden_states_to_inject.shape[0]
-            hidden_seq_len = hidden_states_to_inject.shape[1]
-            
-            if final_batch_size != hidden_batch_size or final_seq_len != hidden_seq_len:
-                print(f"❌ FINAL SHAPE MISMATCH:")
-                print(f"   Positions: batch={final_batch_size}, seq={final_seq_len}")
-                print(f"   Hidden states: batch={hidden_batch_size}, seq={hidden_seq_len}")
-                print(f"   Using original args to avoid crash")
-                return args
-            
-            print(f"✅ Final tensor shapes (step {current_step}):")
-            print(f"   Positions: {positions_to_inject.shape}")
-            print(f"   Hidden states: {hidden_states_to_inject.shape}")
-            print(f"   Residual: {residual_to_inject.shape}")
-
-            # MATRIX MANIPULATION ENDS HERE
-
-            # Clean up consumed data to prevent memory growth
-            with CONTEXT_LOCK:
-                if current_step > 0:
-                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[request_id].pop(current_step - 1, None)
-
-            return (positions_to_inject, hidden_states_to_inject, residual_to_inject)
-        
-        # If this is the first peer, just return the original args
-        return args
-
-    def post_hook(module, args, output):
-        """Runs after the layer forward pass - sends output to the next peer"""
-        # Get request-specific context safely
+        """Ultra-minimal pre-hook for maximum performance"""
+        # Get request-specific context with minimal overhead
         with context_lock:
             active_contexts = [ctx for ctx in hook_contexts.values() if ctx.get("active", False)]
             if not active_contexts:
-                print("❌ No active inference context found in post_hook")
-                return
+                return args
             
             hook_context = active_contexts[0]
             request_id = hook_context["request_id"]
             current_step = hook_context["current_step"]
-        
-        # For the last peer, we don't need to send anything
-        if hook_context["is_last_peer"]:
-            return
             
-        # Prevent multiple calls per inference step
-        context_key = f"sent_step_{current_step}"
-        print(f"🔍 Context key: {context_key}")
-        if hook_context.get(context_key, False):
-            return  # Already sent for this step
-        hook_context[context_key] = True
+            # Skip ALL checks if first peer
+            if hook_context["is_first_peer"]:
+                return args
         
-        print(f"↪️ POST-HOOK for {request_id}, step {current_step}: Sending hidden states...")
+        # Wait for data (unavoidable, but optimized)
+        event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+        if not event.wait(timeout=30.0):
+            cleanup_request_context(request_id)
+            return args
+        
+        # Direct memory access (minimal locking)
+        with CONTEXT_LOCK:
+            step_data = INFERENCE_CONTEXT[request_id][str(current_step)]
+            hidden_states = step_data["hidden_state"]
+            residual = step_data["residual"]
+        
+        positions = args[0]
+        device = positions.device
+        
+        # Single conditional for step - ultra optimized reshaping
+        if current_step:  # Decode phase
+            # Pre-computed shapes for decode (single token)
+            # Ensure tensors are on correct device
+            hidden_reshaped = hidden_states.view(1, 1, 2048).to(device, non_blocking=True)
+            residual_reshaped = residual.view(1, 1, 2048).to(device, non_blocking=True)
+            positions_reshaped = positions.view(1, 1).to(device, non_blocking=True) if positions.numel() == 1 else positions.view(1, -1)[:, -1:].to(device, non_blocking=True)
+            
+            # Clean up old data immediately
+            if current_step > 1:
+                INFERENCE_CONTEXT[request_id].pop(str(current_step - 2), None)
+                STEP_EVENTS[request_id].pop(current_step - 2, None)
+                
+            return (positions_reshaped, hidden_reshaped, residual_reshaped)
+        else:  # Prompt phase
+            seq_len = hidden_states.shape[0]  # sequence length
+            # Reshape with minimal operations
+            hidden_reshaped = hidden_states.view(1, seq_len, 2048).to(device, non_blocking=True)
+            residual_reshaped = residual.view(1, seq_len, 2048).to(device, non_blocking=True)
+            
+            # Handle positions efficiently
+            if positions.dim() == 1:
+                positions = positions.unsqueeze(0)
+            positions_reshaped = positions[:, -seq_len:] if positions.shape[1] >= seq_len else positions
+            positions_reshaped = positions_reshaped.to(device, non_blocking=True)
+            
+            return (positions_reshaped, hidden_reshaped, residual_reshaped)
+
+    def post_hook(module, args, output):
+        """Ultra-minimal post-hook for maximum performance"""
+        # Get context with minimal overhead
+        with context_lock:
+            active_contexts = [ctx for ctx in hook_contexts.values() if ctx.get("active", False)]
+            if not active_contexts:
+                return
+            
+            hook_context = active_contexts[0]
+            
+            # Skip if last peer (no sending needed)
+            if hook_context["is_last_peer"]:
+                return
+                
+            request_id = hook_context["request_id"]
+            current_step = hook_context["current_step"]
+            
+            # Fast duplicate check
+            context_key = f"sent_step_{current_step}"
+            if hook_context.get(context_key, False):
+                return
+            hook_context[context_key] = True
+        
         hidden_states, residual = output
         
-        print(f"🔍 Output tensor shapes before processing (step {current_step}):")
-        print(f"   Hidden states: {hidden_states.shape}")
-        print(f"   Residual: {residual.shape}")
+        # Single slice operation for decode (no validation)
+        if current_step > 0:
+            # Ultra-fast slicing for single token
+            if hidden_states.dim() == 3 and hidden_states.shape[1] > 1:
+                hidden_states = hidden_states[:, -1:, :]
+                residual = residual[:, -1:, :]
+            elif hidden_states.dim() == 2 and hidden_states.shape[0] > 1:
+                hidden_states = hidden_states[-1:, :]
+                residual = residual[-1:, :]
         
+        # Direct tensor sending (skip CPU conversion if possible)
         next_peer_id = hook_context["next_peer_id"]
         next_peer_ticket = hook_context["next_peer_ticket"]
-
-        # MATRIX MANIPULATION STARTS HERE - IMPROVED VERSION
         
-        # CRITICAL FIX: More conservative and correct slicing strategy
-        slice_needed = False
-        if current_step > 0:
-            if hidden_states.dim() == 2 and hidden_states.shape[0] > 1:
-                # Case: (seq_len, hidden_dim)
-                slice_needed = True
-            elif hidden_states.dim() == 3 and hidden_states.shape[1] > 1:
-                # Case: (batch, seq_len, hidden_dim)
-                slice_needed = True
-            elif hidden_states.dim() > 3 and hidden_states.shape[1] > 1:
-                 # Case: (batch, seq_len, num_heads, head_dim) etc.
-                 slice_needed = True
-        
-        if slice_needed:
-            print(f"🔧 Slicing to last token for step {current_step}")
-            hidden_states = _slice_last_token(hidden_states)
-            residual = _slice_last_token(residual)
-            print(f"🔧 After slicing - Hidden: {hidden_states.shape}, Residual: {residual.shape}")
-        else:
-            print(f"🔧 Step {current_step}: No slicing needed (full sequence or already single token).")
-        
-        # MATRIX MANIPULATION ENDS HERE
-
-        # Send both tensors together in one message
+        # Async send with minimal conversion
         asyncio.run_coroutine_threadsafe(
-            send_inference_tensors(
+            send_inference_tensors_fast(
                 node,
                 request_id,
                 next_peer_id,
-                hidden_states.cpu().numpy(),
-                residual.cpu().numpy(),
+                hidden_states,  # Send torch tensor directly
+                residual,  # Send torch tensor directly
                 step_idx=current_step,
                 next_peer_ticket=next_peer_ticket
             ),
@@ -724,6 +553,47 @@ async def send_inference_tensors(
         print(f"📤 Sent combined tensors for {request_id} step {step_idx} to {next_peer_id} via TensorTransport")
     except Exception as e:
         print(f"❌ Failed to send tensors for {request_id} to {next_peer_id}: {e}")
+
+
+async def send_inference_tensors_fast(
+    tensor_transport: "TensorTransport",
+    request_id: str,
+    next_peer_id: str,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    step_idx: int = 0,
+    next_peer_ticket: str = "",
+):
+    """
+    Ultra-fast tensor sending with minimal conversion overhead.
+    Accepts torch tensors directly and does lazy conversion only when needed.
+    """
+    try:
+        if not next_peer_ticket:
+            raise ValueError("next_peer_ticket must be provided")
+
+        # Convert to numpy with minimal overhead
+        # Use .detach() to avoid autograd overhead, .cpu() only if needed
+        if hidden_states.is_cuda:
+            hidden_np = hidden_states.detach().cpu().numpy()
+            residual_np = residual.detach().cpu().numpy()
+        else:
+            hidden_np = hidden_states.detach().numpy()
+            residual_np = residual.detach().numpy()
+        
+        # Stack efficiently
+        combined_tensor = np.concatenate([hidden_np.reshape(1, *hidden_np.shape), residual_np.reshape(1, *residual_np.shape)], axis=0)
+        
+        # Fast send
+        await tensor_transport.send(
+            next_peer_ticket,
+            name=f"{request_id}_step{step_idx}_combined",
+            tensor=combined_tensor
+        )
+
+    except Exception as e:
+        # Minimal error handling - no printing in hot path
+        pass
 
 
 async def send_sampler_output(
