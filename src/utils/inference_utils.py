@@ -78,6 +78,56 @@ async def send_final_result_to_server(
         print(f"❌ Error sending completion to server: {e}")
 
 
+def create_virtual_sampler_output(request_id: str, step_idx: int) -> Any:
+    """
+    Create a virtual/mock SamplerOutput that satisfies vLLM's expectations
+    for intermediate peers that don't actually need the real sampler state.
+    
+    This is a lightweight placeholder that contains minimal required fields.
+    """
+    try:
+        from vllm.model_executor.layers.sampler import SamplerOutput
+        from vllm.outputs import CompletionSequenceGroupOutput, SequenceOutput
+        from vllm.sequence import Logprob
+        import torch
+        
+        # Create minimal mock SequenceOutput
+        mock_sequence_output = SequenceOutput(
+            parent_seq_id=0,
+            output_token=1,  # Dummy token ID
+            logprobs=None,  # No logprobs needed for intermediate peers
+        )
+        
+        # Create minimal mock CompletionSequenceGroupOutput
+        mock_completion_output = CompletionSequenceGroupOutput(
+            samples=[mock_sequence_output],
+            prompt_logprobs=None,
+        )
+        
+        # Create virtual SamplerOutput with minimal required fields
+        virtual_sampler_output = SamplerOutput(
+            outputs=[mock_completion_output],
+            sampled_token_probs=None,  # Not needed for intermediate peers
+            logprobs=None,  # Not needed for intermediate peers  
+            sampled_token_ids=None,  # Not needed for intermediate peers
+            sampled_token_ids_cpu=None,
+            sampled_token_embeds=None,
+            spec_decode_worker_metrics=None,
+            hidden_states=None,
+            prefill_hidden_states=None,
+            model_forward_time=None,
+            model_execute_time=None,
+        )
+        
+        print(f"🎭 Created virtual SamplerOutput for intermediate peer (request: {request_id}, step: {step_idx})")
+        return virtual_sampler_output
+        
+    except Exception as e:
+        print(f"❌ Failed to create virtual SamplerOutput: {e}")
+        # Fallback: return None and let the system handle it
+        return None
+
+
 def register_inference_hooks(
     llm:"LLM",
     node: TensorTransport,
@@ -411,22 +461,26 @@ def register_inference_hooks(
             sampler_output_bytes = pickle.dumps(output)
             sampler_output_np = np.frombuffer(sampler_output_bytes, dtype=np.uint8)
             
-            # Send to all OTHER peers (not ourselves)
-            for peer_ticket in pipeline:
-                if peer_ticket != peer_id:
-                    asyncio.run_coroutine_threadsafe(
-                        send_sampler_output(
-                            node,
-                            request_id,
-                            peer_ticket,
-                            sampler_output_np,
-                            step_idx=current_step,
-                            next_peer_ticket=peer_ticket
-                        ),
-                        main_loop
-                    )
+            # 🚀 OPTIMIZATION: Only send to FIRST peer instead of all peers
+            # Find the first peer in the pipeline
+            first_peer_ticket = pipeline[0] if pipeline else None
             
-            print(f"📢 Last peer sent sampler output to all peers for step {current_step}")
+            if first_peer_ticket and first_peer_ticket != peer_id:
+                print(f"📤 Sending sampler output ONLY to FIRST peer: {first_peer_ticket[:8]}...")
+                asyncio.run_coroutine_threadsafe(
+                    send_sampler_output(
+                        node,
+                        request_id,
+                        first_peer_ticket,
+                        sampler_output_np,
+                        step_idx=current_step,
+                        next_peer_ticket=first_peer_ticket
+                    ),
+                    main_loop
+                )
+                print(f"✅ Optimized: Sent sampler output only to FIRST peer (not {len(pipeline)-1} peers)")
+            else:
+                print(f"⚠️ No valid first peer found or first peer is self")
             
             # Increment step for last peer too
             with context_lock:
@@ -440,32 +494,76 @@ def register_inference_hooks(
                 
             return output
         else:
-            # Non-last peer: wait for sampler output
-            print(f"⏳ Non-last peer waiting for sampler output for step {current_step}")
+            # Non-last peer: Use virtual sampler output instead of waiting
+            print(f"🎭 Non-last peer using VIRTUAL sampler output for step {current_step}")
             
-            # Wait for sampler output using threading.Event
-            event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+            # Determine if this peer is the first peer (needs real sampler state)
+            peer_position = pipeline.index(peer_id) if peer_id in pipeline else -1
+            is_first_peer_in_pipeline = (peer_position == 0)
             
-            if not event.wait(timeout=30.0):
-                cleanup_request_context(request_id)
-                raise RuntimeError(f"Timeout waiting for sampler output for {request_id} step {current_step}")
-            
-            # Data is ready!
-            with CONTEXT_LOCK:
-                received_output = INFERENCE_CONTEXT[request_id][str(current_step)]["sampler_output"]
-                print(f"✅ Received sampler output for step {current_step}")
-            
-            # Clean up consumed data to prevent memory growth
-            with CONTEXT_LOCK:
-                if current_step > 0:
-                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[request_id].pop(current_step - 1, None)
-            
-            # Increment step after receiving
-            with context_lock:
-                hook_context["current_step"] = current_step + 1
+            if is_first_peer_in_pipeline:
+                # FIRST peer: Wait for real sampler output from last peer
+                print(f"⏳ FIRST peer waiting for REAL sampler output for step {current_step}")
                 
-            return received_output
+                # Wait for sampler output using threading.Event
+                event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+                
+                if not event.wait(timeout=30.0):
+                    cleanup_request_context(request_id)
+                    raise RuntimeError(f"Timeout waiting for sampler output for {request_id} step {current_step}")
+                
+                # Data is ready!
+                with CONTEXT_LOCK:
+                    received_output = INFERENCE_CONTEXT[request_id][str(current_step)]["sampler_output"]
+                    print(f"✅ FIRST peer received REAL sampler output for step {current_step}")
+                
+                # Clean up consumed data to prevent memory growth
+                with CONTEXT_LOCK:
+                    if current_step > 0:
+                        INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                        STEP_EVENTS[request_id].pop(current_step - 1, None)
+                
+                # Increment step after receiving
+                with context_lock:
+                    hook_context["current_step"] = current_step + 1
+                    
+                return received_output
+                
+            else:
+                # INTERMEDIATE peer: Use virtual sampler output (no waiting!)
+                print(f"🚀 INTERMEDIATE peer ({peer_position}) using VIRTUAL sampler output - NO WAITING!")
+                
+                # Create virtual sampler output
+                virtual_output = create_virtual_sampler_output(request_id, current_step)
+                
+                if virtual_output is None:
+                    print(f"⚠️ Failed to create virtual output, falling back to waiting...")
+                    # Fallback to old behavior if virtual creation fails
+                    event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+                    if not event.wait(timeout=30.0):
+                        cleanup_request_context(request_id)
+                        raise RuntimeError(f"Timeout waiting for sampler output for {request_id} step {current_step}")
+                    
+                    with CONTEXT_LOCK:
+                        received_output = INFERENCE_CONTEXT[request_id][str(current_step)]["sampler_output"]
+                        
+                    with context_lock:
+                        hook_context["current_step"] = current_step + 1
+                        
+                    return received_output
+                
+                # Clean up old data to prevent memory growth
+                with CONTEXT_LOCK:
+                    if current_step > 0:
+                        INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                        STEP_EVENTS[request_id].pop(current_step - 1, None)
+                
+                # Increment step immediately (no waiting!)
+                with context_lock:
+                    hook_context["current_step"] = current_step + 1
+                    
+                print(f"✅ INTERMEDIATE peer bypassed sampler wait - performance optimized!")
+                return virtual_output
 
 
     def start_inference_run(request_id: str, pipeline: List[str], input_text: str, sampling_params: Any, assigned_layers: Dict[str, List[int]]):
