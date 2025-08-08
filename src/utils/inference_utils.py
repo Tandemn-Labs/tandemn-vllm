@@ -506,8 +506,16 @@ async def send_hidden_state_tensor(
         if not next_peer_ticket:
             raise ValueError("next_peer_ticket must be provided for tensor transport send.")
 
+        # Calculate payload size
+        payload_size_bytes = data_to_send.nbytes
+        payload_size_mb = payload_size_bytes / (1024 * 1024)
+        
+        tensor_type = 'residual' if is_residual else 'hidden_state'
+        print(f"📊 {tensor_type.capitalize()} tensor payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)")
+        print(f"   - Tensor shape: {data_to_send.shape}, dtype: {data_to_send.dtype}")
+
         # Compose a name for the tensor message
-        tensor_name = f"{request_id}_step{step_idx}_{'residual' if is_residual else 'hidden_state'}"
+        tensor_name = f"{request_id}_step{step_idx}_{tensor_type}"
 
         await tensor_transport.send(
             next_peer_ticket,
@@ -515,7 +523,7 @@ async def send_hidden_state_tensor(
             tensor=data_to_send
         )
 
-        print(f"📤 Sent {'residual' if is_residual else 'hidden_state'} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport")
+        print(f"📤 Sent {tensor_type} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport")
     except Exception as e:
         print(f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}")
 
@@ -540,6 +548,15 @@ async def send_inference_tensors(
         # Stack both tensors together - tensor-iroh handles serialization
         # Format: [hidden_states, residual] concatenated along a new dimension
         combined_tensor = np.stack([hidden_states, residual], axis=0)
+        
+        # Calculate payload size
+        payload_size_bytes = combined_tensor.nbytes
+        payload_size_mb = payload_size_bytes / (1024 * 1024)
+        
+        print(f"📊 Payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)")
+        print(f"   - Hidden states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        print(f"   - Residual shape: {residual.shape}, dtype: {residual.dtype}")
+        print(f"   - Combined tensor shape: {combined_tensor.shape}")
         
         # Compose a name for the tensor message
         tensor_name = f"{request_id}_step{step_idx}_combined"
@@ -584,6 +601,15 @@ async def send_inference_tensors_fast(
         # Stack efficiently
         combined_tensor = np.concatenate([hidden_np.reshape(1, *hidden_np.shape), residual_np.reshape(1, *residual_np.shape)], axis=0)
         
+        # Calculate payload size
+        payload_size_bytes = combined_tensor.nbytes
+        payload_size_mb = payload_size_bytes / (1024 * 1024)
+        
+        print(f"📊 Payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)")
+        print(f"   - Hidden states shape: {hidden_np.shape}, dtype: {hidden_np.dtype}")
+        print(f"   - Residual shape: {residual_np.shape}, dtype: {residual_np.dtype}")
+        print(f"   - Combined tensor shape: {combined_tensor.shape}")
+        
         # Fast send
         await tensor_transport.send(
             next_peer_ticket,
@@ -610,6 +636,13 @@ async def send_sampler_output(
     try:
         if not next_peer_ticket:
             raise ValueError("next_peer_ticket must be provided for tensor transport send.")
+
+        # Calculate payload size
+        payload_size_bytes = sampler_output_bytes.nbytes
+        payload_size_mb = payload_size_bytes / (1024 * 1024)
+        
+        print(f"📊 Sampler output payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)")
+        print(f"   - Sampler output shape: {sampler_output_bytes.shape}, dtype: {sampler_output_bytes.dtype}")
 
         # Compose a name for the tensor message
         tensor_name = f"{request_id}_step{step_idx}_sampler_output"
