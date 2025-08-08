@@ -4,6 +4,8 @@ from typing import Any, Dict, Optional
 
 # The wheel you built with build_pyo3_bindings.sh
 import tensor_iroh as tp  
+import numpy as np                         # local import to avoid hard dep
+import torch
 
 
 class TensorTransport:
@@ -51,8 +53,6 @@ class TensorTransport:
         name      – any identifier (not used by the protocol itself)
         tensor    – torch.Tensor or numpy.ndarray
         """
-        import numpy as np                         # local import to avoid hard dep
-        import torch
 
         if self._node is None:
             raise RuntimeError("TensorTransport.start() not called")
@@ -69,32 +69,22 @@ class TensorTransport:
 
     async def recv(self) -> Optional[Dict[str, Any]]:
         """
-        Blocks until *any* tensor arrives.
-        Returns: {"name": str, "tensor": torch.Tensor} or None if no tensor available
+        Block until any tensor arrives (non-polling).
+        Returns: {"name": str, "tensor": torch.Tensor}
         """
-        import numpy as np
-        import torch
 
         if self._node is None:
             raise RuntimeError("TensorTransport.start() not called")
 
-        # Receive tensor data - returns None if no tensor available, or (name, data) tuple
-        result = await self._node.receive_tensor()
-        
-        if result is None:
-            return None
-        # Check if we got a tuple (name, data) or just data
-        if isinstance(result, tuple) and len(result) == 2:
-            name, pdata = result
-        else:
-            # Fallback for old API - assume result is just the data
-            name = "unknown"
-            pdata = result
-            
-        if pdata is None:
-            return None
-            
-        arr = np.frombuffer(pdata.as_bytes(), dtype=pdata.dtype).reshape(pdata.shape)
+        # New API: wait until a tensor arrives, do not poll
+        name, pdata = await self._node.wait_for_tensor()
+
+        # Construct numpy array from received bytes and take ownership of buffer
+        arr = (
+            np.frombuffer(pdata.as_bytes(), dtype=pdata.dtype)
+            .reshape(pdata.shape)
+            .copy()
+        )
         return {"name": name, "tensor": torch.from_numpy(arr)}
 
     # -------- diagnostics -------------------------------------------------
