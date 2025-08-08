@@ -327,7 +327,7 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
             load_format="dummy",     # ← this is the magic flag
             dtype="float16",
             # adding chunked prefill options
-            enable_chunked_prefill=True,
+            enable_chunked_prefill=False,
             max_num_batched_tokens=1024
         )
         

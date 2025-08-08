@@ -51,7 +51,7 @@ from src.utils.model_utils import (
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandemn Server")
 
-SERVER_IP = "172.16.1.249"
+SERVER_IP = "192.168.1.69"
 # Global Variables for Iroh Node and Gossip Management
 
 # IROH STARTS HERE
@@ -835,21 +835,25 @@ async def deploy_model(request: ModelDeploymentRequest):
             "completion_status": {pid: "pending" for pid in deployment_instructions.keys()},
         })
         # 6. Send deployment instructions to each peer via Iroh
+        send_tasks = []
+        peer_ids = []
         for peer_id, instructions in deployment_instructions.items():
-            try:
-                payload_dict = {
-                    "action": "deploy_model",
-                    "target_peer_id": peer_id,  # fix this if needed
-                    "instructions": instructions
-                }
-                payload_bytes = json.dumps(payload_dict).encode()
-                payload = np.frombuffer(payload_bytes, dtype=np.uint8)
+            payload_dict = {
+                "action": "deploy_model",
+                "target_peer_id": peer_id,  # fix this if needed
+                "instructions": instructions
+            }
+            payload_bytes = json.dumps(payload_dict).encode()
+            payload = np.frombuffer(payload_bytes, dtype=np.uint8)
+            peer_ids.append(peer_id)
+            send_tasks.append(asyncio.create_task(tensor_transport.send(peer_id, "deploy", payload)))
 
-                await tensor_transport.send(peer_id, "deploy", payload)
-
+        results = await asyncio.gather(*send_tasks, return_exceptions=True)
+        for peer_id, result in zip(peer_ids, results):
+            if isinstance(result, Exception):
+                print(f"❌ Failed to send instructions to {peer_id}: {result}")
+            else:
                 print(f"📤 Sent deployment instructions to {peer_id}")
-            except Exception as e:
-                print(f"❌ Failed to send instructions to {peer_id}: {e}")
         # IROH ENDS HERE
         print(f"✅ Deployment initiated for {request.model_name}")
         print(f"📊 Distribution: {len(deployment_instructions)} peers")
@@ -1020,10 +1024,17 @@ async def infer(request: InferenceRequest):
     instruction_payload = json.dumps(inference_payload).encode()
     instruction_payload = np.frombuffer(instruction_payload, dtype=np.uint8)
 
-    #5. Broadcast the instruction payload to ALL peers in the pipeline
-    for peer_ticket in pipeline:
-        await tensor_transport.send(peer_ticket, "inference", instruction_payload)
-        print(f"📤 Sent inference trigger to peer: {peer_ticket[:8]}...")
+    #5. Broadcast the instruction payload to ALL peers in the pipeline concurrently
+    trigger_tasks = [
+        asyncio.create_task(tensor_transport.send(peer_ticket, "inference", instruction_payload))
+        for peer_ticket in pipeline
+    ]
+    trigger_results = await asyncio.gather(*trigger_tasks, return_exceptions=True)
+    for peer_ticket, res in zip(pipeline, trigger_results):
+        if isinstance(res, Exception):
+            print(f"❌ Failed to send inference trigger to peer: {peer_ticket[:8]}... ({res})")
+        else:
+            print(f"📤 Sent inference trigger to peer: {peer_ticket[:8]}...")
 
     print(f"🚀 Inference {request_id} started for model {request.model_name}")
     return InferenceResponse(
