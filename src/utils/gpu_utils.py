@@ -105,12 +105,13 @@ def get_gpu_info() -> List[GPUInfo]:
 def get_system_metrics() -> SystemMetrics:
     """
     Get comprehensive system metrics including CPU, RAM, and GPU information.
-    
+
     Returns:
         SystemMetrics object containing all system metrics
     """
+    # Use non-blocking CPU measurement; first call may return 0.0 (acceptable)
     return SystemMetrics(
-        cpu_percent=psutil.cpu_percent(interval=1),
+        cpu_percent=psutil.cpu_percent(interval=None),
         ram_percent=psutil.virtual_memory().percent,
         gpu_info=get_gpu_info(),
         timestamp=datetime.utcnow()
@@ -119,7 +120,7 @@ def get_system_metrics() -> SystemMetrics:
 def get_total_free_vram() -> float:
     """
     Calculate total free VRAM across all GPUs.
-    
+
     Returns:
         Total free VRAM in GB
     """
@@ -131,10 +132,10 @@ def get_total_free_vram() -> float:
 def format_metrics_for_db(metrics: SystemMetrics) -> Dict[str, Any]:
     """
     Format system metrics for database storage.
-    
+
     Args:
         metrics: SystemMetrics object
-        
+
     Returns:
         Dictionary formatted for MongoDB storage
     """
@@ -152,6 +153,7 @@ def format_metrics_for_db(metrics: SystemMetrics) -> Dict[str, Any]:
             }
             for gpu in metrics.gpu_info
         ],
-        "total_free_vram_gb": get_total_free_vram(),
+        # Avoid an extra NVML pass; compute from provided metrics
+        "total_free_vram_gb": round(sum(g.free_vram_gb for g in metrics.gpu_info), 2),
         "timestamp": metrics.timestamp
     } 
