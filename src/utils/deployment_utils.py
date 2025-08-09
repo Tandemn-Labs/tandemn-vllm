@@ -4,7 +4,7 @@ import asyncio
 import httpx
 import aiofiles
 import torch
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from fastapi import HTTPException
 from src.utils.db_utils import get_active_peers, get_peer_metrics
 from src.utils.model_utils import distribute_layers_across_peers
@@ -41,35 +41,35 @@ async def get_peers_with_vram():
     print(f"👥 Found {len(peers_vram)} peers with VRAM data")
     return peers_vram
 
-def create_distribution_plan(metadata, peers_vram):
-            config = {
-                "num_hidden_layers": metadata['num_layers'],
-                "hidden_size": metadata['hidden_size'],
-                "vocab_size": 32000,  # Default for demo
-                "num_attention_heads": 32,  # Default for demo  
-                "num_key_value_heads": 32,  # Default for demo
-                "intermediate_size": metadata['hidden_size'] * 4,  # Standard ratio
-            }
-            
-            distribution_plan = distribute_layers_across_peers(
-                config=config,
-                peers_vram=peers_vram,
-                q_bits=32  # Default quantization, for testing for now
-            )
-            print(f"📋 Distribution plan created:")
-            print(f"   • Model can fit: {distribution_plan['can_fit_model']}")
-            print(f"   • Total VRAM needed: {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB")
-            print(f"   • Available VRAM: {distribution_plan['total_available_vram_gb']:.1f}GB")
-            print(f"   • Peers involved: {len(distribution_plan['distribution'])}")
-            for peer_id, peer_info in distribution_plan['distribution'].items():
-                print(f"   • {peer_id}: {peer_info['assigned_layers']} layers, {peer_info['estimated_vram_usage']:.1f}GB")
+def create_distribution_plan(metadata, peers_vram, q_bits: int = 32):
+    config = {
+        "num_hidden_layers": metadata['num_layers'],
+        "hidden_size": metadata['hidden_size'],
+        "vocab_size": 32000,  # Default for demo
+        "num_attention_heads": 32,  # Default for demo  
+        "num_key_value_heads": 32,  # Default for demo
+        "intermediate_size": metadata['hidden_size'] * 4,  # Standard ratio
+    }
+    
+    distribution_plan = distribute_layers_across_peers(
+        config=config,
+        peers_vram=peers_vram,
+        q_bits=q_bits  # Allow caller to choose precision for VRAM estimate
+    )
+    print(f"📋 Distribution plan created:")
+    print(f"   • Model can fit: {distribution_plan['can_fit_model']}")
+    print(f"   • Total VRAM needed: {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB")
+    print(f"   • Available VRAM: {distribution_plan['total_available_vram_gb']:.1f}GB")
+    print(f"   • Peers involved: {len(distribution_plan['distribution'])}")
+    for peer_id, peer_info in distribution_plan['distribution'].items():
+        print(f"   • {peer_id}: {peer_info['assigned_layers']} layers, {peer_info['estimated_vram_usage']:.1f}GB")
 
-            if not distribution_plan["can_fit_model"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Model cannot fit in available VRAM. Need {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB, have {distribution_plan['total_available_vram_gb']:.1f}GB"
-                )
-            return distribution_plan
+    if not distribution_plan["can_fit_model"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model cannot fit in available VRAM. Need {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB, have {distribution_plan['total_available_vram_gb']:.1f}GB"
+        )
+    return distribution_plan
 
 # The distribution_plan returned by distribute_layers_across_peers looks like this:
 #
@@ -99,62 +99,60 @@ def create_distribution_plan(metadata, peers_vram):
 #     "total_available_vram_gb": float           # Total VRAM available across all peers (GB)
 # }
 
-
 def create_deployment_instructions(request, distribution_plan, peer_table, SERVER_IP):
-            """
-            Create deployment instructions for each peer based on the distribution plan.
-            """
-            deployment_instructions = {}
-            peer_list = list(distribution_plan["distribution"].keys())
+    """
+    Create deployment instructions for each peer based on the distribution plan.
+    Includes optional quantization, dtype and qbits to control vLLM init.
+    """
+    deployment_instructions = {}
+    peer_list = list(distribution_plan["distribution"].keys())
+    
+    for i, (peer_id, peer_info) in enumerate(distribution_plan["distribution"].items()):
+        is_first_peer = (i == 0)
+        is_last_peer = (i == len(peer_list) - 1)
+        
+        assigned_layers = list(range(
+            sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i]),
+            sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i+1])
+        ))
+
+        required_files = []
+        required_files.extend([
+            "config/config.json",
+            "config/tokenizer.json", 
+            "config/tokenizer_config.json",
+        ])
+        
+        if is_first_peer:
+            required_files.append("embedding/layer.safetensors")
             
-            for i, (peer_id, peer_info) in enumerate(distribution_plan["distribution"].items()):
-                is_first_peer = (i == 0)
-                is_last_peer = (i == len(peer_list) - 1)
-                
-                assigned_layers = list(range(
-                    sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i]),
-                    sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i+1])
-                ))
+        if is_last_peer:
+            required_files.extend([
+                "lm_head/layer.safetensors",
+                "norm/layer.safetensors"
+            ])
+        
+        for layer_idx in assigned_layers:
+            required_files.append(f"layers/layer_{layer_idx}.safetensors")
+        
+        next_peer_ticket = peer_list[i + 1] if (i + 1) < len(peer_list) else None
 
-                # Determine required files based on peer position
-                required_files = []
-                
-                # Config files (all peers need these)
-                required_files.extend([
-                    "config/config.json",
-                    "config/tokenizer.json", 
-                    "config/tokenizer_config.json",
-                ])
-                
-                # Essential components based on position
-                if is_first_peer:
-                    required_files.append("embedding/layer.safetensors")
-                    
-                if is_last_peer:
-                    required_files.extend([
-                        "lm_head/layer.safetensors",
-                        "norm/layer.safetensors"
-                    ])
-                
-                # Assigned layer files
-                for layer_idx in assigned_layers:
-                    required_files.append(f"layers/layer_{layer_idx}.safetensors")
-                
-                # Determine the next peer's ID and address (if any)
-                next_peer_ticket = peer_list[i + 1] if (i + 1) < len(peer_list) else None
-
-                deployment_instructions[peer_id] = {
-                    "model_name": request.model_name,
-                    "assigned_layers": assigned_layers,
-                    "is_first_peer": is_first_peer,
-                    "is_last_peer": is_last_peer,
-                    "required_files": required_files,
-                    "server_download_url": f"http://{SERVER_IP}:8000/download_file/{request.model_name.replace('/', '_')}", #TODO: change to server ip
-                    "vram_allocation": peer_info,
-                    "next_peer_ticket": next_peer_ticket,
-                    "pipeline": peer_list
-                }
-            return deployment_instructions
+        deployment_instructions[peer_id] = {
+            "model_name": request.model_name,
+            "assigned_layers": assigned_layers,
+            "is_first_peer": is_first_peer,
+            "is_last_peer": is_last_peer,
+            "required_files": required_files,
+            "server_download_url": f"http://{SERVER_IP}:8000/download_file/{request.model_name.replace('/', '_')}",
+            "vram_allocation": peer_info,
+            "next_peer_ticket": next_peer_ticket,
+            "pipeline": peer_list,
+            # NEW: thread quantization/dtype/qbits end-to-end (optional)
+            "quantization": getattr(request, "quantization", None),
+            "dtype": getattr(request, "dtype", None),
+            "qbits": getattr(request, "qbits", None),
+        }
+    return deployment_instructions
 
 
 # ============================================================================
@@ -272,16 +270,17 @@ async def download_model_files(instructions: Dict[str, Any]) -> tuple[bool, Path
 # MODEL LOADING FUNCTIONS
 # ============================================================================
 
-def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
+def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
+                              quantization: Optional[str] = None,
+                              dtype: Optional[str] = None):
     """
     Create vLLM model with only assigned layers loaded by monkey-patching make_layers.
-    
+
     Args:
         model_dir: Directory containing model files
         assigned_layers: List of layer indices to load
-        
-    Returns:
-        LLM: vLLM model instance with selective layers
+        quantization: Optional vLLM quantization method (e.g., "bitsandbytes", "awq", "gptq")
+        dtype: Optional dtype for activations/weights ("float16", "bfloat16", "float32", "auto")
     """
     
     # STEP 1: Monkey-patch vLLM's make_layers function (Prime Intellect's key insight)
@@ -325,14 +324,13 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
             gpu_memory_utilization=0.8,  # Use much less memory
             use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
             load_format="dummy",     # ← this is the magic flag
-            dtype="float16",
-            # adding chunked prefill options
-            enable_chunked_prefill=False,
-            max_num_batched_tokens=1024
+            dtype=(dtype or "float16"),
+            quantization=quantization  # vLLM will select kernels/flows accordingly
         )
         
         print(f"✅ Successfully created vLLM model with selective layers!")
         print(f"   Our monkey-patch created real layers for: {assigned_layers}")
+        print(f"   Quantization: {quantization} | dtype: {dtype or 'float16'}")
         print(f"   All other layers are PPMissingLayer (passthrough)")
         
         return llm
@@ -342,13 +340,18 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int]):
         model_utils.make_layers = original_make_layers
 
 
-async def load_model_with_selective_layers(model_dir: Path, assigned_layers: List[int]):
+async def load_model_with_selective_layers(model_dir: Path,
+                                           assigned_layers: List[int],
+                                           quantization: Optional[str] = None,
+                                           dtype: Optional[str] = None):
     """
     Load vLLM model with selective layers in a background thread.
     
     Args:
         model_dir: Path to model directory
         assigned_layers: List of layer indices to load
+        quantization: Optional vLLM quantization method (e.g., "bitsandbytes", "awq", "gptq")
+        dtype: Optional dtype for activations/weights ("float16", "bfloat16", "float32", "auto")
         
     Returns:
         LLM: Loaded vLLM model instance
@@ -365,7 +368,6 @@ async def load_model_with_selective_layers(model_dir: Path, assigned_layers: Lis
         print("🔧 Loading model with selective layers...")
         print("Loading only a partial model for vLLM Inference")
 
-        # Run the blocking operation in a background thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
         
         loaded_model = await loop.run_in_executor(
@@ -373,6 +375,8 @@ async def load_model_with_selective_layers(model_dir: Path, assigned_layers: Lis
             create_dynamic_vllm_model,
             str(config_dir),
             assigned_layers,
+            quantization,
+            dtype,
         )
 
         if loaded_model is None:
@@ -464,6 +468,8 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
     """
     model_name = instructions.get('model_name', 'unknown')
     assigned_layers = instructions.get('assigned_layers', [])
+    quantization = instructions.get('quantization')  # e.g. "bitsandbytes", "awq", "gptq"
+    dtype = instructions.get('dtype')  # e.g. "bfloat16", "float16", "auto"
     
     print(f"🚀 Starting model deployment orchestration...")
     print(f"   Model: {model_name}")
@@ -471,7 +477,8 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
     print(f"   Is first peer: {instructions.get('is_first_peer', False)}")
     print(f"   Is last peer: {instructions.get('is_last_peer', False)}")
     print(f"   Required files: {len(instructions.get('required_files', []))}")
-    
+    print(f"   Quantization: {quantization} | dtype: {dtype}")
+
     # Check deployment attempts
     if not deployment_tracker.should_attempt_deployment(model_name, assigned_layers):
         print(f"❌ Maximum deployment attempts reached for {model_name}, giving up")
@@ -491,7 +498,12 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
         # Phase 2: Load model with selective layers
         print("🔧 Phase 2: Loading model with selective layers...")
         try:
-            loaded_model = await load_model_with_selective_layers(model_dir, assigned_layers)
+            loaded_model = await load_model_with_selective_layers(
+                model_dir,
+                assigned_layers,
+                quantization=quantization,
+                dtype=dtype,
+            )
         except ValueError as e:
             print(f"❌ Model loading phase failed: {e}")
             return False, None
@@ -502,7 +514,7 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
         print(f"✅ Model deployment orchestration completed successfully!")
         print(f"   Peer role: {'First' if instructions.get('is_first_peer') else 'Last' if instructions.get('is_last_peer') else 'Middle'}")
         print(f"   Loaded layers: {assigned_layers}")
-        print(f"   Memory optimization: ~{100 * (28 - len(assigned_layers)) / 28:.1f}% VRAM savings")
+        # memory saving is rough / unchanged here
         
         return True, loaded_model
         
