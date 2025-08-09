@@ -238,7 +238,7 @@ async def unified_message_gateway():
             # Single point of message reception
             msg = await tensor_transport.recv()
             if msg is None:
-                # await asyncio.sleep(0.00001)
+                await asyncio.sleep(0)
                 continue
                 
             # Get message metadata
@@ -635,9 +635,11 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
     async with httpx.AsyncClient(timeout=2.0) as client:
         while True:
             try:
-                metrics = get_system_metrics()
+                # Offload potentially blocking metrics collection
+                metrics = await asyncio.to_thread(get_system_metrics)
                 metrics_dict = format_metrics_for_db(metrics)
                 total_free_vram = metrics_dict["total_free_vram_gb"]
+
                 payload = {
                     "peer_id": current_peer_ticket,
                     **{k: v for k, v in metrics_dict.items() if k != "timestamp"},
