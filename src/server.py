@@ -51,7 +51,7 @@ from src.utils.model_utils import (
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandemn Server")
 
-SERVER_IP = "192.168.1.69"
+SERVER_IP = "172.16.1.249"
 # Global Variables for Iroh Node and Gossip Management
 
 # IROH STARTS HERE
@@ -128,6 +128,10 @@ class ModelShardingSafetensorsRequest(BaseModel):
 class ModelDeploymentRequest(BaseModel):
     model_name: str
     shard_folder: str
+    # NEW: optional quantization settings to minimize code changes
+    quantization: Optional[str] = None  # e.g. "bitsandbytes", "awq", "gptq"
+    qbits: Optional[int] = None         # e.g. 4 or 8 for VRAM plan
+    dtype: Optional[str] = None         # e.g. "bfloat16", "float16", "auto"
 
 
 @app.on_event("startup")
@@ -824,8 +828,9 @@ async def deploy_model(request: ModelDeploymentRequest):
         metadata = load_model_metadata(request.shard_folder)
         # 2. Get active peers and their VRAM availability
         peers_vram = await get_peers_with_vram()
-        # 3. Create distribution plan using existing logic
-        distribution_plan = create_distribution_plan(metadata, peers_vram)
+        # 3. Create distribution plan (respect optional qbits)
+        qbits_for_plan = request.qbits if request.qbits is not None else DEFAULT_QBITS
+        distribution_plan = create_distribution_plan(metadata, peers_vram, q_bits=qbits_for_plan)
         # 4. Create optimized deployment instructions for each peer
         deployment_instructions = create_deployment_instructions(request, distribution_plan, peer_table, SERVER_IP)
         # 5. Persist deployment tracking information BEFORE broadcasting
