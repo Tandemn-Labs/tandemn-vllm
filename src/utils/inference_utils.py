@@ -458,6 +458,11 @@ def register_inference_hooks(
         # Generate unique execution ID to avoid collisions
         execution_id = str(uuid.uuid4())[:8]
         
+        # Predefine hook handles for safe, idempotent cleanup
+        pre_hook_handle = None
+        post_hook_handle = None
+        sampler_hook_handle = None
+        
         try:
             # Determine this peer's position in the pipeline
             idx = pipeline.index(peer_id)
@@ -533,10 +538,6 @@ def register_inference_hooks(
                 except Exception as e:
                     print(f"❌ Failed to schedule send_final_result_to_server: {e}")
 
-            # Clean up hooks
-            pre_hook_handle.remove()
-            post_hook_handle.remove()
-            sampler_hook_handle.remove()
             print(f"🎉 Inference run completed for {request_id}")
             
         except Exception as e:
@@ -544,13 +545,37 @@ def register_inference_hooks(
             import traceback
             traceback.print_exc()
         finally:
-            # Always clean up context and request data
+            # Mark context inactive early to avoid further hook activity for this execution
             with context_lock:
                 if execution_id in hook_contexts:
                     hook_contexts[execution_id]["active"] = False
-                    del hook_contexts[execution_id]
+            
+            # Always clean up hooks idempotently, even on error/early exit
+            try:
+                if pre_hook_handle is not None:
+                    try:
+                        pre_hook_handle.remove()
+                    except Exception:
+                        pass
+                if post_hook_handle is not None:
+                    try:
+                        post_hook_handle.remove()
+                    except Exception:
+                        pass
+                if sampler_hook_handle is not None:
+                    try:
+                        sampler_hook_handle.remove()
+                    except Exception:
+                        pass
+            finally:
+                # Remove context entry now that hooks are torn down
+                with context_lock:
+                    if execution_id in hook_contexts:
+                        del hook_contexts[execution_id]
+            
+            # Always clean up per-request transport/context
             cleanup_request_context(request_id)
-        
+            
         return
     
     # return the start_inference_run function
