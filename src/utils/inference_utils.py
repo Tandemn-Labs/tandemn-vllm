@@ -148,6 +148,53 @@ def register_inference_hooks(
     hook_contexts = {}  # Per-request context storage
     context_lock = threading.RLock()
 
+    # Discover hidden/vocab sizes from model config or layers where possible
+    def get_model_hidden_size() -> Optional[int]:
+        try:
+            # Try common config locations
+            cfg = getattr(model, "config", None)
+            if cfg is not None and hasattr(cfg, "hidden_size"):
+                return int(getattr(cfg, "hidden_size"))
+            inner_model = getattr(model, "model", None)
+            if inner_model is not None:
+                cfg = getattr(inner_model, "config", None)
+                if cfg is not None and hasattr(cfg, "hidden_size"):
+                    return int(getattr(cfg, "hidden_size"))
+                # Heuristic via first layer weights
+                layers = getattr(inner_model, "layers", None)
+                if layers:
+                    first_layer = layers[0]
+                    for attr_path in [
+                        "self_attn.q_proj.weight",
+                        "mlp.gate_proj.weight",
+                        "mlp.up_proj.weight",
+                    ]:
+                        try:
+                            weight = first_layer
+                            for part in attr_path.split("."):
+                                weight = getattr(weight, part)
+                            if hasattr(weight, "shape"):
+                                return int(weight.shape[1])
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+        return None
+
+    def get_model_vocab_size() -> Optional[int]:
+        try:
+            cfg = getattr(model, "config", None)
+            if cfg is not None and hasattr(cfg, "vocab_size"):
+                return int(getattr(cfg, "vocab_size"))
+            inner_model = getattr(model, "model", None)
+            if inner_model is not None:
+                cfg = getattr(inner_model, "config", None)
+                if cfg is not None and hasattr(cfg, "vocab_size"):
+                    return int(getattr(cfg, "vocab_size"))
+        except Exception:
+            pass
+        return None
+
     def pre_hook(module, args):
         """Ultra-minimal pre-hook for maximum performance"""
         # Get request-specific context with minimal overhead
@@ -178,13 +225,24 @@ def register_inference_hooks(
         
         positions = args[0]
         device = positions.device
+
+        # Infer payload hidden size and keep it in context for visibility
+        payload_hidden_size = int(hidden_states.shape[-1])
+        with context_lock:
+            if hook_context.get("hidden_size") is None:
+                hook_context["hidden_size"] = payload_hidden_size
+                print(f"🔧 Inferred hidden size from payload: {payload_hidden_size}")
+            elif hook_context["hidden_size"] != payload_hidden_size:
+                print(
+                    f"⚠️ Hidden size mismatch: model={hook_context['hidden_size']} payload={payload_hidden_size}. Using payload size."
+                )
         
         # Single conditional for step - ultra optimized reshaping
         if current_step:  # Decode phase
             # Pre-computed shapes for decode (single token)
             # Ensure tensors are on correct device
-            hidden_reshaped = hidden_states.view(1, 1, 2048).to(device, non_blocking=True)
-            residual_reshaped = residual.view(1, 1, 2048).to(device, non_blocking=True)
+            hidden_reshaped = hidden_states.view(1, 1, payload_hidden_size).to(device, non_blocking=True)
+            residual_reshaped = residual.view(1, 1, payload_hidden_size).to(device, non_blocking=True)
             positions_reshaped = positions.view(1, 1).to(device, non_blocking=True) if positions.numel() == 1 else positions.view(1, -1)[:, -1:].to(device, non_blocking=True)
             
             # Clean up old data immediately
@@ -196,8 +254,8 @@ def register_inference_hooks(
         else:  # Prompt phase
             seq_len = hidden_states.shape[0]  # sequence length
             # Reshape with minimal operations
-            hidden_reshaped = hidden_states.view(1, seq_len, 2048).to(device, non_blocking=True)
-            residual_reshaped = residual.view(1, seq_len, 2048).to(device, non_blocking=True)
+            hidden_reshaped = hidden_states.view(1, seq_len, payload_hidden_size).to(device, non_blocking=True)
+            residual_reshaped = residual.view(1, seq_len, payload_hidden_size).to(device, non_blocking=True)
             
             # Handle positions efficiently
             if positions.dim() == 1:
@@ -425,7 +483,9 @@ def register_inference_hooks(
                     "next_peer_id": next_peer_id,
                     "next_peer_ticket": next_peer_ticket,
                     "current_step": 0,
-                    "active": True
+                    "active": True,
+                    # pre-seed with model-reported sizes when available
+                    "hidden_size": get_model_hidden_size()
                 }
             
             # Get this peer's assigned layers
@@ -439,6 +499,13 @@ def register_inference_hooks(
             last_layer = real_layers[-1]
             print(f"✅ Dynamically attaching hooks to layers: {first_layer.__class__.__name__} -> {last_layer.__class__.__name__}")
 
+            # Report sizes once for visibility
+            model_hidden = hook_contexts[execution_id].get("hidden_size")
+            if model_hidden is not None:
+                print(f"ℹ️ Model-reported hidden/residual size: {model_hidden}")
+            vocab_size = get_model_vocab_size()
+            if vocab_size is not None:
+                print(f"ℹ️ Model-reported vocab size (sampler): {vocab_size}")
             # Register hooks
             pre_hook_handle = first_layer.register_forward_pre_hook(pre_hook)
             post_hook_handle = last_layer.register_forward_hook(post_hook)
