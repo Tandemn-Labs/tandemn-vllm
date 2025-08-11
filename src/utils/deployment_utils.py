@@ -6,6 +6,7 @@ import aiofiles
 import torch
 from typing import Dict, Any, List, Optional
 from fastapi import HTTPException
+from safetensors import safe_open  # type: ignore
 from src.utils.db_utils import get_active_peers, get_peer_metrics
 from src.utils.model_utils import distribute_layers_across_peers
 
@@ -327,8 +328,98 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
             dtype=(dtype or "float16"),
             quantization=quantization  # vLLM will select kernels/flows accordingly
         )
+
+        # STEP 3: Load weights for assigned layers + essential components (replicating selective_layer_loading_fixed.py)
+        try:
+            # model_dir may be a config/ subfolder; shards root is its parent
+            shards_root = Path(model_dir).resolve().parent
+            
+            # Navigate to underlying torch model
+            model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
+            model = model_runner.model
+            
+            # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
+            all_weights = {}
+            
+            # Helper: load all tensors from a safetensors file
+            def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
+                """Load all tensors from a safetensors file."""
+                tensors = {}
+                if path.exists():
+                    with safe_open(str(path), framework="pt", device="cpu") as f:
+                        for key in f.keys():
+                            tensors[key] = f.get_tensor(key)
+                return tensors
+            
+            # Load embedding (always needed for first peer)
+            embed_path = shards_root / "embedding" / "layer.safetensors"
+            if embed_path.exists():
+                embed_weights = load_safetensors_file(embed_path)
+                all_weights.update(embed_weights)
+                print(f"✅ Loaded embedding weights from {embed_path}")
+            
+            # Load lm_head (always needed for last peer)
+            lm_head_path = shards_root / "lm_head" / "layer.safetensors"
+            if lm_head_path.exists():
+                lm_head_weights = load_safetensors_file(lm_head_path)
+                all_weights.update(lm_head_weights)
+                print(f"✅ Loaded lm_head weights from {lm_head_path}")
+            
+            # Load model.norm (always needed for last peer)
+            norm_path = shards_root / "norm" / "layer.safetensors"
+            if norm_path.exists():
+                norm_weights = load_safetensors_file(norm_path)
+                all_weights.update(norm_weights)
+                print(f"✅ Loaded model.norm weights from {norm_path}")
+            
+            # Load only specified transformer layers
+            for layer_idx in assigned_layers:
+                layer_path = shards_root / "layers" / f"layer_{layer_idx}.safetensors"
+                if layer_path.exists():
+                    layer_weights = load_safetensors_file(layer_path)
+                    all_weights.update(layer_weights)
+                    print(f"✅ Loaded layer {layer_idx} weights from {layer_path}")
+                else:
+                    print(f"⚠️ Warning: Layer {layer_idx} not found at {layer_path}")
+            
+            # STEP 4: Apply the loaded weights to the model (exact replication of selective_layer_loading_fixed.py)
+            print(f"\n🔧 APPLYING LOADED WEIGHTS TO MODEL...")
+            print(f"   Total weights loaded: {len(all_weights)}")
+            
+            applied_count = 0
+            missing_params = []
+            
+            for name, param in model.named_parameters():
+                if name in all_weights:
+                    with torch.no_grad():
+                        param.copy_(all_weights[name].to(param.dtype).to(param.device))
+                        applied_count += 1
+                else:
+                    # Check if this parameter belongs to a layer we should have loaded
+                    is_expected_missing = False
+                    
+                    # Check if it's from an unassigned layer
+                    for i in range(100):  # Assuming max 100 layers
+                        if f".layers.{i}." in name and i not in assigned_layers:
+                            is_expected_missing = True
+                            break
+                    
+                    if not is_expected_missing:
+                        missing_params.append(name)
+            
+            print(f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters")
+            
+            if missing_params and len(missing_params) < 20:  # Only show first 20 to avoid spam
+                print(f"⚠️ Parameters without loaded weights (first 20): {missing_params[:20]}")
+            elif missing_params:
+                print(f"⚠️ {len(missing_params)} parameters without loaded weights (expected for unassigned layers)")
+                
+        except Exception as e:
+            print(f"⚠️ Weight loading/injection failed: {e}")
+            import traceback
+            traceback.print_exc()
         
-        print(f"✅ Successfully created vLLM model with selective layers!")
+        print(f"\n✅ Successfully created vLLM model with selective layers!")
         print(f"   Our monkey-patch created real layers for: {assigned_layers}")
         print(f"   Quantization: {quantization} | dtype: {dtype or 'float16'}")
         print(f"   All other layers are PPMissingLayer (passthrough)")
