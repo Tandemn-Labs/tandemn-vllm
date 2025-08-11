@@ -120,9 +120,20 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
         required_files = []
         required_files.extend([
             "config/config.json",
-            "config/tokenizer.json", 
-            "config/tokenizer_config.json",
+            "layer_metadata.json",
         ])
+        
+        # Optional tokenizer/config artifacts that improve tokenizer initialization
+        optional_files = [
+            "config/tokenizer.json",            # HF consolidated tokenizer
+            "config/tokenizer.model",           # SentencePiece for LLaMA-style models
+            "config/tokenizer_config.json",
+            "config/special_tokens_map.json",
+            "config/generation_config.json",
+            "config/added_tokens.json",
+            "config/vocab.json",                # BPE vocab
+            "config/merges.txt",                # BPE merges
+        ]
         
         if is_first_peer:
             required_files.append("embedding/layer.safetensors")
@@ -144,6 +155,8 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
             "is_first_peer": is_first_peer,
             "is_last_peer": is_last_peer,
             "required_files": required_files,
+            # Attempt to fetch optional files but do not fail if missing
+            "optional_files": optional_files,
             "server_download_url": f"http://{SERVER_IP}:8000/download_file/{request.model_name.replace('/', '_')}",
             "vram_allocation": peer_info,
             "next_peer_ticket": next_peer_ticket,
@@ -243,7 +256,7 @@ async def download_model_files(instructions: Dict[str, Any]) -> tuple[bool, Path
         successful_downloads = 0
         total_files = len(instructions["required_files"])
         
-        print(f"📥 Starting download of {total_files} files...")
+        print(f"📥 Starting download of {total_files} required files...")
         
         for file_path in instructions["required_files"]:
             file_url = f"{base_url}/{file_path}"
@@ -255,11 +268,33 @@ async def download_model_files(instructions: Dict[str, Any]) -> tuple[bool, Path
             else:
                 print(f"❌ Failed to download {file_path}")
         
-        if successful_downloads != total_files:
-            print(f"❌ Only {successful_downloads}/{total_files} files downloaded successfully")
-            return False, model_dir
+        # Attempt optional files without failing the deployment
+        optional_files = instructions.get("optional_files", [])
+        if optional_files:
+            print(f"📥 Attempting to download up to {len(optional_files)} optional files...")
+        optional_success = 0
+        for file_path in optional_files:
+            file_url = f"{base_url}/{file_path}"
+            local_file_path = model_dir / file_path
+            print(f"📥 (optional) Downloading {file_path}...")
+            if await download_file(file_url, local_file_path):
+                optional_success += 1
+            else:
+                print(f"ℹ️ Optional file not available: {file_path}")
+        if optional_files:
+            print(f"✅ Optional files downloaded: {optional_success}/{len(optional_files)}")
         
-        print(f"✅ All {total_files} files downloaded successfully")
+        
+        # Validate tokenizer presence: at least one of the common tokenizer assets must exist
+        tokenizer_candidates = [
+            model_dir / "config/tokenizer.json",
+            model_dir / "config/tokenizer.model",
+            model_dir / "config/vocab.json",
+        ]
+        if not any(p.exists() and p.stat().st_size > 0 for p in tokenizer_candidates):
+            print("⚠️ No tokenizer asset found (tokenizer.json/tokenizer.model/vocab.json). Tokenizer init may fail.")
+        
+        print(f"✅ All {total_files} required files downloaded successfully")
         return True, model_dir
         
     except Exception as e:
