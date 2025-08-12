@@ -19,12 +19,87 @@ from collections import defaultdict
 # Structure: {request_id: {step_idx: {"hidden_state": tensor, "residual": tensor}}}
 INFERENCE_CONTEXT: Dict[str, Dict[str, Any]] = {}
 # the above is just a payload that is sent from one peer to another. 
+#
+# INFERENCE_CONTEXT (what it is and how it is used):
+# ---------------------------------------------------
+# Purpose:
+# - A per-request scratchpad for cross-peer hand-off of intermediate tensors.
+# - It stores step-scoped payloads that allow a downstream stage (peer) to pick
+#   up exactly the right data at exactly the right time.
+#
+# Shape/keys:
+# - Top-level key: request_id (str)
+# - Second-level key: step index (stored as str for consistency with JSON names)
+# - Leaf dict keys:
+#     * "hidden_state": tensor with shape [seq_len, hidden_dim] (prompt) or [1, hidden_dim] (decode)
+#     * "residual": tensor matching the hidden_state shape
+#     * "sampler_output": pickled SamplerOutput (only present on the first peer when the last peer sends it)
+#
+# Producers (writers):
+# - handle_inference_data_message in machine_runner.py
+#     * When receiving "..._combined" messages, it unpacks and writes
+#       {hidden_state, residual} for a specific (request_id, step).
+#     * When receiving "..._sampler_output" messages, it unpickles and writes
+#       {sampler_output} for the (request_id, step) the first peer is waiting on.
+#
+# Consumers (readers):
+# - pre_hook (non-first peers): waits on STEP_EVENTS[req][step], then reads
+#   {hidden_state, residual} to feed its layers.
+# - sampler_post_hook (first peer): waits on STEP_EVENTS_SAMPLER[req][step], then
+#   reads {sampler_output} to continue the engine’s control flow.
+#
+# Synchronization:
+# - Read/writes are protected by CONTEXT_LOCK.
+# - Arrival is coordinated by two distinct event maps:
+#     * STEP_EVENTS → payload (hidden_state/residual) readiness
+#     * STEP_EVENTS_SAMPLER → sampler_output readiness (from last peer)
+#
+# Lifecycle/cleanup:
+# - Per-step garbage collection: once a step is consumed and we advance, we drop
+#   step-1 data to avoid unbounded growth.
+# - Per-request cleanup: cleanup_request_context(request_id) removes the entire
+#   request subtree and both event maps, called on completion or timeout.
+#
+# ========== LOCKING MODEL (READ ME) ==========
+# We use three distinct synchronization primitives to keep concurrency sane:
+#
+# 1) CONTEXT_LOCK (global, RLock):
+#    - Protects access to INFERENCE_CONTEXT and step-event dicts when we create,
+#      read, or delete per-request/step payloads (hidden/residual/sampler_output)
+#    - Use when: storing tensors, reading tensors for a given step, or cleaning up
+#      per-request maps to avoid races with other threads/hooks.
+#
+# 2) context_lock (local to register_inference_hooks, RLock):
+#    - Protects the hook_contexts dict (per-execution request metadata) and any
+#      updates to fields like current_step, active, next_peer_ticket, etc.
+#    - Hooks may run from different threads; this lock ensures we don't read a
+#      partially-updated context or increment steps concurrently.
+#    - RLock (re-entrant) is used to avoid deadlocks when the same thread needs
+#      to re-enter protected sections during nested calls.
+#
+# 3) INFERENCE_MUTEX (global, Lock):
+#    - Serializes start_inference_run per peer. This avoids multiple concurrent
+#      hook contexts being attached at the same time on a single peer, which
+#      previously led to misrouting and timeouts. This is a temporary safety
+#      measure until hooks are made fully request-aware and can run concurrently.
+#
+# Step events (STEP_EVENTS vs STEP_EVENTS_SAMPLER):
+# - STEP_EVENTS: signals arrival of payload tensors (hidden_state/residual)
+# - STEP_EVENTS_SAMPLER: signals arrival of the last peer's sampler output
+# Keeping these separate prevents accidental cross-wakeup (payload setting the
+# sampler wait, or vice versa).
 CONTEXT_LOCK = threading.RLock()  # Thread-safe access to INFERENCE_CONTEXT
 
 # ------------------------------------------------------------------
 #  Per–request / per-step Events that tell a waiting peer "data ready"
 # ------------------------------------------------------------------
+# Backwards-compatible: STEP_EVENTS keeps signaling for hidden/residual tensors
 STEP_EVENTS: Dict[str, Dict[int, threading.Event]] = defaultdict(dict)
+# New: separate event map for sampler outputs to avoid cross-signaling
+STEP_EVENTS_SAMPLER: Dict[str, Dict[int, threading.Event]] = defaultdict(dict)
+
+# Serialize per-peer inference until hooks are made fully request-aware
+INFERENCE_MUTEX = threading.Lock()
 
 
 def cleanup_request_context(request_id: str):
@@ -36,6 +111,9 @@ def cleanup_request_context(request_id: str):
         if request_id in STEP_EVENTS:
             del STEP_EVENTS[request_id]
             print(f"🧹 Cleaned up step events for {request_id}")
+        if request_id in STEP_EVENTS_SAMPLER:
+            del STEP_EVENTS_SAMPLER[request_id]
+            print(f"🧹 Cleaned up sampler step events for {request_id}")
 
 
 async def send_final_result_to_server(
@@ -157,6 +235,9 @@ def register_inference_hooks(
     
     # Thread-safe hook context with locks
     hook_contexts = {}  # Per-request context storage
+    # context_lock protects hook_contexts and all fields inside each context
+    # (request_id, current_step, active, is_first/last, routing info). Hooks
+    # from multiple threads consult and update this state during forward passes.
     context_lock = threading.RLock()
 
     # Discover hidden/vocab sizes from model config or layers where possible
@@ -260,6 +341,7 @@ def register_inference_hooks(
             if current_step > 1:
                 INFERENCE_CONTEXT[request_id].pop(str(current_step - 2), None)
                 STEP_EVENTS[request_id].pop(current_step - 2, None)
+                STEP_EVENTS_SAMPLER[request_id].pop(current_step - 2, None)
                 
             return (positions_reshaped, hidden_reshaped, residual_reshaped)
         else:  # Prompt phase
@@ -389,6 +471,7 @@ def register_inference_hooks(
                 if current_step > 0:
                     INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
                     STEP_EVENTS[request_id].pop(current_step - 1, None)
+                    STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
                 
             return output
         else:
@@ -404,7 +487,7 @@ def register_inference_hooks(
                 print(f"⏳ FIRST peer waiting for REAL sampler output for step {current_step}")
                 
                 # Wait for sampler output using threading.Event
-                event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+                event = STEP_EVENTS_SAMPLER[request_id].setdefault(current_step, threading.Event())
                 
                 if not event.wait(timeout=30.0):
                     cleanup_request_context(request_id)
@@ -420,6 +503,7 @@ def register_inference_hooks(
                     if current_step > 0:
                         INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
                         STEP_EVENTS[request_id].pop(current_step - 1, None)
+                        STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
                 
                 # Increment step after receiving
                 with context_lock:
@@ -437,7 +521,7 @@ def register_inference_hooks(
                 if virtual_output is None:
                     print(f"⚠️ Failed to create virtual output, falling back to waiting...")
                     # Fallback to old behavior if virtual creation fails
-                    event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+                    event = STEP_EVENTS_SAMPLER[request_id].setdefault(current_step, threading.Event())
                     if not event.wait(timeout=30.0):
                         cleanup_request_context(request_id)
                         raise RuntimeError(f"Timeout waiting for sampler output for {request_id} step {current_step}")
@@ -455,6 +539,7 @@ def register_inference_hooks(
                     if current_step > 0:
                         INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
                         STEP_EVENTS[request_id].pop(current_step - 1, None)
+                        STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
                 
                 # Increment step immediately (no waiting!)
                 with context_lock:
@@ -474,136 +559,138 @@ def register_inference_hooks(
         post_hook_handle = None
         sampler_hook_handle = None
         
-        try:
-            # Determine this peer's position in the pipeline
-            idx = pipeline.index(peer_id)
-            is_first = (idx == 0)
-            is_last = (idx == len(pipeline) - 1)
-            
-            # Determine next peer info if not last
-            next_peer_id = None
-            next_peer_ticket = None
-            if not is_last:
-                next_peer_id = pipeline[idx + 1]
-                next_peer_ticket = pipeline[idx + 1]  # In this implementation, peer_id and ticket are the same
-            
-            # Initialize thread-safe context for this request
-            with context_lock:
-                hook_contexts[execution_id] = {
-                    "request_id": request_id,
-                    "pipeline": pipeline,
-                    "input_text": input_text,
-                    "is_first_peer": is_first,
-                    "is_last_peer": is_last,
-                    "peer_id": peer_id,
-                    "next_peer_id": next_peer_id,
-                    "next_peer_ticket": next_peer_ticket,
-                    "current_step": 0,
-                    "active": True,
-                    # pre-seed with model-reported sizes when available
-                    "hidden_size": get_model_hidden_size()
-                }
-            
-            # Get this peer's assigned layers
-            real_layers = [layer for layer in model.model.layers if "PPMissingLayer" not in layer.__class__.__name__]
-            if not real_layers:
-                print(f"⚠️ No real layers detected here. Cannot participate in this inference")
-                return
-            
-            # Attach hooks to first and last real layers
-            first_layer = real_layers[0]
-            last_layer = real_layers[-1]
-            print(f"✅ Dynamically attaching hooks to layers: {first_layer.__class__.__name__} -> {last_layer.__class__.__name__}")
-
-            # Report sizes once for visibility
-            model_hidden = hook_contexts[execution_id].get("hidden_size")
-            if model_hidden is not None:
-                print(f"ℹ️ Model-reported hidden/residual size: {model_hidden}")
-            vocab_size = get_model_vocab_size()
-            if vocab_size is not None:
-                print(f"ℹ️ Model-reported vocab size (sampler): {vocab_size}")
-            # Register hooks
-            pre_hook_handle = first_layer.register_forward_pre_hook(pre_hook)
-            post_hook_handle = last_layer.register_forward_hook(post_hook)
-            sampler_hook_handle = sampler.register_forward_hook(sampler_post_hook)
-
-            print("Starting the inference run...")
-            # Run vLLM inference
-            if hasattr(llm, "engine"):
-                # AsyncLLMEngine (v0): generate is an async generator and requires request_id
-                async def _collect_async_outputs():
-                    last_output = None
-                    async for out in llm.generate(
-                        input_text,  # prompt as string
-                        sampling_params,
-                        request_id,
-                    ):
-                        last_output = out
-                    return last_output
-
-                future = asyncio.run_coroutine_threadsafe(_collect_async_outputs(), main_loop)
-                final_output = future.result()
-                completions = [final_output] if final_output is not None else []
-            else:
-                # Blocking LLM path
-                completions = llm.generate([input_text], sampling_params=sampling_params)
-
-            # If last peer, send final result to server
-            if is_last and completions:
-                comp = completions[0]
-                final_text = comp.outputs[0].text
-                try:
-                    # Use a unique sent flag per request to avoid collisions
-                    request_sent_key = f"final_sent_{request_id}"
-                    with context_lock:
-                        if not hook_contexts[execution_id].get(request_sent_key, False):
-                            hook_contexts[execution_id][request_sent_key] = True
-                            asyncio.run_coroutine_threadsafe(
-                                send_final_result_to_server(request_id, final_text, peer_id, server_url),
-                                main_loop,
-                            )
-                        print(f"🎯 Final result sent for {request_id}")
-                except Exception as e:
-                    print(f"❌ Failed to schedule send_final_result_to_server: {e}")
-
-            print(f"🎉 Inference run completed for {request_id}")
-            
-        except Exception as e:
-            print(f"❌ Error in inference run for {request_id}: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            # Mark context inactive early to avoid further hook activity for this execution
-            with context_lock:
-                if execution_id in hook_contexts:
-                    hook_contexts[execution_id]["active"] = False
-            
-            # Always clean up hooks idempotently, even on error/early exit
+        # Serialize per-peer inference to avoid concurrent hook contexts
+        with INFERENCE_MUTEX:
             try:
-                if pre_hook_handle is not None:
+                # Determine this peer's position in the pipeline
+                idx = pipeline.index(peer_id)
+                is_first = (idx == 0)
+                is_last = (idx == len(pipeline) - 1)
+                
+                # Determine next peer info if not last
+                next_peer_id = None
+                next_peer_ticket = None
+                if not is_last:
+                    next_peer_id = pipeline[idx + 1]
+                    next_peer_ticket = pipeline[idx + 1]  # In this implementation, peer_id and ticket are the same
+                
+                # Initialize thread-safe context for this request
+                with context_lock:
+                    hook_contexts[execution_id] = {
+                        "request_id": request_id,
+                        "pipeline": pipeline,
+                        "input_text": input_text,
+                        "is_first_peer": is_first,
+                        "is_last_peer": is_last,
+                        "peer_id": peer_id,
+                        "next_peer_id": next_peer_id,
+                        "next_peer_ticket": next_peer_ticket,
+                        "current_step": 0,
+                        "active": True,
+                        # pre-seed with model-reported sizes when available
+                        "hidden_size": get_model_hidden_size()
+                    }
+                
+                # Get this peer's assigned layers
+                real_layers = [layer for layer in model.model.layers if "PPMissingLayer" not in layer.__class__.__name__]
+                if not real_layers:
+                    print(f"⚠️ No real layers detected here. Cannot participate in this inference")
+                    return
+                
+                # Attach hooks to first and last real layers
+                first_layer = real_layers[0]
+                last_layer = real_layers[-1]
+                print(f"✅ Dynamically attaching hooks to layers: {first_layer.__class__.__name__} -> {last_layer.__class__.__name__}")
+
+                # Report sizes once for visibility
+                model_hidden = hook_contexts[execution_id].get("hidden_size")
+                if model_hidden is not None:
+                    print(f"ℹ️ Model-reported hidden/residual size: {model_hidden}")
+                vocab_size = get_model_vocab_size()
+                if vocab_size is not None:
+                    print(f"ℹ️ Model-reported vocab size (sampler): {vocab_size}")
+                # Register hooks
+                pre_hook_handle = first_layer.register_forward_pre_hook(pre_hook)
+                post_hook_handle = last_layer.register_forward_hook(post_hook)
+                sampler_hook_handle = sampler.register_forward_hook(sampler_post_hook)
+
+                print("Starting the inference run...")
+                # Run vLLM inference
+                if hasattr(llm, "engine"):
+                    # AsyncLLMEngine (v0): generate is an async generator and requires request_id
+                    async def _collect_async_outputs():
+                        last_output = None
+                        async for out in llm.generate(
+                            input_text,  # prompt as string
+                            sampling_params,
+                            request_id,
+                        ):
+                            last_output = out
+                        return last_output
+
+                    future = asyncio.run_coroutine_threadsafe(_collect_async_outputs(), main_loop)
+                    final_output = future.result()
+                    completions = [final_output] if final_output is not None else []
+                else:
+                    # Blocking LLM path
+                    completions = llm.generate([input_text], sampling_params=sampling_params)
+
+                # If last peer, send final result to server
+                if is_last and completions:
+                    comp = completions[0]
+                    final_text = comp.outputs[0].text
                     try:
-                        pre_hook_handle.remove()
-                    except Exception:
-                        pass
-                if post_hook_handle is not None:
-                    try:
-                        post_hook_handle.remove()
-                    except Exception:
-                        pass
-                if sampler_hook_handle is not None:
-                    try:
-                        sampler_hook_handle.remove()
-                    except Exception:
-                        pass
+                        # Use a unique sent flag per request to avoid collisions
+                        request_sent_key = f"final_sent_{request_id}"
+                        with context_lock:
+                            if not hook_contexts[execution_id].get(request_sent_key, False):
+                                hook_contexts[execution_id][request_sent_key] = True
+                                asyncio.run_coroutine_threadsafe(
+                                    send_final_result_to_server(request_id, final_text, peer_id, server_url),
+                                    main_loop,
+                                )
+                            print(f"🎯 Final result sent for {request_id}")
+                    except Exception as e:
+                        print(f"❌ Failed to schedule send_final_result_to_server: {e}")
+
+                print(f"🎉 Inference run completed for {request_id}")
+                
+            except Exception as e:
+                print(f"❌ Error in inference run for {request_id}: {e}")
+                import traceback
+                traceback.print_exc()
             finally:
-                # Remove context entry now that hooks are torn down
+                # Mark context inactive early to avoid further hook activity for this execution
                 with context_lock:
                     if execution_id in hook_contexts:
-                        del hook_contexts[execution_id]
-            
-            # Always clean up per-request transport/context
-            cleanup_request_context(request_id)
-            
+                        hook_contexts[execution_id]["active"] = False
+                
+                # Always clean up hooks idempotently, even on error/early exit
+                try:
+                    if pre_hook_handle is not None:
+                        try:
+                            pre_hook_handle.remove()
+                        except Exception:
+                            pass
+                    if post_hook_handle is not None:
+                        try:
+                            post_hook_handle.remove()
+                        except Exception:
+                            pass
+                    if sampler_hook_handle is not None:
+                        try:
+                            sampler_hook_handle.remove()
+                        except Exception:
+                            pass
+                finally:
+                    # Remove context entry now that hooks are torn down
+                    with context_lock:
+                        if execution_id in hook_contexts:
+                            del hook_contexts[execution_id]
+                
+                # Always clean up per-request transport/context
+                cleanup_request_context(request_id)
+                
         return
     
     # return the start_inference_run function
