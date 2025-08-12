@@ -9,6 +9,10 @@ from fastapi import HTTPException
 from safetensors import safe_open  # type: ignore
 from src.utils.db_utils import get_active_peers, get_peer_metrics
 from src.utils.model_utils import distribute_layers_across_peers
+from vllm.engine.async_llm_engine import AsyncLLMEngine  # v0 async engine
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.usage.usage_lib import UsageContext
+from functools import partial
 
 def load_model_metadata(shard_folder: str):
     shard_path = Path(shard_folder)
@@ -465,11 +469,115 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
         # Restore original function
         model_utils.make_layers = original_make_layers
 
+def create_async_vllm_engine_with_selective_layers(
+    model_dir: str,
+    assigned_layers: List[int],
+    *,
+    quantization: Optional[str] = None,
+    dtype: Optional[str] = None,
+    max_num_seqs: int = 1,
+    max_num_batched_tokens: int = 2048,
+) -> AsyncLLMEngine:
+    """
+    Create an in-process v0 AsyncLLMEngine with selective layers loaded.
+    Preserves your monkey-patch strategy and manually injects weights.
+    """
+
+    # STEP 1: Monkey-patch make_layers so only assigned layers are real.
+    def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
+        from vllm.model_executor.models.utils import PPMissingLayer, maybe_offload_to_cpu
+        modules = []
+        for i in range(num_hidden_layers):
+            if i in assigned_layers:
+                layer = layer_fn(prefix=f"{prefix}.{i}")
+                modules.append(maybe_offload_to_cpu(layer))
+                print(f"  [Async] Created REAL layer {i}")
+            else:
+                modules.append(PPMissingLayer())
+        return (min(assigned_layers) if assigned_layers else 0,
+                (max(assigned_layers) + 1) if assigned_layers else 0,
+                torch.nn.ModuleList(modules))
+
+    import vllm.model_executor.models.utils as model_utils
+    original_make_layers = model_utils.make_layers
+    model_utils.make_layers = _selective_make_layers
+
+    try:
+        # STEP 2: Build AsyncEngineArgs mirroring your LLM init
+        engine_args = AsyncEngineArgs(
+            model=model_dir,
+            tensor_parallel_size=1,
+            enforce_eager=True,
+            load_format="dummy",
+            disable_log_stats=True,
+            gpu_memory_utilization=0.8,
+            skip_tokenizer_init=False,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            quantization=quantization,
+            dtype=dtype or "float16",
+        )
+
+        # STEP 3: Create AsyncLLMEngine (v0 path, in-process)
+        async_engine = AsyncLLMEngine.from_engine_args(
+            engine_args=engine_args,
+            usage_context=UsageContext.ENGINE_CONTEXT,
+            start_engine_loop=True,
+        )
+
+        # STEP 4: Inject weights into the underlying model
+        shards_root = Path(model_dir).resolve().parent
+        model = async_engine.engine.model_executor.driver_worker.model_runner.model
+
+        def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
+            tensors = {}
+            if path.exists():
+                with safe_open(str(path), framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        tensors[key] = f.get_tensor(key)
+            return tensors
+
+        all_weights: Dict[str, torch.Tensor] = {}
+
+        embed_path = shards_root / "embedding" / "layer.safetensors"
+        if embed_path.exists():
+            all_weights.update(load_safetensors_file(embed_path))
+
+        lm_head_path = shards_root / "lm_head" / "layer.safetensors"
+        if lm_head_path.exists():
+            all_weights.update(load_safetensors_file(lm_head_path))
+
+        norm_path = shards_root / "norm" / "layer.safetensors"
+        if norm_path.exists():
+            all_weights.update(load_safetensors_file(norm_path))
+
+        for layer_idx in assigned_layers:
+            layer_path = shards_root / "layers" / f"layer_{layer_idx}.safetensors"
+            if layer_path.exists():
+                all_weights.update(load_safetensors_file(layer_path))
+
+        applied_count = 0
+        for name, param in model.named_parameters():
+            if name in all_weights:
+                with torch.no_grad():
+                    param.copy_(all_weights[name].to(param.dtype).to(param.device))
+                    applied_count += 1
+        print(f"✅ [Async] Applied weights to {applied_count} parameters")
+
+        print("✅ Created AsyncLLMEngine (v0) with selective layers")
+        return async_engine
+
+    finally:
+        model_utils.make_layers = original_make_layers
 
 async def load_model_with_selective_layers(model_dir: Path,
                                            assigned_layers: List[int],
                                            quantization: Optional[str] = None,
-                                           dtype: Optional[str] = None):
+                                           dtype: Optional[str] = None,
+                                           *,
+                                           use_async_engine: bool = False,
+                                           max_num_seqs: int = 1,
+                                           max_num_batched_tokens: int = 2048):
     """
     Load vLLM model with selective layers in a background thread.
     
@@ -478,9 +586,12 @@ async def load_model_with_selective_layers(model_dir: Path,
         assigned_layers: List of layer indices to load
         quantization: Optional vLLM quantization method (e.g., "bitsandbytes", "awq", "gptq")
         dtype: Optional dtype for activations/weights ("float16", "bfloat16", "float32", "auto")
+        use_async_engine: If True, initialize AsyncLLMEngine (v0) instead of LLM
+        max_num_seqs: Scheduler cap to avoid intra-step mixing (ring-buffer behavior)
+        max_num_batched_tokens: Upper bound on tokens per batch
         
     Returns:
-        LLM: Loaded vLLM model instance
+        Union[LLM, AsyncLLMEngine]: Loaded model/engine instance
         
     Raises:
         ValueError: If model loading fails
@@ -496,14 +607,27 @@ async def load_model_with_selective_layers(model_dir: Path,
 
         loop = asyncio.get_running_loop()
         
-        loaded_model = await loop.run_in_executor(
-            None,
-            create_dynamic_vllm_model,
-            str(config_dir),
-            assigned_layers,
-            quantization,
-            dtype,
-        )
+        if use_async_engine:
+            print("⚙️ Using AsyncLLMEngine (v0) path with scheduler limits for ring-buffer behavior")
+            create_async_engine_fn = partial(
+                create_async_vllm_engine_with_selective_layers,
+                str(config_dir),
+                assigned_layers,
+                quantization=quantization,
+                dtype=dtype,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
+            )
+            loaded_model = await loop.run_in_executor(None, create_async_engine_fn)
+        else:
+            loaded_model = await loop.run_in_executor(
+                None,
+                create_dynamic_vllm_model,
+                str(config_dir),
+                assigned_layers,
+                quantization,
+                dtype,
+            )
 
         if loaded_model is None:
             raise ValueError("Model loading returned None")
@@ -596,6 +720,9 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
     assigned_layers = instructions.get('assigned_layers', [])
     quantization = instructions.get('quantization')  # e.g. "bitsandbytes", "awq", "gptq"
     dtype = instructions.get('dtype')  # e.g. "bfloat16", "float16", "auto"
+    use_async_engine = bool(instructions.get('use_async_engine') or (instructions.get('engine_type') == 'async'))
+    max_num_seqs = int(instructions.get('max_num_seqs', 1))
+    max_num_batched_tokens = int(instructions.get('max_num_batched_tokens', 2048))
     
     print(f"🚀 Starting model deployment orchestration...")
     print(f"   Model: {model_name}")
@@ -604,6 +731,7 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
     print(f"   Is last peer: {instructions.get('is_last_peer', False)}")
     print(f"   Required files: {len(instructions.get('required_files', []))}")
     print(f"   Quantization: {quantization} | dtype: {dtype}")
+    print(f"   Engine: {'AsyncLLMEngine(v0)' if use_async_engine else 'LLM'} | max_num_seqs={max_num_seqs} | max_num_batched_tokens={max_num_batched_tokens}")
 
     # Check deployment attempts
     if not deployment_tracker.should_attempt_deployment(model_name, assigned_layers):
@@ -629,6 +757,9 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
                 assigned_layers,
                 quantization=quantization,
                 dtype=dtype,
+                use_async_engine=use_async_engine,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
             )
         except ValueError as e:
             print(f"❌ Model loading phase failed: {e}")
