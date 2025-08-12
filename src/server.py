@@ -132,6 +132,11 @@ class ModelDeploymentRequest(BaseModel):
     quantization: Optional[str] = None  # e.g. "bitsandbytes", "awq", "gptq"
     qbits: Optional[int] = None         # e.g. 4 or 8 for VRAM plan
     dtype: Optional[str] = None         # e.g. "bfloat16", "float16", "auto"
+    # NEW: optional async engine selection & scheduler tuning
+    engine_type: Optional[str] = None   # "async" to enable v0 AsyncLLMEngine; default None/"llm"
+    use_async_engine: Optional[bool] = None  # alternative toggle; True = async engine
+    max_num_seqs: Optional[int] = None
+    max_num_batched_tokens: Optional[int] = None
 
 
 @app.on_event("startup")
@@ -833,6 +838,17 @@ async def deploy_model(request: ModelDeploymentRequest):
         distribution_plan = create_distribution_plan(metadata, peers_vram, q_bits=qbits_for_plan)
         # 4. Create optimized deployment instructions for each peer
         deployment_instructions = create_deployment_instructions(request, distribution_plan, peer_table, SERVER_IP)
+        # Propagate async engine preferences (if provided) into each peer's instructions
+        if isinstance(request.engine_type, str) or isinstance(request.use_async_engine, bool):
+            for peer_id, instr in deployment_instructions.items():
+                if request.engine_type is not None:
+                    instr["engine_type"] = request.engine_type
+                if request.use_async_engine is not None:
+                    instr["use_async_engine"] = bool(request.use_async_engine)
+                if request.max_num_seqs is not None:
+                    instr["max_num_seqs"] = int(request.max_num_seqs)
+                if request.max_num_batched_tokens is not None:
+                    instr["max_num_batched_tokens"] = int(request.max_num_batched_tokens)
         # 5. Persist deployment tracking information BEFORE broadcasting
         active_deployments[request.model_name].update({
             "instructions_sent_at": time.time(),
