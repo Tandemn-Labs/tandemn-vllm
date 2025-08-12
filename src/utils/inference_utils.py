@@ -528,8 +528,25 @@ def register_inference_hooks(
             sampler_hook_handle = sampler.register_forward_hook(sampler_post_hook)
 
             print("Starting the inference run...")
-            # Run vLLM inference (this is the blocking call)
-            completions = llm.generate([input_text], sampling_params=sampling_params)
+            # Run vLLM inference
+            if hasattr(llm, "engine"):
+                # AsyncLLMEngine (v0): generate is an async generator and requires request_id
+                async def _collect_async_outputs():
+                    last_output = None
+                    async for out in llm.generate(
+                        input_text,  # prompt as string
+                        sampling_params,
+                        request_id,
+                    ):
+                        last_output = out
+                    return last_output
+
+                future = asyncio.run_coroutine_threadsafe(_collect_async_outputs(), main_loop)
+                final_output = future.result()
+                completions = [final_output] if final_output is not None else []
+            else:
+                # Blocking LLM path
+                completions = llm.generate([input_text], sampling_params=sampling_params)
 
             # If last peer, send final result to server
             if is_last and completions:
