@@ -71,6 +71,7 @@ async def send_final_result_to_server(
                 json=completion_data
             )
             if response.status_code == 200:
+                print(f"🔍 Response: {final_text}")
                 print(f"✅ Sent final result to server for request {request_id}")
             else:
                 print(f"❌ Failed to send completion: {response.status_code} - {response.text}")
@@ -140,9 +141,19 @@ def register_inference_hooks(
     Create pre and post hooks for the inference pipeline, to transfer hidden states
     """
     # get the model runner worker, model itself and the sampler
-    model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
-    model=model_runner.model
-    sampler=model_runner.sampler
+    try:
+        if hasattr(llm, "llm_engine"):
+            model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
+        elif hasattr(llm, "engine"):
+            # AsyncLLMEngine (v0) exposes underlying LLMEngine at .engine
+            model_runner = llm.engine.model_executor.driver_worker.model_runner
+        else:
+            raise AttributeError("Unsupported engine object passed to register_inference_hooks")
+    except Exception as e:
+        raise RuntimeError(f"Failed to resolve model_runner from engine: {e}")
+
+    model = model_runner.model
+    sampler = model_runner.sampler
     
     # Thread-safe hook context with locks
     hook_contexts = {}  # Per-request context storage
