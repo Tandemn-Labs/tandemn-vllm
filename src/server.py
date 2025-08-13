@@ -51,7 +51,9 @@ from src.utils.model_utils import (
 # Initialize FastAPI application
 app = FastAPI(title="Iroh Tandemn Server")
 
-SERVER_IP = "172.16.1.249"
+# SERVER_IP = "172.16.1.249"
+SERVER_IP = SERVER_HOST
+
 # Global Variables for Iroh Node and Gossip Management
 
 # IROH STARTS HERE
