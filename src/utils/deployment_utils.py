@@ -509,6 +509,7 @@ def create_async_vllm_engine_with_selective_layers(
             tensor_parallel_size=1,
             enforce_eager=True,
             load_format="dummy",
+            max_model_len=128, # small for demo
             disable_log_stats=True,
             gpu_memory_utilization=0.8,
             skip_tokenizer_init=False,
@@ -516,6 +517,7 @@ def create_async_vllm_engine_with_selective_layers(
             max_num_batched_tokens=max_num_batched_tokens,
             quantization=quantization,
             dtype=dtype or "float16",
+            block_size=16
         )
 
         # STEP 3: Create AsyncLLMEngine (v0 path, in-process)
