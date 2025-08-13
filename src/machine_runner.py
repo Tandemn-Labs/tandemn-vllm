@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional
 import time
 import aiofiles
 from colorama import Fore, Style, init as colorama_init
-from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT, STEP_EVENTS
+from src.utils.inference_utils import register_inference_hooks, INFERENCE_CONTEXT, STEP_EVENTS, STEP_EVENTS_SAMPLER
 from src.utils.message_processing import (
     parse_deployment_message, 
     parse_inference_trigger_message,
@@ -356,7 +356,7 @@ async def handle_inference_trigger_message(tensor):
             sampling_params = SamplingParams(**trigger.get("sampling_params", {}))
             assigned_layers = trigger.get("assigned_layers", {})
             
-            print(f"🏃 Starting inference run in background thread...")
+            print(f"�� Starting inference run in background thread...")
             future = loop.run_in_executor(
                 None,
                 start_inference_run,
@@ -414,7 +414,7 @@ async def handle_inference_data_message(name: str, tensor):
             INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
             print(f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}")
             
-            # NEW: wake anybody waiting for this step
+            # wake anybody waiting for this step's payload
             event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
             event.set()
                 
@@ -438,8 +438,8 @@ async def handle_inference_data_message(name: str, tensor):
             INFERENCE_CONTEXT[request_id][str(step_idx)]["sampler_output"] = sampler_output
             print(f"✅ Stored sampler_output for {request_id} step {step_idx}")
             
-            # NEW: wake anybody waiting for this step
-            event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
+            # wake anybody waiting for this step's sampler output
+            event = STEP_EVENTS_SAMPLER[request_id].setdefault(step_idx, threading.Event())
             event.set()
                 
     except Exception as e:
