@@ -1,5 +1,4 @@
 import asyncio
-import iroh
 import torch
 import json
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
@@ -62,8 +61,6 @@ SERVER_IP = SERVER_HOST
 # IROH STARTS HERE
 active_inferences = {}
 central_server_ticket = None
-# TRIGGER_TOPIC = bytes("trigger_topic".ljust(32), "utf-8")[:32]
-# DEPLOYMENT_TOPIC = bytes("deployment_topic".ljust(32), "utf-8")[:32]
 # IROH ENDS HERE
 
 peer_table: Dict[str,str] = {}
@@ -101,10 +98,6 @@ class HeartbeatRequest(BaseModel):
     gpu_info: Optional[List[Dict[str, Any]]] = None
     total_free_vram_gb: Optional[float] = None
     timestamp: int
-
-class NoopCallback(iroh.GossipMessageCallback):
-    async def on_message(self, msg):
-        return
 
 # still has to change
 class InferenceResponse(BaseModel):
@@ -147,8 +140,6 @@ class ModelDeploymentRequest(BaseModel):
 @app.on_event("startup")
 async def startup():
     """Initialize the Iroh node and document on server startup"""
-    # global node, doc, ticket, server_peer_id
-    # global node, server_id, trigger_gossip_sink, active_inferences, TRIGGER_TOPIC, peer_table, central_server_ticket
     global central_server_ticket, tensor_transport
     print("🚀 Starting Iroh Tandemn server...")
 
@@ -718,29 +709,6 @@ async def get_task_status(task_id: str):
         response["error"] = task["error"]
     
     return response
-
-@app.get("/tasks")
-async def list_all_tasks():
-    """
-    List all background tasks and their current status.
-    
-    Returns:
-        List of all tasks with their status
-    """
-    tasks_summary = []
-    for task_id, task in background_tasks.items():
-        tasks_summary.append({
-            "task_id": task_id,
-            "model_id": task["model_id"],
-            "status": task["status"],
-            "created_at": task["created_at"],
-            "completed_at": task["completed_at"]
-        })
-
-        return {
-        "total_tasks": len(tasks_summary),
-        "tasks": sorted(tasks_summary, key=lambda x: x["created_at"], reverse=True)
-    }
 
 @app.api_route("/download_file/{model_name}/{file_path:path}", methods=["GET", "HEAD"])
 async def download_model_file(model_name: str, file_path: str, request: Request):

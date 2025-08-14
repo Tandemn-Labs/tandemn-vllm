@@ -9,10 +9,9 @@ from fastapi import HTTPException
 from safetensors import safe_open  # type: ignore
 from src.utils.db_utils import get_active_peers, get_peer_metrics
 from src.utils.model_utils import distribute_layers_across_peers
-from vllm.engine.async_llm_engine import AsyncLLMEngine  # v0 async engine
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.usage.usage_lib import UsageContext
 from functools import partial
+from src.config.settings import SERVER_PORT
+
 
 def load_model_metadata(shard_folder: str):
     shard_path = Path(shard_folder)
@@ -169,7 +168,7 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
             "required_files": required_files,
             # Attempt to fetch optional files but do not fail if missing
             "optional_files": optional_files,
-            "server_download_url": f"http://{SERVER_IP}:8000/download_file/{request.model_name.replace('/', '_')}",
+            "server_download_url": f"http://{SERVER_IP}:{SERVER_PORT}/download_file/{request.model_name.replace('/', '_')}",
             "vram_allocation": peer_info,
             "next_peer_ticket": next_peer_ticket,
             "pipeline": peer_list,
@@ -331,6 +330,9 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
         dtype: Optional dtype for activations/weights ("float16", "bfloat16", "float32", "auto")
     """
     
+    # Import vLLM lazily to avoid forcing it on the central server process
+    from vllm import LLM, SamplingParams
+    
     # STEP 1: Monkey-patch vLLM's make_layers function (Prime Intellect's key insight)
     def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
         """Custom make_layers that creates real layers only for assigned indices."""
@@ -360,8 +362,6 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
     
     try:
         # STEP 2: Create vLLM model (will use our patched make_layers)
-        from vllm import LLM, SamplingParams
-        
         llm = LLM(
             model=model_dir,
             tensor_parallel_size=1,
@@ -485,11 +485,16 @@ def create_async_vllm_engine_with_selective_layers(
     dtype: Optional[str] = None,
     max_num_seqs: int = 1,
     max_num_batched_tokens: int = 2048,
-) -> AsyncLLMEngine:
+):
     """
     Create an in-process v0 AsyncLLMEngine with selective layers loaded.
     Preserves your monkey-patch strategy and manually injects weights.
     """
+
+    # Import vLLM lazily to avoid forcing it on the central server process
+    from vllm.engine.async_llm_engine import AsyncLLMEngine  # v0 async engine
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.usage.usage_lib import UsageContext
 
     # STEP 1: Monkey-patch make_layers so only assigned layers are real.
     def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
@@ -541,14 +546,6 @@ def create_async_vllm_engine_with_selective_layers(
         # in sync vllm we had the model in llm.llm_engine.model_executor.driver_worker.model_runner
         # so a slight change. 
         model = async_engine.engine.model_executor.driver_worker.model_runner.model
-
-        # def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
-        #     tensors = {}
-        #     if path.exists():
-        #         with safe_open(str(path), framework="pt", device="cpu") as f:
-        #             for key in f.keys():
-        #                 tensors[key] = f.get_tensor(key)
-        #     return tensors
 
         # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
         all_weights = {}
