@@ -47,15 +47,23 @@ async def get_peers_with_vram():
     return peers_vram
 
 def create_distribution_plan(metadata, peers_vram, q_bits: int = 32):
+    # Use metadata provided by sharding to avoid hardcoded defaults
+    num_hidden_layers = int(metadata.get('num_layers'))
+    hidden_size = int(metadata.get('hidden_size'))
+    vocab_size = int(metadata.get('vocab_size', 32000))
+    num_attention_heads = int(metadata.get('num_attention_heads', 32))
+    num_key_value_heads = int(metadata.get('num_key_value_heads', num_attention_heads))
+    intermediate_size = int(metadata.get('intermediate_size', hidden_size * 4))
+
     config = {
-        "num_hidden_layers": metadata['num_layers'],
-        "hidden_size": metadata['hidden_size'],
-        "vocab_size": 32000,  # Default for demo
-        "num_attention_heads": 32,  # Default for demo  
-        "num_key_value_heads": 32,  # Default for demo
-        "intermediate_size": metadata['hidden_size'] * 4,  # Standard ratio
+        "num_hidden_layers": num_hidden_layers,
+        "hidden_size": hidden_size,
+        "vocab_size": vocab_size,
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "intermediate_size": intermediate_size,
     }
-    
+
     distribution_plan = distribute_layers_across_peers(
         config=config,
         peers_vram=peers_vram,

@@ -23,6 +23,9 @@ from fastapi.responses import HTMLResponse
 from src.utils.tensor_protocol_adapter import TensorTransport
 ######################################################
 
+# Ensure accelerated downloads from Hugging Face hub are enabled for this process
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
 from src.config.settings import (
     SERVER_HOST,
     SERVER_PORT,
