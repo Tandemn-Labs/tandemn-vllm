@@ -519,7 +519,7 @@ def create_async_vllm_engine_with_selective_layers(
         # STEP 2: Build AsyncEngineArgs mirroring your LLM init
         engine_args = AsyncEngineArgs(
             model=model_dir,
-            tensor_parallel_size=1,
+            tensor_parallel_size=2,
             enforce_eager=True,
             load_format="dummy",
             max_model_len=128, # small for demo
@@ -541,15 +541,28 @@ def create_async_vllm_engine_with_selective_layers(
         )
 
         # STEP 4: Inject weights into the underlying model
+        
         shards_root = Path(model_dir).resolve().parent
         # this is where the model instance is stored 
         # in sync vllm we had the model in llm.llm_engine.model_executor.driver_worker.model_runner
         # so a slight change. 
         model = async_engine.engine.model_executor.driver_worker.model_runner.model
 
+        # TP-aware loaders: use module-native loaders to slice per-rank
+        from vllm.model_executor.layers.linear import (
+            ColumnParallelLinear,
+            RowParallelLinear,
+            MergedColumnParallelLinear,
+            QKVParallelLinear,
+        )
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+            ParallelLMHead,
+        )
+
         # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
         all_weights = {}
-            
+        
         # Helper: load all tensors from a safetensors file
         def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
             """Load all tensors from a safetensors file."""
@@ -597,21 +610,70 @@ def create_async_vllm_engine_with_selective_layers(
         applied_count = 0
         missing_params = []
         print(model)
+
+        # Build a name->parameter mapping for fast lookup
+        name_to_param: Dict[str, torch.nn.Parameter] = {
+            n: p for n, p in model.named_parameters()
+        }
+
         for name, param in model.named_parameters():
+            if model_utils.is_pp_missing_parameter(name, model):
+                # Skip parameters that belong to PP-missing layers
+                continue
+
             if name in all_weights:
-                with torch.no_grad():
-                    param.copy_(all_weights[name].to(param.dtype).to(param.device))
-                    applied_count += 1
+                loaded_weight = all_weights[name]
+
+                # Ensure dtype alignment early
+                if loaded_weight.dtype != param.dtype:
+                    loaded_weight = loaded_weight.to(param.dtype)
+
+                # Route to module-aware loaders when applicable
+                try:
+                    module_path, param_name = name.rsplit(".", 1)
+                    module = model.get_submodule(module_path)
+
+                    if isinstance(module, (VocabParallelEmbedding, ParallelLMHead)):
+                        target_param = getattr(module, param_name)
+                        module.weight_loader(target_param, loaded_weight)
+                        applied_count += 1
+                        continue
+
+                    if isinstance(module, (MergedColumnParallelLinear, QKVParallelLinear)):
+                        # For fused/merged modules, pass fused tensor; loader will split and shard
+                        target_param = getattr(module, param_name)
+                        module.weight_loader(target_param, loaded_weight)
+                        applied_count += 1
+                        continue
+
+                    if isinstance(module, (ColumnParallelLinear, RowParallelLinear)):
+                        target_param = getattr(module, param_name)
+                        module.weight_loader(target_param, loaded_weight)
+                        applied_count += 1
+                        continue
+
+                    # Fallback for non-TP modules (e.g., norms)
+                    with torch.no_grad():
+                        param.copy_(loaded_weight.to(param.device))
+                        applied_count += 1
+                except Exception:
+                    # As a last resort, do a direct copy if shapes match
+                    try:
+                        if param.shape == loaded_weight.shape:
+                            with torch.no_grad():
+                                param.copy_(loaded_weight.to(param.device))
+                                applied_count += 1
+                        else:
+                            missing_params.append(name)
+                    except Exception:
+                        missing_params.append(name)
             else:
                 # Check if this parameter belongs to a layer we should have loaded
                 is_expected_missing = False
-                
-                # Check if it's from an unassigned layer
                 for i in range(100):  # Assuming max 100 layers
                     if f".layers.{i}." in name and i not in assigned_layers:
                         is_expected_missing = True
                         break
-                
                 if not is_expected_missing:
                     missing_params.append(name)
         
