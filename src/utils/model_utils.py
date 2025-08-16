@@ -128,12 +128,19 @@ def estimate_vram(parameters_billions: float, dtype: str) -> float:
 
 def estimate_layer_vram(config: Dict[str, Any], q_bits: int) -> Tuple[float, float, float]:
     """
-    Estimate VRAM requirements per layer and for non-layer components.
-    
+    Estimate VRAM requirements per layer and for non-layer components (weights only).
+
+    Notes:
+        - This function estimates WEIGHTS memory only (no activations / KV cache / framework overhead),
+          to align with vLLM's "model weights take X GiB" measurement.
+        - Embeddings include the input embedding matrix plus LM head if weights are not tied.
+        - Per-layer parameters include attention, 3-projection MLP (gate/up/down), and layer norms.
+        - Final output norm is included in the total but not in per-layer or embedding buckets.
+
     Args:
         config: Model configuration dictionary
         q_bits: Quantization bits (e.g., 16 for FP16)
-        
+
     Returns:
         Tuple of (vram_per_layer_gb, embedding_vram_gb, total_vram_gb)
     """
@@ -143,36 +150,63 @@ def estimate_layer_vram(config: Dict[str, Any], q_bits: int) -> Tuple[float, flo
     num_hidden_layers = config.get("num_hidden_layers")
     num_attention_heads = config.get("num_attention_heads")
     head_dim = config.get("head_dim")
-    if head_dim is None:
+    if head_dim is None and hidden_size is not None and num_attention_heads:
         head_dim = hidden_size // num_attention_heads
     num_key_value_heads = config.get("num_key_value_heads")
+    if num_key_value_heads is None:
+        num_key_value_heads = num_attention_heads
     intermediate_size = config.get("intermediate_size")
-    
-    if None in [vocab_size, hidden_size, num_hidden_layers, num_attention_heads, num_key_value_heads, intermediate_size]:
+    tie_word_embeddings = bool(config.get("tie_word_embeddings", False))
+
+
+    required = [vocab_size, hidden_size, num_hidden_layers, num_attention_heads,
+                num_key_value_heads, intermediate_size, head_dim]
+    # print("Required parameters:", required)
+    if any(x is None for x in required):
         raise ValueError("The config is missing one or more required parameters.")
-    
-    # Calculate parameters for different components
-    embed_params = vocab_size * hidden_size  # Embedding layers (input + output)
-    
+
+    # Embeddings (input) + LM head if not tied
+    embed_params = vocab_size * hidden_size
+    lm_head_params = 0 if tie_word_embeddings else vocab_size * hidden_size
+    embedding_params_total = embed_params + lm_head_params
+
     # Parameters per transformer layer
+    # Attention projections
     q_params = hidden_size * (num_attention_heads * head_dim)
     k_params = hidden_size * (num_key_value_heads * head_dim)
     v_params = hidden_size * (num_key_value_heads * head_dim)
     o_params = (num_attention_heads * head_dim) * hidden_size
     attn_params = q_params + k_params + v_params + o_params
-    mlp_params = 2 * hidden_size * intermediate_size
-    layer_params = attn_params + mlp_params
-    
-    # Convert to VRAM (GB) with quantization and overhead
+
+    # MLP: gate, up, down (3 projections for most modern LLMs, e.g., SwiGLU)
+    mlp_params = 3 * hidden_size * intermediate_size
+
+    # Layer norms per layer (pre-attn and pre-mlp)
+    layer_norm_params = 2 * hidden_size
+
+    layer_params = attn_params + mlp_params + layer_norm_params
+
+    # Final output norm (applied once at the end of the stack)
+    final_norm_params = hidden_size
+
+    # Convert to VRAM (GB) for WEIGHTS only
     bytes_per_param = q_bits / 8
-    overhead_factor = 1.2  # 20% overhead for activations, etc.
-    
-    embedding_vram_gb = (embed_params * bytes_per_param * overhead_factor) / (1024**3)
-    vram_per_layer_gb = (layer_params * bytes_per_param * overhead_factor) / (1024**3)
-    total_vram_gb = embedding_vram_gb + (num_hidden_layers * vram_per_layer_gb)
-    print(f"vram_per_layer_gb: {vram_per_layer_gb}, embedding_vram_gb: {embedding_vram_gb}, total_vram_gb: {total_vram_gb}")
-    
-    return vram_per_layer_gb, embedding_vram_gb, total_vram_gb
+    bytes_to_gb = (1024 ** 3)
+
+    # [HETARTH] TODO: This is a hack to account for the activation overhead. THIS WILL FUCK US UP SOMEDAY - SO PROFILE IT!!
+    MAGIC_KNOB_FOR_ACTIVATION_OVERHEAD = 1.2 # this is the activation overhead for the ENTIRE MODEL WHEN ITS LOADED
+    # So the activation overhead for each layer is MAGIC_KNOB_FOR_ACTIVATION_OVERHEAD / num_hidden_layers
+    per_layer_activation_overhead = MAGIC_KNOB_FOR_ACTIVATION_OVERHEAD / num_hidden_layers # this is the activation overhead for each layer
+
+    embedding_vram_gb = (embedding_params_total * bytes_per_param) / bytes_to_gb
+    vram_per_layer_gb = ((layer_params * bytes_per_param) / bytes_to_gb) + per_layer_activation_overhead  # make sure you profile the activation overhead
+    total_vram_gb = (
+        embedding_vram_gb
+        + (num_hidden_layers * vram_per_layer_gb)
+        + (final_norm_params * bytes_per_param) / bytes_to_gb
+    )
+
+    return round(vram_per_layer_gb, 6), round(embedding_vram_gb, 6), round(total_vram_gb, 6)
 
 def calculate_max_layers_for_peer(
     config: Dict[str, Any], 
@@ -243,6 +277,7 @@ def distribute_layers_across_peers(
     """
     total_layers = config.get("num_hidden_layers")
     vram_per_layer_gb, embedding_vram_gb, total_model_vram_gb = estimate_layer_vram(config, q_bits)
+    print(f"🔍 Model {config.get('model_name')} has {total_layers} layers and requires {total_model_vram_gb} GB of VRAM")
     
     # Sort peers by available VRAM (descending)
     sorted_peers = sorted(peers_vram.items(), key=lambda x: x[1], reverse=True)
@@ -257,9 +292,9 @@ def distribute_layers_across_peers(
             break
             
         # # HACK: For the peer with highest VRAM (first in sorted list), simulate only 4GB
-        if i == 0:
-            print(f"🔧 [HACK] Simulating 4GB VRAM for highest VRAM peer {peer_id} (actual: {available_vram}GB)")
-            available_vram = 0.25
+        # if i == 0:
+        #     print(f"🔧 [HACK] Simulating 4GB VRAM for highest VRAM peer {peer_id} (actual: {available_vram}GB)")
+        #     available_vram = 0.25
             
         # Calculate max layers for this peer
         peer_calculation = calculate_max_layers_for_peer(config, available_vram, q_bits, safety_margin)
