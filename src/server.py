@@ -110,7 +110,6 @@ class ModelEstimationRequest(BaseModel):
     model_id: str
     hf_token: str
     qbits: int = DEFAULT_QBITS
-    filename: str = DEFAULT_CONFIG_FILENAME
 
 class ModelShardingRequest(BaseModel):
     model_id: str
@@ -306,13 +305,22 @@ async def estimate_model(request: ModelEstimationRequest):
         Dictionary containing total parameters and estimated VRAM
     """
     try:
-        config = await download_config(
-            request.model_id,
-            request.hf_token,
-            request.filename
-        )
-        total_params = estimate_parameters(config)
-        vram_gb = estimate_vram(total_params, request.qbits)
+        # config = await download_config(
+        #     request.model_id,
+        #     request.hf_token,
+        #     request.filename
+        # )
+        total_params = estimate_parameters(request.model_id, request.hf_token)
+        # Convert qbits to appropriate dtype string for the VRAM calculation
+        dtype_map = {
+            4: "int4",
+            8: "int8", 
+            16: "float16",
+            32: "float32"
+        }
+        dtype = dtype_map.get(request.qbits, "float16")
+        parameters_billions = total_params / 1e9
+        vram_gb = estimate_vram(parameters_billions, dtype)
         
         return {
             "status": "success",
