@@ -14,4 +14,5 @@ safetensors
 transformers<4.54.0
 torch==2.8.0+cpu
 huggingface_hub[hf_transfer]
-tensor-iroh 
+tensor-iroh
+boto3 

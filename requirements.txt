@@ -22,3 +22,4 @@ aiofiles
 vllm==0.9.1
 tensor-iroh
 huggingface_hub[hf_transfer]
+boto3

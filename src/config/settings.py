@@ -25,3 +25,7 @@ PEER_CLEANUP_THRESHOLD = int(os.getenv("PEER_CLEANUP_THRESHOLD", "1"))  # hours 
 # GPU metrics settings
 GPU_METRICS_INTERVAL = int(os.getenv("GPU_METRICS_INTERVAL", "60"))  # seconds 
 
+# S3 settings
+S3_SHARDS_BASE = os.getenv("S3_SHARDS_BASE", "") 
+S3_BUCKET = os.getenv("S3_BUCKET", "") 
+S3_REGION = os.getenv("S3_REGION", "") 
