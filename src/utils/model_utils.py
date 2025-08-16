@@ -126,20 +126,30 @@ def estimate_vram(parameters_billions: float, dtype: str) -> float:
 #     P_in_billions = total_params / 1e9
 #     return P_in_billions * 4 * (q_bits / 32) * 1.2
 
-def estimate_layer_vram(config: Dict[str, Any], q_bits: int) -> Tuple[float, float, float]:
+# [HETARTH] TODO: This is a hack to account for the activation overhead. THIS WILL FUCK US UP SOMEDAY - SO PROFILE IT!!
+def estimate_layer_vram(
+    config: Dict[str, Any], 
+    q_bits: int,
+    batch_size: int = 1,
+    seq_length: int = 2048,
+    include_kv_cache: bool = False
+) -> Tuple[float, float, float]:
     """
-    Estimate VRAM requirements per layer and for non-layer components (weights only).
+    Estimate VRAM requirements per layer and for non-layer components (weights + activations).
 
     Notes:
-        - This function estimates WEIGHTS memory only (no activations / KV cache / framework overhead),
-          to align with vLLM's "model weights take X GiB" measurement.
+        - This function estimates both weights memory and activation memory.
         - Embeddings include the input embedding matrix plus LM head if weights are not tied.
         - Per-layer parameters include attention, 3-projection MLP (gate/up/down), and layer norms.
         - Final output norm is included in the total but not in per-layer or embedding buckets.
+        - Activation memory is calculated based on batch size and sequence length.
 
     Args:
         config: Model configuration dictionary
         q_bits: Quantization bits (e.g., 16 for FP16)
+        batch_size: Batch size for activation calculation (default: 1)
+        seq_length: Sequence length for activation calculation (default: 2048)
+        include_kv_cache: Whether to include KV cache (not implemented yet, default: False)
 
     Returns:
         Tuple of (vram_per_layer_gb, embedding_vram_gb, total_vram_gb)
@@ -189,17 +199,30 @@ def estimate_layer_vram(config: Dict[str, Any], q_bits: int) -> Tuple[float, flo
     # Final output norm (applied once at the end of the stack)
     final_norm_params = hidden_size
 
-    # Convert to VRAM (GB) for WEIGHTS only
+    # Convert to VRAM (GB) for WEIGHTS
     bytes_per_param = q_bits / 8
     bytes_to_gb = (1024 ** 3)
 
-    # [HETARTH] TODO: This is a hack to account for the activation overhead. THIS WILL FUCK US UP SOMEDAY - SO PROFILE IT!!
-    MAGIC_KNOB_FOR_ACTIVATION_OVERHEAD = 1.2 # this is the activation overhead for the ENTIRE MODEL WHEN ITS LOADED
-    # So the activation overhead for each layer is MAGIC_KNOB_FOR_ACTIVATION_OVERHEAD / num_hidden_layers
-    per_layer_activation_overhead = MAGIC_KNOB_FOR_ACTIVATION_OVERHEAD / num_hidden_layers # this is the activation overhead for each layer
-
+    # Calculate WEIGHTS memory
     embedding_vram_gb = (embedding_params_total * bytes_per_param) / bytes_to_gb
-    vram_per_layer_gb = ((layer_params * bytes_per_param) / bytes_to_gb) + per_layer_activation_overhead  # make sure you profile the activation overhead
+    layer_weights_vram_gb = (layer_params * bytes_per_param) / bytes_to_gb
+    
+    # Calculate ACTIVATION memory per layer
+    # Based on article formula: batch_size * seq_length * hidden_dim * K
+    # K is a heuristic factor (using conservative estimate of 12)
+    # This represents intermediate activations in attention and MLP blocks
+    K_FACTOR = 12  # Conservative heuristic for activation multiplier
+    
+    # Activation memory per layer (in bytes)
+    activation_bytes_per_layer = (
+        batch_size * seq_length * hidden_size * K_FACTOR * (q_bits / 8)
+    )
+    activation_vram_per_layer_gb = activation_bytes_per_layer / bytes_to_gb
+    
+    # Total per-layer VRAM (weights + activations)
+    vram_per_layer_gb = layer_weights_vram_gb + activation_vram_per_layer_gb
+    
+    # Total model VRAM
     total_vram_gb = (
         embedding_vram_gb
         + (num_hidden_layers * vram_per_layer_gb)
@@ -212,7 +235,9 @@ def calculate_max_layers_for_peer(
     config: Dict[str, Any], 
     available_vram_gb: float, 
     q_bits: int,
-    safety_margin: float = 0.1
+    safety_margin: float = 0.1,
+    batch_size: int = 1,
+    seq_length: int = 2048
 ) -> Dict[str, Any]:
     """
     Calculate the maximum number of layers that can fit in a peer's available VRAM.
@@ -222,12 +247,16 @@ def calculate_max_layers_for_peer(
         available_vram_gb: Available VRAM in GB for this peer
         q_bits: Quantization bits (e.g., 16 for FP16)
         safety_margin: Safety margin as fraction of available VRAM (default: 10%)
+        batch_size: Batch size for activation calculation (default: 1)
+        seq_length: Sequence length for activation calculation (default: 2048)
         
     Returns:
         Dictionary containing layer calculation details
     """
-    # Get VRAM requirements
-    vram_per_layer_gb, embedding_vram_gb, total_model_vram_gb = estimate_layer_vram(config, q_bits)
+    # Get VRAM requirements with activation overhead
+    vram_per_layer_gb, embedding_vram_gb, total_model_vram_gb = estimate_layer_vram(
+        config, q_bits, batch_size, seq_length, include_kv_cache=False
+    )
     
     # Apply safety margin
     usable_vram_gb = available_vram_gb * (1 - safety_margin)
@@ -254,14 +283,18 @@ def calculate_max_layers_for_peer(
         "vram_used_layers_only": round(vram_used_layers_only, 3),
         "vram_used_with_embeddings": round(vram_used_with_embeddings, 3),
         "total_model_layers": config.get("num_hidden_layers"),
-        "total_model_vram_gb": round(total_model_vram_gb, 3)
+        "total_model_vram_gb": round(total_model_vram_gb, 3),
+        "batch_size": batch_size,
+        "seq_length": seq_length
     }
 
 def distribute_layers_across_peers(
     config: Dict[str, Any],
     peers_vram: Dict[str, float],  # peer_id -> available_vram_gb
     q_bits: int,
-    safety_margin: float = 0.1
+    safety_margin: float = 0.1,
+    batch_size: int = 1,
+    seq_length: int = 2048
 ) -> Dict[str, Any]:
     """
     Distribute model layers optimally across multiple GPU peers.
@@ -271,12 +304,16 @@ def distribute_layers_across_peers(
         peers_vram: Dictionary mapping peer_id to available VRAM in GB
         q_bits: Quantization bits
         safety_margin: Safety margin as fraction of available VRAM
+        batch_size: Batch size for activation calculation (default: 1)
+        seq_length: Sequence length for activation calculation (default: 2048)
         
     Returns:
         Dictionary containing the distribution plan
     """
     total_layers = config.get("num_hidden_layers")
-    vram_per_layer_gb, embedding_vram_gb, total_model_vram_gb = estimate_layer_vram(config, q_bits)
+    vram_per_layer_gb, embedding_vram_gb, total_model_vram_gb = estimate_layer_vram(
+        config, q_bits, batch_size, seq_length, include_kv_cache=False
+    )
     print(f"🔍 Model {config.get('model_name')} has {total_layers} layers and requires {total_model_vram_gb} GB of VRAM")
     
     # Sort peers by available VRAM (descending)
@@ -297,7 +334,9 @@ def distribute_layers_across_peers(
         #     available_vram = 0.25
             
         # Calculate max layers for this peer
-        peer_calculation = calculate_max_layers_for_peer(config, available_vram, q_bits, safety_margin)
+        peer_calculation = calculate_max_layers_for_peer(
+            config, available_vram, q_bits, safety_margin, batch_size, seq_length
+        )
         
         # Determine how many layers to assign
         if not embedding_assigned and available_vram >= embedding_vram_gb:
@@ -340,7 +379,9 @@ def distribute_layers_across_peers(
             "total_assigned_layers": total_assigned_layers,
             "vram_per_layer_gb": round(vram_per_layer_gb, 3),
             "embedding_vram_gb": round(embedding_vram_gb, 3),
-            "total_model_vram_gb": round(total_model_vram_gb, 3)
+            "total_model_vram_gb": round(total_model_vram_gb, 3),
+            "batch_size": batch_size,
+            "seq_length": seq_length
         },
         "can_fit_model": can_fit_model,
         "remaining_layers": remaining_layers,
