@@ -2,6 +2,7 @@ import json
 import aiohttp
 from typing import Dict, Any, Tuple
 from src.config.settings import HUGGINGFACE_TOKEN, DEFAULT_CONFIG_FILENAME
+from huggingface_hub import get_safetensors_metadata
 
 async def download_config(model_id: str, hf_token: str = None, filename: str = DEFAULT_CONFIG_FILENAME) -> Dict[str, Any]:
     """
@@ -44,53 +45,86 @@ async def download_config(model_id: str, hf_token: str = None, filename: str = D
         except aiohttp.ClientError as e:
             raise Exception(f"Network error while accessing Hugging Face: {str(e)}")
 
-def estimate_parameters(config: Dict[str, Any]) -> int:
-    """
-    Estimate the total number of parameters of a Transformer model based on its config.
-    
-    Args:
-        config: Model configuration dictionary
-        
-    Returns:
-        Total number of parameters
-    """
-    vocab_size = config.get("vocab_size")
-    hidden_size = config.get("hidden_size")
-    num_hidden_layers = config.get("num_hidden_layers")
-    num_attention_heads = config.get("num_attention_heads")
-    head_dim = config.get("head_dim")
-    if head_dim is None:
-        head_dim = hidden_size // num_attention_heads
-    num_key_value_heads = config.get("num_key_value_heads")
-    intermediate_size = config.get("intermediate_size")
-    
-    if None in [vocab_size, hidden_size, num_hidden_layers, num_attention_heads, num_key_value_heads, intermediate_size]:
-        raise ValueError("The config is missing one or more required parameters.")
-    
-    embed_params = vocab_size * hidden_size
-    q_params = hidden_size * (num_attention_heads * head_dim)
-    k_params = hidden_size * (num_key_value_heads * head_dim)
-    v_params = hidden_size * (num_key_value_heads * head_dim)
-    o_params = (num_attention_heads * head_dim) * hidden_size
-    attn_params = q_params + k_params + v_params + o_params
-    mlp_params = 2 * hidden_size * intermediate_size
-    layer_params = attn_params + mlp_params
-    total_params = embed_params + num_hidden_layers * layer_params
-    return total_params
+# llm-mem's byte mapping
+BYTES_PER_DTYPE = {
+        "int4": 0.5,
+        "int8": 1,
+        "float8": 1,
+        "float16": 2,
+        "float32": 4,
+        "bfloat16": 2}
 
-def estimate_vram(total_params: int, q_bits: int) -> float:
-    """
-    Estimate VRAM requirements for a model.
-    
-    Args:
-        total_params: Total number of model parameters
-        q_bits: Quantization bits (e.g., 16 for FP16)
+def estimate_parameters(model_id: str, hf_token: str) -> int:
+    """Get actual parameter count from safetensors metadata (llm-mem approach)"""
+    try:
+        metadata = get_safetensors_metadata(model_id, token=hf_token)
+        if not metadata or not metadata.parameter_count:
+            print("Could not fetch metadata")
+            return 0
         
-    Returns:
-        Estimated VRAM requirement in GB
-    """
-    P_in_billions = total_params / 1e9
-    return P_in_billions * 4 * (q_bits / 32) * 1.2
+        # Sum all parameter counts (handles multi-file models)
+        total_params = sum(int(count) for count in metadata.parameter_count.values())
+        return total_params
+    except Exception as e:
+        print(f"Error getting safetensors metadata: {e}")
+        return 0
+
+def estimate_vram(parameters_billions: float, dtype: str) -> float:
+    """Apply llm-mem's exact formula for model memory"""
+    bytes_val = BYTES_PER_DTYPE[dtype]
+    # llm-mem's formula: (params * 4) / (32/(bytes*8)) * 1.18
+    # return round((parameters_billions * 4) / (32 / (bytes_val * 8)) * 1.18, 2)
+    MAGIC_KNOB_FOR_ACTIVATION_OVERHEAD = 1.21
+    return round((parameters_billions * 4) / (32 / (bytes_val * 8)) + MAGIC_KNOB_FOR_ACTIVATION_OVERHEAD, 2)
+
+
+# def estimate_parameters(config: Dict[str, Any]) -> int:
+#     """
+#     Estimate the total number of parameters of a Transformer model based on its config.
+    
+#     Args:
+#         config: Model configuration dictionary
+        
+#     Returns:
+#         Total number of parameters
+#     """
+#     vocab_size = config.get("vocab_size")
+#     hidden_size = config.get("hidden_size")
+#     num_hidden_layers = config.get("num_hidden_layers")
+#     num_attention_heads = config.get("num_attention_heads")
+#     head_dim = config.get("head_dim")
+#     if head_dim is None:
+#         head_dim = hidden_size // num_attention_heads
+#     num_key_value_heads = config.get("num_key_value_heads")
+#     intermediate_size = config.get("intermediate_size")
+    
+#     if None in [vocab_size, hidden_size, num_hidden_layers, num_attention_heads, num_key_value_heads, intermediate_size]:
+#         raise ValueError("The config is missing one or more required parameters.")
+    
+#     embed_params = vocab_size * hidden_size
+#     q_params = hidden_size * (num_attention_heads * head_dim)
+#     k_params = hidden_size * (num_key_value_heads * head_dim)
+#     v_params = hidden_size * (num_key_value_heads * head_dim)
+#     o_params = (num_attention_heads * head_dim) * hidden_size
+#     attn_params = q_params + k_params + v_params + o_params
+#     mlp_params = 2 * hidden_size * intermediate_size
+#     layer_params = attn_params + mlp_params
+#     total_params = embed_params + num_hidden_layers * layer_params
+#     return total_params
+
+# def estimate_vram(total_params: int, q_bits: int) -> float:
+#     """
+#     Estimate VRAM requirements for a model.
+    
+#     Args:
+#         total_params: Total number of model parameters
+#         q_bits: Quantization bits (e.g., 16 for FP16)
+        
+#     Returns:
+#         Estimated VRAM requirement in GB
+#     """
+#     P_in_billions = total_params / 1e9
+#     return P_in_billions * 4 * (q_bits / 32) * 1.2
 
 def estimate_layer_vram(config: Dict[str, Any], q_bits: int) -> Tuple[float, float, float]:
     """
