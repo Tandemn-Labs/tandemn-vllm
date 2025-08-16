@@ -11,6 +11,8 @@ from src.utils.db_utils import get_active_peers, get_peer_metrics
 from src.utils.model_utils import distribute_layers_across_peers
 from functools import partial
 from src.config.settings import SERVER_PORT
+import os
+import subprocess
 
 
 def load_model_metadata(shard_folder: str):
@@ -23,11 +25,12 @@ def load_model_metadata(shard_folder: str):
     print(f"📊 Model metadata: {metadata['num_layers']} layers, type: {metadata['model_type']}")
     return metadata
 
+
 async def get_peers_with_vram():
     active_peers = await get_active_peers()
     if len(active_peers) < 1:
         raise HTTPException(status_code=400, detail="No active peers available for deployment")
-    
+
     peers_vram = {}
     for peer_id in active_peers:
         try:
@@ -118,7 +121,17 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
     """
     deployment_instructions = {}
     peer_list = list(distribution_plan["distribution"].keys())
-    
+
+    # Determine base URL for model files: prefer S3 if configured
+    model_dir_name = Path(getattr(request, "shard_folder", "")).name or request.model_name.replace('/', '_')
+    s3_base = os.getenv("S3_SHARDS_BASE")  # e.g., s3://tandemn-model-shards/shards
+    prefer_s3 = bool(s3_base)
+
+    if prefer_s3:
+        base_url = f"{s3_base.rstrip('/')}/{model_dir_name}"
+    else:
+        base_url = f"http://{SERVER_IP}:{SERVER_PORT}/download_file/{request.model_name.replace('/', '_')}"
+
     for i, (peer_id, peer_info) in enumerate(distribution_plan["distribution"].items()):
         is_first_peer = (i == 0)
         is_last_peer = (i == len(peer_list) - 1)
@@ -168,7 +181,7 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
             "required_files": required_files,
             # Attempt to fetch optional files but do not fail if missing
             "optional_files": optional_files,
-            "server_download_url": f"http://{SERVER_IP}:{SERVER_PORT}/download_file/{request.model_name.replace('/', '_')}",
+            "server_download_url": base_url,
             "vram_allocation": peer_info,
             "next_peer_ticket": next_peer_ticket,
             "pipeline": peer_list,
@@ -189,39 +202,77 @@ async def download_file(url: str, local_path: Path, chunk_size: int = 16*1024*10
     Download a file from server with progress tracking and resume capability.
     
     Args:
-        url: Download URL
+        url: Download URL (supports http(s):// and s3://)
         local_path: Local file path to save to
         chunk_size: Download chunk size in bytes (default: 16MB)
-        
+
     Returns:
         bool: True if download successful, False otherwise
     """
     try:
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Skip download if file already exists and has content
         if local_path.exists() and local_path.stat().st_size > 0:
-            # Optional: Verify file size matches server (HEAD request)
-            try:
-                async with httpx.AsyncClient() as client:
-                    head_response = await client.head(url)
-                    if head_response.status_code == 200:
-                        remote_size = int(head_response.headers.get("content-length", 0))
-                        local_size = local_path.stat().st_size
-                        
-                        if local_size == remote_size:
-                            print(f"✅ File already exists with correct size, skipping: {local_path.name} ({local_size:,} bytes)")
-                            return True
+            # Optional: Verify file size matches server (HEAD request) for HTTP(S) only
+            if url.startswith("http://") or url.startswith("https://"):
+                try:
+                    async with httpx.AsyncClient() as client:
+                        head_response = await client.head(url)
+                        if head_response.status_code == 200:
+                            remote_size = int(head_response.headers.get("content-length", 0))
+                            local_size = local_path.stat().st_size
+
+                            if local_size == remote_size:
+                                print(f"✅ File already exists with correct size, skipping: {local_path.name} ({local_size:,} bytes)")
+                                return True
+                            else:
+                                print(f"⚠️ File exists but size mismatch - redownloading: local={local_size:,}, remote={remote_size:,}")
                         else:
-                            print(f"⚠️ File exists but size mismatch - redownloading: local={local_size:,}, remote={remote_size:,}")
-                    else:
-                        print(f"⚠️ Could not verify remote file size (HEAD {head_response.status_code}), downloading anyway")
-            except Exception as e:
-                print(f"⚠️ HEAD request failed: {e}, proceeding with download")
-                # If HEAD fails, just check local file exists and has content
-                print(f"✅ File exists locally, assuming valid: {local_path.name} ({local_path.stat().st_size:,} bytes)")
+                            print(f"⚠️ Could not verify remote file size (HEAD {head_response.status_code}), downloading anyway")
+                except Exception as e:
+                    print(f"⚠️ HEAD request failed: {e}, proceeding with download")
+                    # If HEAD fails, just check local file exists and has content
+                    print(f"✅ File exists locally, assuming valid: {local_path.name} ({local_path.stat().st_size:,} bytes)")
+                    return True
+            else:
+                # For s3, if file exists, assume valid
+                print(f"✅ File exists locally, assuming valid (s3): {local_path.name} ({local_path.stat().st_size:,} bytes)")
                 return True
-        
+
+        # S3 path: use boto3 if available; fallback to aws cli
+        if url.startswith("s3://"):
+            try:
+                from urllib.parse import urlparse
+                o = urlparse(url)
+                # urlparse yields scheme='s3', netloc='bucket', path='/key'
+                bucket = o.netloc
+                key = o.path.lstrip('/')
+                try:
+                    import boto3  # type: ignore
+                    client = boto3.client("s3")
+                    client.download_file(bucket, key, str(local_path))
+                    print(f"✅ Downloaded {local_path.name} from s3://{bucket}/{key}")
+                    return True
+                except ImportError:
+                    print("ℹ️ boto3 not installed; falling back to aws cli for S3 download")
+                    cmd = [
+                        "aws", "s3", "cp",
+                        f"s3://{bucket}/{key}",
+                        str(local_path)
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        print(f"✅ Downloaded {local_path.name} via aws cli from s3://{bucket}/{key}")
+                        return True
+                    else:
+                        print(f"❌ aws cli download failed: {result.stderr}")
+                        return False
+            except Exception as e:
+                print(f"❌ Failed to download from S3 URL {url}: {e}")
+                return False
+
+        # HTTP(S) path: stream with httpx
         async with httpx.AsyncClient() as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
