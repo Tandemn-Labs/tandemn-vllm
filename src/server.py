@@ -69,7 +69,7 @@ peer_table: Dict[str,str] = {}
 active_peer_ids = set()  # Currently active peer node_ids
 peer_last_seen = {}  # Track when each peer was last seen
 PEER_TIMEOUT = 30  # Seconds before considering a peer dead
-
+PEER_CLEANUP_INTERVAL = 5 # Seconds
 # Task tracking for background operations
 background_tasks = {}  # Dict to track running background tasks
 
@@ -160,7 +160,8 @@ async def startup():
     central_server_ticket = tensor_transport.ticket
     print(f"🪪 TensorTransport for the central server started – ticket:\n{central_server_ticket}\n")
     #################################################################################################
-
+    # Start the background task for cleaning up inactive peers
+    asyncio.create_task(periodic_peer_cleanup())
     
 @app.get("/health")
 async def health():
@@ -214,24 +215,6 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
             topology_changed = True
             print(f"🗒️ New peer detected: {peer_id_of_requester}")
 
-        # Optimize dead peer detection using a list comprehension and direct hash lookups
-        # peer_last_seen is a dict: {peer_id: last_seen_time}
-        # Only check those whose last_seen is too old
-        dead_peers = [peer_id for peer_id, last_seen in peer_last_seen.items()
-                      if current_time - last_seen > PEER_TIMEOUT]
-
-        # Remove dead peers from all relevant hashmaps/sets
-        for dead_node_id in dead_peers:
-            if dead_node_id in peer_table:
-                del peer_table[dead_node_id]
-            active_peer_ids.discard(dead_node_id)
-            if dead_node_id in peer_last_seen:
-                del peer_last_seen[dead_node_id]
-            topology_changed = True
-            print(f"💀 Peer {dead_node_id[:8]} timed out and removed")
-
-        print(f"🗒️ Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
-
         # Compact metrics object similar to previous format
         formatted_metrics = {
             "cpu_percent": hb.cpu,
@@ -265,6 +248,48 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
     except Exception as e:
         print(f"❌ Heartbeat processing failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+async def periodic_peer_cleanup():
+    """Periodically check for and remove inactive peers."""
+    while True:
+        await asyncio.sleep(PEER_CLEANUP_INTERVAL)
+        current_time = time.time()
+
+        # Find dead peers
+        dead_peers = [peer_id for peer_id, last_seen in peer_last_seen.items()
+                      if current_time - last_seen > PEER_TIMEOUT]
+
+        if dead_peers:
+            print(f"🧹 Running periodic cleanup, found {len(dead_peers)} dead peer(s)...")
+            for dead_node_id in dead_peers:
+                if dead_node_id in peer_table:
+                    del peer_table[dead_node_id]
+                active_peer_ids.discard(dead_node_id)
+                if dead_node_id in peer_last_seen:
+                    del peer_last_seen[dead_node_id]
+
+                # Also mark as inactive in the database
+                await _db[PEERS_COLLECTION].update_one(
+                    {"peer_id": dead_node_id},
+                    {"$set": {"is_active": False}}
+                )
+                print(f"💀 Peer {dead_node_id[:8]} timed out and removed during periodic cleanup")
+            print(f"🔗 Active peers after cleanup: {len(active_peer_ids)} ({list(peer_table.keys())})")
+
+            # After cleaning up peers, check for orphaned deployments
+            for model_name, deployment_info in list(active_deployments.items()):
+                # Check if deployment has a map
+                if "deployment_map" not in deployment_info or not deployment_info["deployment_map"]:
+                    continue
+
+                peers_for_deployment = set(deployment_info["deployment_map"].keys())
+
+                # If the set of peers for this deployment is not empty and has no intersection
+                # with the currently active peers, then all its peers are gone.
+                if peers_for_deployment and peers_for_deployment.isdisjoint(active_peer_ids):
+                    print(f"🗑️ All peers for model '{model_name}' have timed out. Clearing deployment.")
+                    del active_deployments[model_name]
+
 
 @app.get("/metrics/{peer_id}")
 async def get_peer_metrics_endpoint(peer_id: str, time_window: int = 300):
