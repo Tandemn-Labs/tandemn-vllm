@@ -462,6 +462,17 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
                 lm_head_weights = load_safetensors_file(lm_head_path)
                 all_weights.update(lm_head_weights)
                 print(f"✅ Loaded lm_head weights from {lm_head_path}")
+            else:
+                # Handle tied embeddings case - copy embed_tokens weights to lm_head
+                print(f"ℹ️ No separate lm_head file found - checking for tied embeddings")
+                if "model.embed_tokens.weight" in all_weights:
+                    # Llama models with tied embeddings
+                    all_weights["lm_head.weight"] = all_weights["model.embed_tokens.weight"]
+                    print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
+                elif "embed_tokens.weight" in all_weights:
+                    # Alternative naming
+                    all_weights["lm_head.weight"] = all_weights["embed_tokens.weight"]
+                    print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
             
             # Load model.norm (always needed for last peer)
             norm_path = shards_root / "norm" / "layer.safetensors"
@@ -624,6 +635,17 @@ def create_async_vllm_engine_with_selective_layers(
             lm_head_weights = load_safetensors_file(lm_head_path)
             all_weights.update(lm_head_weights)
             print(f"✅ Loaded lm_head weights from {lm_head_path}")
+        else:
+            # Handle tied embeddings case - copy embed_tokens weights to lm_head
+            print(f"ℹ️ No separate lm_head file found - checking for tied embeddings")
+            if "model.embed_tokens.weight" in all_weights:
+                # Llama models with tied embeddings
+                all_weights["lm_head.weight"] = all_weights["model.embed_tokens.weight"]
+                print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
+            elif "embed_tokens.weight" in all_weights:
+                # Alternative naming
+                all_weights["lm_head.weight"] = all_weights["embed_tokens.weight"]
+                print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
         
         # Load model.norm (always needed for last peer)
         norm_path = shards_root / "norm" / "layer.safetensors"
