@@ -15,7 +15,50 @@ import os
 import subprocess
 
 
+
 def load_model_metadata(shard_folder: str):
+    # Prefer reading layer_metadata.json from S3 if configured
+    s3_base = os.getenv("S3_SHARDS_BASE", "")
+    model_dir_name = Path(shard_folder).name if shard_folder else ""
+    if s3_base:
+        try:
+            from urllib.parse import urlparse
+            o = urlparse(s3_base)
+            bucket = o.netloc
+            base_key = o.path.lstrip('/')
+            key = f"{base_key.rstrip('/')}/{model_dir_name}/layer_metadata.json" if model_dir_name else f"{base_key.rstrip('/')}/layer_metadata.json"
+            try:
+                import boto3  # type: ignore
+                client = boto3.client("s3")
+                obj = client.get_object(Bucket=bucket, Key=key)
+                body = obj["Body"].read()
+                metadata = json.loads(body)
+                print(f"📊 Model metadata (S3): {metadata['num_layers']} layers, type: {metadata.get('model_type', 'unknown')}")
+                return metadata
+            except ImportError:
+                # Fallback to aws cli if boto3 is not installed
+                import tempfile
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_path = Path(tmpdir) / "layer_metadata.json"
+                    cmd = [
+                        "aws", "s3", "cp",
+                        f"s3://{bucket}/{key}",
+                        str(tmp_path)
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        raise HTTPException(status_code=404, detail=f"Failed to read layer_metadata.json from S3 at s3://{bucket}/{key}: {result.stderr.strip()}")
+                    with open(tmp_path, "r") as f:
+                        metadata = json.load(f)
+                    print(f"📊 Model metadata (S3 via aws cli): {metadata['num_layers']} layers, type: {metadata.get('model_type', 'unknown')}")
+                    return metadata
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"⚠️ Failed to read layer_metadata.json from S3 base {s3_base}: {e}")
+            # Fall back to local if S3 read fails
+
+    # Local fallback
     shard_path = Path(shard_folder)
     metadata_file = shard_path / "layer_metadata.json"
     if not metadata_file.exists() or not shard_path.exists():
@@ -132,6 +175,15 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
     else:
         base_url = f"http://{SERVER_IP}:{SERVER_PORT}/download_file/{request.model_name.replace('/', '_')}"
 
+    # Check if model has tied embeddings (need to read metadata)
+    try:
+        # Try to get tie_word_embeddings from model metadata
+        metadata = load_model_metadata(getattr(request, "shard_folder", ""))
+        tie_word_embeddings = metadata.get("tie_word_embeddings", False)
+    except:
+        # Default to False if we can't read metadata
+        tie_word_embeddings = False
+
     for i, (peer_id, peer_info) in enumerate(distribution_plan["distribution"].items()):
         is_first_peer = (i == 0)
         is_last_peer = (i == len(peer_list) - 1)
@@ -163,10 +215,30 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
             required_files.append("embedding/layer.safetensors")
             
         if is_last_peer:
+            # Always need norm for last peer
             required_files.extend([
-                "lm_head/layer.safetensors",
                 "norm/layer.safetensors"
             ])
+            
+            # Check if lm_head file exists (not tied) or if we need embeddings (tied)
+            # Try to determine if lm_head file exists
+            lm_head_exists = True  # Default assumption
+            
+            # If we have access to the shard folder, check if lm_head exists
+            if hasattr(request, "shard_folder") and request.shard_folder:
+                shard_path = Path(request.shard_folder)
+                lm_head_path = shard_path / "lm_head" / "layer.safetensors"
+                lm_head_exists = lm_head_path.exists()
+            
+            if lm_head_exists:
+                # Model has separate lm_head weights
+                required_files.append("lm_head/layer.safetensors")
+            else:
+                # Model likely has tied embeddings - last peer needs embedding file too
+                # This ensures the last peer can copy embed_tokens.weight to lm_head.weight
+                if "embedding/layer.safetensors" not in required_files:
+                    required_files.append("embedding/layer.safetensors")
+                    print(f"ℹ️ Last peer {peer_id} will download embeddings (tied weights detected)")
         
         for layer_idx in assigned_layers:
             required_files.append(f"layers/layer_{layer_idx}.safetensors")
@@ -189,6 +261,7 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
             "quantization": getattr(request, "quantization", None),
             "dtype": getattr(request, "dtype", None),
             "qbits": getattr(request, "qbits", None),
+            "tie_word_embeddings": tie_word_embeddings,  # Pass this info to peers
         }
     return deployment_instructions
 
@@ -417,7 +490,7 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
             model=model_dir,
             tensor_parallel_size=1,
             enforce_eager=True,  # Required for custom layer loading
-            max_model_len=128,   # Small for demo
+            max_model_len=50,   # Small for demo
             disable_log_stats=True,
             skip_tokenizer_init=False,
             gpu_memory_utilization=0.8,  # Use much less memory
