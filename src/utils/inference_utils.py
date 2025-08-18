@@ -166,44 +166,34 @@ def create_virtual_sampler_output(request_id: str, step_idx: int) -> Any:
     """
     try:
         from vllm.model_executor.layers.sampler import SamplerOutput
-        from vllm.outputs import CompletionSequenceGroupOutput, SequenceOutput
-        from vllm.sequence import Logprob
-        import torch
-        
-        # Create minimal mock SequenceOutput
+        from vllm.sequence import CompletionSequenceGroupOutput, SequenceOutput, Logprob
+
+        # Choose a dummy token id and provide a matching logprob entry
+        output_token_id = 1
+
+        # minimal mock SequenceOutput
         mock_sequence_output = SequenceOutput(
             parent_seq_id=0,
-            output_token=1,  # Dummy token ID
-            logprobs=None,  # No logprobs needed for intermediate peers
+            output_token=output_token_id,
+            logprobs={output_token_id: Logprob(logprob=0.0)},
         )
-        
-        # Create minimal mock CompletionSequenceGroupOutput
+
+        # minimal mock CompletionSequenceGroupOutput
         mock_completion_output = CompletionSequenceGroupOutput(
             samples=[mock_sequence_output],
             prompt_logprobs=None,
         )
-        
-        # Create virtual SamplerOutput with minimal required fields
+
+        # virtual SamplerOutput with just the required outputs field
         virtual_sampler_output = SamplerOutput(
             outputs=[mock_completion_output],
-            sampled_token_probs=None,  # Not needed for intermediate peers
-            logprobs=None,  # Not needed for intermediate peers  
-            sampled_token_ids=None,  # Not needed for intermediate peers
-            sampled_token_ids_cpu=None,
-            sampled_token_embeds=None,
-            spec_decode_worker_metrics=None,
-            hidden_states=None,
-            prefill_hidden_states=None,
-            model_forward_time=None,
-            model_execute_time=None,
         )
-        
+
         print(f"🎭 Created virtual SamplerOutput for intermediate peer (request: {request_id}, step: {step_idx})")
         return virtual_sampler_output
-        
+
     except Exception as e:
         print(f"❌ Failed to create virtual SamplerOutput: {e}")
-        # Fallback: return None and let the system handle it
         return None
 
 
@@ -393,6 +383,28 @@ def register_inference_hooks(
                 hidden_states = hidden_states[-1:, :]
                 residual = residual[-1:, :]
         
+        # Normalize ranks before sending to ensure both tensors match
+        if current_step == 0:
+            # Prompt phase: ensure (seq, hidden)
+            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                hidden_states = hidden_states.squeeze(0)
+            if residual.dim() == 3 and residual.size(0) == 1:
+                residual = residual.squeeze(0)
+            if hidden_states.dim() == 3:
+                hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+            if residual.dim() == 3:
+                residual = residual.view(-1, residual.size(-1))
+        else:
+            # Decode phase: ensure (1, hidden)
+            if hidden_states.dim() >= 2:
+                hidden_states = hidden_states.view(-1, hidden_states.size(-1))[-1:, :]
+            else:
+                hidden_states = hidden_states.view(1, -1)
+            if residual.dim() >= 2:
+                residual = residual.view(-1, residual.size(-1))[-1:, :]
+            else:
+                residual = residual.view(1, -1)
+        
         # Direct tensor sending (skip CPU conversion if possible)
         next_peer_id = hook_context["next_peer_id"]
         next_peer_ticket = hook_context["next_peer_ticket"]
@@ -468,9 +480,11 @@ def register_inference_hooks(
             
             # Clean up old data to prevent memory growth
             with CONTEXT_LOCK:
-                if current_step > 0:
+                if current_step > 0 and request_id in INFERENCE_CONTEXT:
                     INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                if current_step > 0 and request_id in STEP_EVENTS:
                     STEP_EVENTS[request_id].pop(current_step - 1, None)
+                if current_step > 0 and request_id in STEP_EVENTS_SAMPLER:
                     STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
                 
             return output
@@ -500,9 +514,11 @@ def register_inference_hooks(
                 
                 # Clean up consumed data to prevent memory growth
                 with CONTEXT_LOCK:
-                    if current_step > 0:
+                    if current_step > 0 and request_id in INFERENCE_CONTEXT:
                         INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                    if current_step > 0 and request_id in STEP_EVENTS:
                         STEP_EVENTS[request_id].pop(current_step - 1, None)
+                    if current_step > 0 and request_id in STEP_EVENTS_SAMPLER:
                         STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
                 
                 # Increment step after receiving
@@ -536,9 +552,11 @@ def register_inference_hooks(
                 
                 # Clean up old data to prevent memory growth
                 with CONTEXT_LOCK:
-                    if current_step > 0:
+                    if current_step > 0 and request_id in INFERENCE_CONTEXT:
                         INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
+                    if current_step > 0 and request_id in STEP_EVENTS:
                         STEP_EVENTS[request_id].pop(current_step - 1, None)
+                    if current_step > 0 and request_id in STEP_EVENTS_SAMPLER:
                         STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
                 
                 # Increment step immediately (no waiting!)
@@ -805,8 +823,17 @@ async def send_inference_tensors_fast(
             hidden_np = hidden_states.detach().numpy()
             residual_np = residual.detach().numpy()
         
-        # Stack efficiently
-        combined_tensor = np.concatenate([hidden_np.reshape(1, *hidden_np.shape), residual_np.reshape(1, *residual_np.shape)], axis=0)
+        # Normalize to 2D (seq, hidden)
+        hidden_np = hidden_np.reshape(-1, hidden_np.shape[-1])
+        residual_np = residual_np.reshape(-1, residual_np.shape[-1])
+        
+        # For decode steps, ensure (1, hidden)
+        if step_idx > 0:
+            hidden_np = hidden_np[-1:, :]
+            residual_np = residual_np[-1:, :]
+        
+        # Stack along a new axis to form (2, seq_or_1, hidden)
+        combined_tensor = np.stack([hidden_np, residual_np], axis=0)
         
         # Calculate payload size
         payload_size_bytes = combined_tensor.nbytes
@@ -823,10 +850,12 @@ async def send_inference_tensors_fast(
             name=f"{request_id}_step{step_idx}_combined",
             tensor=combined_tensor
         )
+        
+        print(f"✅ [FAST] sent name='{request_id}_step{step_idx}_combined' → next={str(next_peer_id)[:8]}")
 
     except Exception as e:
-        # Minimal error handling - no printing in hot path
-        pass
+        print(f"❌ [FAST] send error req={request_id} step={step_idx} next={str(next_peer_id)[:8]} err={e}")
+        raise
 
 
 async def send_sampler_output(
