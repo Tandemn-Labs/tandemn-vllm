@@ -1,5 +1,4 @@
 import asyncio
-import iroh
 import torch
 import json
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
@@ -102,9 +101,6 @@ class HeartbeatRequest(BaseModel):
     total_free_vram_gb: Optional[float] = None
     timestamp: int
 
-class NoopCallback(iroh.GossipMessageCallback):
-    async def on_message(self, msg):
-        return
 
 # still has to change
 class InferenceResponse(BaseModel):
