@@ -1,7 +1,7 @@
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 export PATH="~/.local/bin:$PATH"
-export PATH="~/tandemn-vllm/scripts"
+export PATH="~/tandemn-vllm/scripts:$PATH"
 
 chmod +x ~/tandemn-vllm/scripts/*
 
