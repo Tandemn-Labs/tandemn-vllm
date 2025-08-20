@@ -240,7 +240,7 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         # Colored log
         color = _get_peer_color(hb.peer_id)
         # print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
-        print(f"🔗 Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
+        # print(f"🔗 Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
         
         return {
             "status": "ok",

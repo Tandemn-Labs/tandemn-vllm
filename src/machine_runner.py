@@ -212,7 +212,6 @@ async def handle_inference_trigger_message(tensor):
                 pipeline,
                 input_text,
                 sampling_params,
-                assigned_layers,
             )
             
             print(f"✅ Inference started for request {request_id}")

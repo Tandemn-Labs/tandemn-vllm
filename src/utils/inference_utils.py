@@ -223,12 +223,15 @@ def register_inference_hooks(
     model = model_runner.model
     sampler = model_runner.sampler
     
-    # Thread-safe hook context with locks
-    hook_contexts = {}  # Per-request context storage
+    # Per-request context storage, maps uuid to dict of metadata
+    hook_contexts = {}
+
     # context_lock protects hook_contexts and all fields inside each context
     # (request_id, current_step, active, is_first/last, routing info). Hooks
     # from multiple threads consult and update this state during forward passes.
     context_lock = threading.RLock()
+
+    main_loop = asyncio.get_running_loop()
 
     # Discover hidden/vocab sizes from model config or layers where possible
     def get_model_hidden_size() -> Optional[int]:
@@ -285,7 +288,7 @@ def register_inference_hooks(
             if not active_contexts:
                 return args
             
-            hook_context = active_contexts[0]
+            hook_context = active_contexts[0] #?
             request_id = hook_context["request_id"]
             current_step = hook_context["current_step"]
             print(f"🔍 Pre-hook called for request {request_id} step {current_step}")
@@ -367,7 +370,7 @@ def register_inference_hooks(
             if not active_contexts:
                 return
             
-            hook_context = active_contexts[0]
+            hook_context = active_contexts[0] #?
             
             # Skip if last peer (no sending needed)
             if hook_context["is_last_peer"]:
@@ -375,6 +378,8 @@ def register_inference_hooks(
                 
             request_id = hook_context["request_id"]
             current_step = hook_context["current_step"]
+
+            print(f"pre-hook: {request_id}")
             
             # Fast duplicate check
             context_key = f"sent_step_{current_step}"
@@ -439,10 +444,8 @@ def register_inference_hooks(
         )
         
         # NOTE: Step increment moved to sampler_post_hook to ensure it happens on ALL peers
-    
-    # Capture the main asyncio loop so we can schedule coroutines from threads
-    main_loop = asyncio.get_running_loop()
 
+    
     def sampler_post_hook(module, args, output):
         """
         Post-hook for the sampler module.
@@ -577,7 +580,7 @@ def register_inference_hooks(
                 return virtual_output
 
 
-    def start_inference_run(request_id: str, pipeline: List[str], input_text: str, sampling_params: Any, assigned_layers: Dict[str, List[int]]):
+    def start_inference_run(request_id: str, pipeline: List[str], input_text: str, sampling_params: Any):
         """The main inference runner"""
         # Generate unique execution ID to avoid collisions
         execution_id = str(uuid.uuid4())[:8]
@@ -648,19 +651,23 @@ def register_inference_hooks(
                     # AsyncLLMEngine (v0): generate is an async generator and requires request_id
                     async def _collect_async_outputs():
                         last_output = None
+                        print(f"async-llm-generate: {request_id}")
                         async for out in llm.generate(
                             input_text,  # prompt as string
                             sampling_params,
                             request_id,
                         ):
+                            print(f"In async-llm-generate: {out}")
                             last_output = out
                         return last_output
 
+                    # Runs the coro in the event loop belonging in another thread
                     future = asyncio.run_coroutine_threadsafe(_collect_async_outputs(), main_loop)
                     final_output = future.result()
                     completions = [final_output] if final_output is not None else []
                 else:
                     # Blocking LLM path
+                    print(f"llm-generate: {request_id}")
                     completions = llm.generate([input_text], sampling_params=sampling_params)
 
                 # If last peer, send final result to server
