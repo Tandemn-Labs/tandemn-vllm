@@ -30,7 +30,6 @@ class TensorTransport:
 
         # Fetch the node-ticket (= shareable address string)
         self._ticket = await self._node.get_node_addr()
-        print(f"🪪 TensorTransport started – ticket:\n{self._ticket}\n")
 
     async def stop(self) -> None:
         if self._node is not None:
