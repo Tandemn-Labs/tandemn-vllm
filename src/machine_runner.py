@@ -502,7 +502,7 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
                         central_server_ticket = data["central_server_ticket"]
                         print(f"🔗 Central server ticket: {central_server_ticket}")
                         server_added = True
-                    print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
+                    # print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
                 else:
                     consecutive_failures += 1
                     print(f"{PEER_COLOR}⚠️ Heartbeat HTTP {response.status_code}{Style.RESET_ALL}")
@@ -535,7 +535,7 @@ async def main():
     print(f"✅ Registered in MongoDB as {current_peer_ticket}")
     print("Starting unified message gateway...")
     gateway_task = asyncio.create_task(unified_message_gateway())
-    debug_monitor_task = asyncio.create_task(debug_inference_context_monitor())
+    # debug_monitor_task = asyncio.create_task(debug_inference_context_monitor())
     await asyncio.sleep(1)
 
 
@@ -570,7 +570,7 @@ async def main():
         # Cancel background tasks
         heartbeat_task.cancel()
         gateway_task.cancel()
-        debug_monitor_task.cancel()
+        # debug_monitor_task.cancel()
         try:
             await heartbeat_task
         except asyncio.CancelledError:
@@ -579,10 +579,10 @@ async def main():
             await gateway_task
         except asyncio.CancelledError:
             pass
-        try:
-            await debug_monitor_task
-        except asyncio.CancelledError:
-            pass
+        # try:
+        #     await debug_monitor_task
+        # except asyncio.CancelledError:
+        #     pass
         # Deregister peer when shutting down
         # await deregister_peer(current_peer_ticket)
         print(f"👋 Deregistered {current_peer_ticket} from pipeline")

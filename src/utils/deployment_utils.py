@@ -642,7 +642,7 @@ def create_async_vllm_engine_with_selective_layers(
                 # Llama models with tied embeddings
                 all_weights["lm_head.weight"] = all_weights["model.embed_tokens.weight"]
                 print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
-            elif "embed_tokens.weight" in all_weights:
+            if "embed_tokens.weight" in all_weights:
                 # Alternative naming
                 all_weights["lm_head.weight"] = all_weights["embed_tokens.weight"]
                 print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
@@ -680,7 +680,7 @@ def create_async_vllm_engine_with_selective_layers(
                 is_expected_missing = False
                 
                 # Check if it's from an unassigned layer
-                for i in range(100):  # Assuming max 100 layers
+                for i in range(400):  # Assuming max 100 layers
                     if f".layers.{i}." in name and i not in assigned_layers:
                         is_expected_missing = True
                         break
