@@ -324,15 +324,15 @@ def register_inference_hooks(
         if current_step:  # Decode phase
             # Pre-computed shapes for decode (single token)
             # Ensure tensors are on correct device
-            print(f"🔍 Pre-hook reshaping for request {request_id} step {current_step}", hidden_states, hidden_states.shape)
+            # print(f"🔍 Pre-hook reshaping for request {request_id} step {current_step}", hidden_states, hidden_states.shape)
             hidden_reshaped = hidden_states.view(1, 1, payload_hidden_size).to(device, non_blocking=True)
-            print(f"🔍 Pre-hook reshaped hidden_states: {hidden_reshaped}", hidden_reshaped.shape)
-            print(f"🔍 Pre-hook residual: {residual}", residual.shape)
+            # print(f"🔍 Pre-hook reshaped hidden_states: {hidden_reshaped}", hidden_reshaped.shape)
+            # print(f"🔍 Pre-hook residual: {residual}", residual.shape)
             residual_reshaped = residual.view(1, 1, payload_hidden_size).to(device, non_blocking=True)
-            print(f"🔍 Pre-hook residual_reshaped: {residual_reshaped}", residual_reshaped.shape)
-            print(f"🔍 Pre-hook positions: {positions}", positions.shape) 
+            # print(f"🔍 Pre-hook residual_reshaped: {residual_reshaped}", residual_reshaped.shape)
+            # print(f"🔍 Pre-hook positions: {positions}", positions.shape) 
             positions_reshaped = positions.view(1, 1).to(device, non_blocking=True) if positions.numel() == 1 else positions.view(1, -1)[:, -1:].to(device, non_blocking=True)
-            print(f"🔍 Pre-hook positions_reshaped: {positions_reshaped}", positions_reshaped.shape)
+            # print(f"🔍 Pre-hook positions_reshaped: {positions_reshaped}", positions_reshaped.shape)
 
             # Clean up old data immediately
             if current_step > 1:
@@ -344,19 +344,19 @@ def register_inference_hooks(
         else:  # Prompt phase
             seq_len = hidden_states.shape[0]  # sequence length
             # Reshape with minimal operations
-            print(f"🔍 Pre-hook reshaping for request {request_id} step {current_step}", hidden_states, hidden_states.shape)
+            # print(f"🔍 Pre-hook reshaping for request {request_id} step {current_step}", hidden_states, hidden_states.shape)
             hidden_reshaped = hidden_states.view(1, seq_len, payload_hidden_size).to(device, non_blocking=True)
-            print(f"🔍 Pre-hook reshaped hidden_states: {hidden_reshaped}", hidden_reshaped.shape)
-            print(f"🔍 Pre-hook residual: {residual}", residual.shape)
+            # print(f"🔍 Pre-hook reshaped hidden_states: {hidden_reshaped}", hidden_reshaped.shape)
+            # print(f"🔍 Pre-hook residual: {residual}", residual.shape)
             residual_reshaped = residual.view(1, seq_len, payload_hidden_size).to(device, non_blocking=True)
-            print(f"🔍 Pre-hook residual_reshaped: {residual_reshaped}", residual_reshaped.shape)
-            print(f"🔍 Pre-hook positions: {positions}", positions.shape) 
+            # print(f"🔍 Pre-hook residual_reshaped: {residual_reshaped}", residual_reshaped.shape)
+            # print(f"🔍 Pre-hook positions: {positions}", positions.shape) 
             # Handle positions efficiently
             if positions.dim() == 1:
                 positions = positions.unsqueeze(0)
             positions_reshaped = positions[:, -seq_len:] if positions.shape[1] >= seq_len else positions
             positions_reshaped = positions_reshaped.to(device, non_blocking=True)
-            print(f"🔍 Pre-hook positions_reshaped: {positions_reshaped}", positions_reshaped.shape)
+            # print(f"🔍 Pre-hook positions_reshaped: {positions_reshaped}", positions_reshaped.shape)
             return (positions_reshaped, hidden_reshaped, residual_reshaped)
 
     def post_hook(module, args, output):
@@ -383,8 +383,8 @@ def register_inference_hooks(
             hook_context[context_key] = True
         
         hidden_states, residual = output
-        print(f"🔍 Post-hook called for request {request_id} step {current_step}", hidden_states, hidden_states.shape)
-        print(f"🔍 Post-hook residual: {residual}", residual.shape)
+        # print(f"🔍 Post-hook called for request {request_id} step {current_step}", hidden_states, hidden_states.shape)
+        # print(f"🔍 Post-hook residual: {residual}", residual.shape)
         
         # Single slice operation for decode (no validation)
         if current_step > 0:
@@ -395,8 +395,31 @@ def register_inference_hooks(
             elif hidden_states.dim() == 2 and hidden_states.shape[0] > 1:
                 hidden_states = hidden_states[-1:, :]
                 residual = residual[-1:, :]
-        print(f"🔍 Post-hook hidden_states: {hidden_states}", hidden_states.shape, f"id {id(hidden_states)}")
-        print(f"🔍 Post-hook residual: {residual}", residual.shape)
+        # print(f"🔍 Post-hook hidden_states: {hidden_states}", hidden_states.shape, f"id {id(hidden_states)}")
+        # print(f"🔍 Post-hook residual: {residual}", residual.shape)
+                # Normalize ranks before sending to ensure both tensors match
+        if current_step == 0:
+            # Prompt phase: ensure (seq, hidden)
+            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                hidden_states = hidden_states.squeeze(0)
+            if residual.dim() == 3 and residual.size(0) == 1:
+                residual = residual.squeeze(0)
+            if hidden_states.dim() == 3:
+                hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+            if residual.dim() == 3:
+                residual = residual.view(-1, residual.size(-1))
+        else:
+            # Decode phase: ensure (1, hidden)
+            if hidden_states.dim() >= 2:
+                hidden_states = hidden_states.view(-1, hidden_states.size(-1))[-1:, :]
+            else:
+                hidden_states = hidden_states.view(1, -1)
+            if residual.dim() >= 2:
+                residual = residual.view(-1, residual.size(-1))[-1:, :]
+            else:
+                residual = residual.view(1, -1)
+        # print(f"🔍 Post-hook hidden_states: {hidden_states}", hidden_states.shape, f"id {id(hidden_states)}")
+        # print(f"🔍 Post-hook residual: {residual}", residual.shape)
         # Direct tensor sending (skip CPU conversion if possible)
         next_peer_id = hook_context["next_peer_id"]
         next_peer_ticket = hook_context["next_peer_ticket"]
@@ -813,8 +836,17 @@ async def send_inference_tensors_fast(
             residual_np = residual.detach().numpy()
         
         # Stack efficiently
-        combined_tensor = np.concatenate([hidden_np.reshape(1, *hidden_np.shape), residual_np.reshape(1, *residual_np.shape)], axis=0)
-        print(f"🔍 Combined tensor: {combined_tensor}", combined_tensor.shape)
+        # combined_tensor = np.concatenate([hidden_np.reshape(1, *hidden_np.shape), residual_np.reshape(1, *residual_np.shape)], axis=0)
+        # print(f"🔍 Combined tensor: {combined_tensor}", combined_tensor.shape)
+         # Normalize to 2D (seq, hidden)
+        hidden_np = hidden_np.reshape(-1, hidden_np.shape[-1])
+        residual_np = residual_np.reshape(-1, residual_np.shape[-1])
+        # For decode steps, ensure (1, hidden)
+        if step_idx > 0:
+            hidden_np = hidden_np[-1:, :]
+            residual_np = residual_np[-1:, :]
+        # Stack along a new axis to form (2, seq_or_1, hidden)
+        combined_tensor = np.stack([hidden_np, residual_np], axis=0)
         # Calculate payload size
         payload_size_bytes = combined_tensor.nbytes
         payload_size_mb = payload_size_bytes / (1024 * 1024)
