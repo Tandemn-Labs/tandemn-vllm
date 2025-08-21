@@ -54,7 +54,7 @@ from src.utils.gpu_utils import (
 
 # Global TensorTransport instance (lazy-started in main) #######################
 tensor_transport: TensorTransport | None = None
-peer_ticket_map: dict[str, str] = {}  # peer_id  → ticket string (filled in heartbeat)
+peer_ticket_map: dict[str, str] = {}  # peer_id  → ticket string (filled in heartbeat) #? Check if hostnames are being set even
 current_peer_ticket = None # this is the global variable for the current peer ticket
 deployed_model = None # this is the global variable for the deployed model
 deployment_status = "idle"  # idle, downloading, loading, ready, failed
@@ -212,7 +212,6 @@ async def handle_inference_trigger_message(tensor):
                 pipeline,
                 input_text,
                 sampling_params,
-                assigned_layers,
             )
             
             print(f"✅ Inference started for request {request_id}")
@@ -503,6 +502,7 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
                         print(f"🔗 Central server ticket: {central_server_ticket}")
                         server_added = True
                     # print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
+                    # print(f"{PEER_COLOR}💓 Sent heartbeat | CPU {metrics.cpu_percent:.1f}% VRAM {total_free_vram:.1f} GB → ACK {Style.RESET_ALL}")
                 else:
                     consecutive_failures += 1
                     print(f"{PEER_COLOR}⚠️ Heartbeat HTTP {response.status_code}{Style.RESET_ALL}")
@@ -514,36 +514,38 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
                 os._exit(1)
             await asyncio.sleep(interval_s)
 
-
-
-
 async def main():
     """Main function to run the distributed computation node"""
     global current_peer_ticket, peer_ticket_map, tensor_transport
+    
     # Set up Tensor_Iroh and get the ticket #################################
     tensor_transport = TensorTransport()
     await tensor_transport.start()
     current_peer_ticket = tensor_transport.ticket
     print(f"🪪 TensorTransport started – ticket:\n{current_peer_ticket}\n")
+    
     # Set up a unique data directory for this node
     hostname = socket.gethostname()
     ticket_and_hostname = f"Ticket: {current_peer_ticket}, Hostname: {hostname}"
     peer_ticket_map[ticket_and_hostname] = current_peer_ticket # check if we even need ticket_and_hostname
-    print(f"🤖 Running as peer: {current_peer_ticket}")
+    
+    print(f"🤖 Running as peer: {current_peer_ticket}") #? Misleading, does our use of the term peer mean that it is registered w server?
     heartbeat_task = asyncio.create_task(http_heartbeat_loop(current_peer_ticket))
     await register_peer(current_peer_ticket, hostname)
     print(f"✅ Registered in MongoDB as {current_peer_ticket}")
+    
+    # Main gateway to receive web requests
     print("Starting unified message gateway...")
     gateway_task = asyncio.create_task(unified_message_gateway())
-    # debug_monitor_task = asyncio.create_task(debug_inference_context_monitor())
-    await asyncio.sleep(1)
+    debug_monitor_task = asyncio.create_task(debug_inference_context_monitor())
+    await asyncio.sleep(1) #?
 
 
-    try:
+    try: #? Why is this specific portion in a try block
         # Wait until this peer is included in the pipeline configuration
         print("⏳ Waiting to be included in the pipeline...")
-        while True:
-            pipeline = await get_active_peers()
+        while True: #? This block seems strange. get_active_peers checks the same thing as register_peer, which we just await-ed
+            pipeline = await get_active_peers() #? the ordering of peers in the pipeline is order of addition to db, is this correct?
             print(f"🔗 Pipeline: {pipeline}")
             if current_peer_ticket in pipeline:
                 print(f"✅ Included in pipeline as {current_peer_ticket}")
@@ -558,11 +560,10 @@ async def main():
 
         print(f"✅ Position: {index} | First: {is_first} | Last: {is_last}")
 
-        # Main processing loop - continuously process computation jobs
-        while True:
-            # print("🔄 Processing...")
-            # await process_once(doc, author, peer_id, next_peer, is_first, is_last, local_matrix, node)
-            await asyncio.sleep(2)  # Small delay between processing cycles
+        try:
+            await gateway_task
+        except Exception as e:
+            print(f"Gateway crash: {e}")
 
     except Exception as e:
         print(f"❌ Error in main loop: {e}")

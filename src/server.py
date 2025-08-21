@@ -54,7 +54,7 @@ from src.utils.model_utils import (
 app = FastAPI(title="Iroh Tandemn Server")
 
 # SERVER_IP = "172.16.1.249"
-SERVER_IP = SERVER_HOST
+SERVER_IP = SERVER_HOST #?
 
 # Global Variables for Iroh Node and Gossip Management
 
@@ -160,6 +160,7 @@ async def startup():
     central_server_ticket = tensor_transport.ticket
     print(f"🪪 TensorTransport for the central server started – ticket:\n{central_server_ticket}\n")
     #################################################################################################
+    
     # Start the background task for cleaning up inactive peers
     asyncio.create_task(periodic_peer_cleanup())
     
@@ -238,8 +239,8 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         )
         # Colored log
         color = _get_peer_color(hb.peer_id)
-        print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
-        print(f"🔗 Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
+        # print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
+        # print(f"🔗 Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
         
         return {
             "status": "ok",
