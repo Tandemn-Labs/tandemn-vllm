@@ -10,11 +10,16 @@ import json
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
+import tempfile
+import subprocess
+import shutil
+
 import torch
 from safetensors.torch import save_file
 from huggingface_hub import hf_hub_download, list_repo_files
 from transformers import AutoConfig, AutoTokenizer
 
+import boto3
 from .sharding_adapters import get_adapter_for_config
 
 # Ensure accelerated downloads from Hugging Face are enabled for this process
@@ -29,7 +34,39 @@ def get_model_safetensors_files(model_name: str, hf_token: Optional[str] = None)
 	except Exception as e:
 		print(f"Error listing files for {model_name}: {e}")
 		return []
+		
+def _s3_upload_file(local_path: Path, s3_uri: str) -> bool:
+	try:
+		import boto3  # type: ignore
+		# Parse s3://bucket/key format without urlparse
+		if s3_uri.startswith("s3://"):
+			s3_path = s3_uri[5:]  # Remove "s3://"
+			parts = s3_path.split('/', 1)
+			if len(parts) == 2:
+				bucket, key = parts
+			else:
+				bucket = parts[0]
+				key = ""
+		else:
+			print(f"❌ Invalid S3 URI format: {s3_uri}")
+			return False
+		
+		boto3.client("s3").upload_file(str(local_path), bucket, key)
+		return True
+	except ImportError:
+		cmd = ["aws", "s3", "cp", str(local_path), s3_uri]
+		result = subprocess.run(cmd, capture_output=True, text=True)
+		if result.returncode != 0:
+			print(f"❌ aws cli upload failed: {result.stderr}")
+			return False
+		return True
+	except Exception as e:
+		print(f"❌ Failed to upload {local_path} to {s3_uri}: {e}")
+		return False
 
+
+def _join_s3_uri(base: str, *parts: str) -> str:
+	return base.rstrip('/') + '/' + '/'.join(p.strip('/').replace('\\', '/') for p in parts)
 
 def load_safetensors(local_path: str) -> Dict[str, torch.Tensor]:
 	from safetensors.torch import load_file as st_load
@@ -74,9 +111,19 @@ def shard_model_by_layers_safetensors(
 	print(f"🔪 Starting safetensors-based layer sharding for {model_name}")
 
 	# Output setup
-	output_path = Path(output_dir)
-	output_path.mkdir(parents=True, exist_ok=True)
+	s3_base = os.getenv("S3_SHARDS_BASE")  # e.g., s3://tandemn-model-shards/shards
+	use_s3 = bool(s3_base)
+	model_dir_name = model_name.replace('/', '_')
+	dest_root_uri = _join_s3_uri(s3_base, model_dir_name) if use_s3 else output_dir
 
+	if use_s3:
+		tmpdir = tempfile.mkdtemp(prefix="shards-")
+		output_path = Path(tmpdir)
+		print(f"🔪 Using temporary directory: {output_path}")
+	else:
+		output_path = Path(output_dir)
+		output_path.mkdir(parents=True, exist_ok=True)
+	
 	# Config & tokenizer
 	config = AutoConfig.from_pretrained(
 		model_name,
@@ -201,6 +248,25 @@ def shard_model_by_layers_safetensors(
 	metadata_path = output_path / "layer_metadata.json"
 	with open(metadata_path, "w") as f:
 		json.dump(metadata, f, indent=2)
+
+	if use_s3:
+		print(f"🔪 Uploading to S3: {dest_root_uri}")
+		uploaded=0
+		for file in output_path.rglob("*"):
+			if file.is_file():
+				relative_path = file.relative_to(output_path).as_posix()
+				s3_uri = _join_s3_uri(dest_root_uri, relative_path)
+				if not _s3_upload_file(file, s3_uri):
+					print(f"❌ Failed to upload {file} to {s3_uri}")
+				else:
+					uploaded += 1
+		print(f"✅ Successfully uploaded {uploaded} files to S3")
+		try:
+			shutil.rmtree(tmpdir)
+			print(f"🔪 Removed temporary directory: {tmpdir}")
+		except Exception as e:
+			print(f"⚠️ Failed to remove temporary directory: {e}")
+			pass
 
 	print(f"✅ Successfully sharded model into {len(metadata['layer_components'])} components")
 	print(f"📁 Saved to: {output_path}")
