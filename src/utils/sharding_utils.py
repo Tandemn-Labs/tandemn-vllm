@@ -113,6 +113,7 @@ def shard_model_by_layers_safetensors(
 	# Output setup
 	s3_base = os.getenv("S3_SHARDS_BASE")  # e.g., s3://tandemn-model-shards/shards
 	use_s3 = bool(s3_base)
+	# use_s3 = False
 	model_dir_name = model_name.replace('/', '_')
 	dest_root_uri = _join_s3_uri(s3_base, model_dir_name) if use_s3 else output_dir
 
@@ -139,6 +140,14 @@ def shard_model_by_layers_safetensors(
 	)
 
 	adapter = get_adapter_for_config(config)
+
+	# Add debug information
+	print(f"📊 Model architecture: {getattr(config, 'model_type', 'unknown')}")
+	if hasattr(config, "quantization_config"):
+		quant_config = config.quantization_config
+		if isinstance(quant_config, dict):
+			print(f"📊 Quantization: {quant_config.get('quant_method', 'unknown')}")
+			print(f"📊 Using adapter: {adapter.__class__.__name__}")
 
 	# Save config/tokenizer
 	config_dir = output_path / "config"
@@ -171,6 +180,18 @@ def shard_model_by_layers_safetensors(
 		"intermediate_size": int(getattr(config, "intermediate_size", hidden_size * 4)),
 		"layer_components": [],
 	}
+	# Add quantization metadata when available
+	if hasattr(config, "quantization_config"):
+		qc = config.quantization_config
+		try:
+			# Ensure JSON-serializable dict, if it's already a dict keep it
+			if isinstance(qc, dict):
+				metadata["quantization_config"] = qc
+			else:
+				# Best-effort conversion
+				metadata["quantization_config"] = dict(qc)  # type: ignore
+		except Exception:
+			metadata["quantization_config"] = str(qc)
 
 	# Embedding
 	try:
