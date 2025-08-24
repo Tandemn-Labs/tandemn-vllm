@@ -13,6 +13,8 @@ from functools import partial
 from src.config.settings import SERVER_PORT
 import os
 import subprocess
+import tempfile
+import boto3
 
 
 
@@ -28,7 +30,6 @@ def load_model_metadata(shard_folder: str):
             base_key = o.path.lstrip('/')
             key = f"{base_key.rstrip('/')}/{model_dir_name}/layer_metadata.json" if model_dir_name else f"{base_key.rstrip('/')}/layer_metadata.json"
             try:
-                import boto3  # type: ignore
                 client = boto3.client("s3")
                 obj = client.get_object(Bucket=bucket, Key=key)
                 body = obj["Body"].read()
@@ -36,8 +37,7 @@ def load_model_metadata(shard_folder: str):
                 print(f"📊 Model metadata (S3): {metadata['num_layers']} layers, type: {metadata.get('model_type', 'unknown')}")
                 return metadata
             except ImportError:
-                # Fallback to aws cli if boto3 is not installed
-                import tempfile
+                # Fallback to aws cli if boto3 is not installed 
                 with tempfile.TemporaryDirectory() as tmpdir:
                     tmp_path = Path(tmpdir) / "layer_metadata.json"
                     cmd = [
@@ -740,34 +740,82 @@ def create_async_vllm_engine_with_selective_layers(
         print(f"\n🔧 APPLYING LOADED WEIGHTS TO MODEL...")
         print(f"   Total weights loaded: {len(all_weights)}")
         
-        applied_count = 0
-        missing_params = []
-        print(model)
-        for name, param in model.named_parameters():
-            if name in all_weights:
-                with torch.no_grad():
-                    param.copy_(all_weights[name].to(param.dtype).to(param.device))
-                    applied_count += 1
-            else:
-                # Check if this parameter belongs to a layer we should have loaded
-                is_expected_missing = False
-                
-                # Check if it's from an unassigned layer
-                for i in range(400):  # Assuming max 100 layers
-                    if f".layers.{i}." in name and i not in assigned_layers:
-                        is_expected_missing = True
-                        break
-                
-                if not is_expected_missing:
-                    missing_params.append(name)
+        # # Check if this is a compressed-tensors model
+        # is_compressed_tensors = False
+        # config_path = shards_root / "config" / "config.json"
+        # if config_path.exists():
+        #     with open(config_path, 'r') as f:
+        #         config_data = json.load(f)
+        #         if 'quantization_config' in config_data:
+        #             quant_config = config_data['quantization_config']
+        #             if isinstance(quant_config, dict) and quant_config.get('quant_method') == 'compressed-tensors':
+        #                 is_compressed_tensors = True
+        #                 print("   🔍 Detected compressed-tensors quantization")
         
-        print(f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters")
+        # # For compressed-tensors models, we need to strip the "model." prefix from weight names
+        # # because vLLM's LlamaModel.load_weights expects weights without the "model." prefix
+        # if is_compressed_tensors:
+        #     corrected_weights = {}
+        #     for name, tensor in all_weights.items():
+        #         # Strip "model." prefix for everything except lm_head
+        #         if name.startswith("model.") and not name.startswith("model.lm_head"):
+        #             corrected_name = name[6:]  # Remove "model." prefix
+        #             corrected_weights[corrected_name] = tensor
+        #             print(f"   📝 Renamed: {name} -> {corrected_name}")
+        #         else:
+        #             corrected_weights[name] = tensor
+        #     all_weights = corrected_weights
+        #     print(f"   ✅ Corrected {len(corrected_weights)} weight names for compressed-tensors")
         
-        if missing_params and len(missing_params) < 20:  # Only show first 20 to avoid spam
-            print(f"⚠️ Parameters without loaded weights (first 20): {missing_params[:20]}")
-        elif missing_params:
-            print(f"⚠️ {len(missing_params)} parameters without loaded weights (expected for unassigned layers)")
+        # # Filter weights to only include assigned layers + always-needed components
+        # filtered_weights = {}
+        # for name, tensor in all_weights.items():
+        #     # Always include embeddings, lm_head, and norm
+        #     if any(x in name for x in ["embedding", "embed_tokens", "lm_head", "norm"]):
+        #         filtered_weights[name] = tensor
+        #         continue
             
+        #     # Check if this weight belongs to an assigned layer
+        #     for layer_idx in assigned_layers:
+        #         if f".layers.{layer_idx}." in name or f"layers.{layer_idx}." in name:
+        #             filtered_weights[name] = tensor
+        #             break
+
+        # print(f"   Filtered to {len(filtered_weights)} weights for assigned layers")
+        
+        # # Debug: Show what weights we have
+        # print("   📋 Weight categories:")
+        # embed_weights = [k for k in filtered_weights.keys() if 'embed' in k]
+        # lm_head_weights = [k for k in filtered_weights.keys() if 'lm_head' in k]
+        # norm_weights = [k for k in filtered_weights.keys() if 'norm' in k]
+        # layer_weights = [k for k in filtered_weights.keys() if 'layers.' in k]
+        
+        # print(f"      - Embedding weights: {len(embed_weights)}")
+        # print(f"      - LM head weights: {len(lm_head_weights)}")
+        # print(f"      - Norm weights: {len(norm_weights)}")
+        # print(f"      - Layer weights: {len(layer_weights)}")
+
+        # # Use vLLM's load_weights method which handles fusion and quantization
+        # if hasattr(model, 'model') and hasattr(model.model, 'load_weights'):
+        #     # This is the path for LlamaForCausalLM -> LlamaModel
+        #     print("   🔧 Using model.model.load_weights (LlamaModel path)")
+        #     loaded_params = model.model.load_weights(filtered_weights.items())
+        #     print(f"   ✅ vLLM loaded {len(loaded_params)} parameter groups")
+        # elif hasattr(model, 'load_weights'):
+        #     # Direct load_weights on the model
+        #     print("   🔧 Using model.load_weights (direct path)")
+        #     loaded_params = model.load_weights(filtered_weights.items())
+        #     print(f"   ✅ vLLM loaded {len(loaded_params)} parameter groups")
+        # else:
+        #     # Manual parameter copy - should not reach here for Llama models
+        #     print("   ⚠️ No load_weights method found, using manual parameter copy")
+        #     applied = 0
+        #     for name, param in model.named_parameters():
+        #         if name in filtered_weights:
+        #             param.data = filtered_weights[name].to(param.dtype).to(param.device)
+        #             applied += 1
+        #     print(f"   ✅ Manually copied {applied} parameters")
+
         print("✅ Created AsyncLLMEngine (v0) with selective layers")
         return async_engine
 
