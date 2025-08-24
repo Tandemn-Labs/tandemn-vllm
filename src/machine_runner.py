@@ -537,7 +537,7 @@ async def main():
     # Main gateway to receive web requests
     print("Starting unified message gateway...")
     gateway_task = asyncio.create_task(unified_message_gateway())
-    debug_monitor_task = asyncio.create_task(debug_inference_context_monitor())
+    # debug_monitor_task = asyncio.create_task(debug_inference_context_monitor())
     await asyncio.sleep(1) #?
 
 
