@@ -754,14 +754,14 @@ def create_async_vllm_engine_with_selective_layers(
             tensor_parallel_size=1,
             enforce_eager=True,
             load_format="dummy",
-            max_model_len=128,  # small for demo
-            disable_log_stats=True,
+            max_model_len=4000,  # small for demo
+            disable_log_stats=False,
             gpu_memory_utilization=0.8,
             skip_tokenizer_init=False,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
             quantization=quantization,
-            dtype=dtype or "float16",
+            dtype=dtype or "float16",  # activations
             block_size=16,
         )
 
@@ -876,6 +876,7 @@ def create_async_vllm_engine_with_selective_layers(
             print(
                 f"⚠️ {len(missing_params)} parameters without loaded weights (expected for unassigned layers)"
             )
+            print(f"Missing params: {missing_params}")
 
         print("✅ Created AsyncLLMEngine (v0) with selective layers")
         return async_engine
