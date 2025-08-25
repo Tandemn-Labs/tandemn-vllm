@@ -171,12 +171,18 @@ class LlamaShardingAdapter(ShardingAdapter):
     ) -> Dict[str, torch.Tensor]:
         out: Dict[str, torch.Tensor] = {}
         if self.is_awq:
+            # Check for quantized lm_head (rare for AWQ)
             if "lm_head.qweight" in hf_weights:
                 out["lm_head.qweight"] = hf_weights["lm_head.qweight"].detach().cpu()
             if "lm_head.qzeros" in hf_weights:
                 out["lm_head.qzeros"] = hf_weights["lm_head.qzeros"].detach().cpu()
             if "lm_head.scales" in hf_weights:
                 out["lm_head.scales"] = hf_weights["lm_head.scales"].detach().cpu()
+
+            # CRITICAL: Also check for unquantized lm_head (common in AWQ models!)
+            if "lm_head.weight" in hf_weights:
+                out["lm_head.weight"] = hf_weights["lm_head.weight"].detach().cpu()
+                print(f"✅ Found unquantized lm_head.weight in AWQ model (size: {hf_weights['lm_head.weight'].shape})")
         else:
             if "lm_head.weight" in hf_weights:
                 out["lm_head.weight"] = hf_weights["lm_head.weight"].detach().cpu()
