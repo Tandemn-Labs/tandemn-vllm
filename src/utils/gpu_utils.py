@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
 
+
 @dataclass
 class GPUInfo:
     name: str
@@ -13,6 +14,7 @@ class GPUInfo:
     utilization_percent: Optional[float]
     temperature_celsius: Optional[float]
 
+
 @dataclass
 class SystemMetrics:
     cpu_percent: float
@@ -20,9 +22,11 @@ class SystemMetrics:
     gpu_info: List[GPUInfo]
     timestamp: datetime
 
+
 def bytes_to_gb(bytes_value: int) -> float:
     """Convert bytes to gigabytes."""
-    return bytes_value / (1024 ** 3)
+    return bytes_value / (1024**3)
+
 
 def _safe_decode_name(raw_name: Any, fallback: str) -> str:
     """
@@ -50,6 +54,7 @@ def _safe_decode_name(raw_name: Any, fallback: str) -> str:
         return str(raw_name)
     except Exception:
         return fallback
+
 
 def get_gpu_info() -> List[GPUInfo]:
     """
@@ -84,14 +89,16 @@ def get_gpu_info() -> List[GPUInfo]:
             except Exception:
                 temperature = None
 
-            gpu_info_list.append(GPUInfo(
-                name=name,
-                total_vram_gb=round(bytes_to_gb(mem_info.total), 2),
-                used_vram_gb=round(bytes_to_gb(mem_info.used), 2),
-                free_vram_gb=round(bytes_to_gb(mem_info.free), 2),
-                utilization_percent=utilization,
-                temperature_celsius=temperature
-            ))
+            gpu_info_list.append(
+                GPUInfo(
+                    name=name,
+                    total_vram_gb=round(bytes_to_gb(mem_info.total), 2),
+                    used_vram_gb=round(bytes_to_gb(mem_info.used), 2),
+                    free_vram_gb=round(bytes_to_gb(mem_info.free), 2),
+                    utilization_percent=utilization,
+                    temperature_celsius=temperature,
+                )
+            )
     except Exception as e:
         print(f"Error getting GPU info: {e}")
     finally:
@@ -101,6 +108,7 @@ def get_gpu_info() -> List[GPUInfo]:
         except Exception:
             pass
     return gpu_info_list
+
 
 def get_system_metrics() -> SystemMetrics:
     """
@@ -114,8 +122,9 @@ def get_system_metrics() -> SystemMetrics:
         cpu_percent=psutil.cpu_percent(interval=None),
         ram_percent=psutil.virtual_memory().percent,
         gpu_info=get_gpu_info(),
-        timestamp=datetime.utcnow()
+        timestamp=datetime.utcnow(),
     )
+
 
 def get_total_free_vram() -> float:
     """
@@ -128,6 +137,7 @@ def get_total_free_vram() -> float:
     for gpu in get_gpu_info():
         total_free += gpu.free_vram_gb
     return round(total_free, 2)
+
 
 def format_metrics_for_db(metrics: SystemMetrics) -> Dict[str, Any]:
     """
@@ -149,11 +159,11 @@ def format_metrics_for_db(metrics: SystemMetrics) -> Dict[str, Any]:
                 "used_vram_gb": gpu.used_vram_gb,
                 "free_vram_gb": gpu.free_vram_gb,
                 "utilization_percent": gpu.utilization_percent,
-                "temperature_celsius": gpu.temperature_celsius
+                "temperature_celsius": gpu.temperature_celsius,
             }
             for gpu in metrics.gpu_info
         ],
         # Avoid an extra NVML pass; compute from provided metrics
         "total_free_vram_gb": round(sum(g.free_vram_gb for g in metrics.gpu_info), 2),
-        "timestamp": metrics.timestamp
-    } 
+        "timestamp": metrics.timestamp,
+    }

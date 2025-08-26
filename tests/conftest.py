@@ -3,10 +3,10 @@ import asyncio
 import motor.motor_asyncio
 import iroh
 from fastapi.testclient import TestClient
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from src.server import app
-from src.config.settings import MONGODB_URI, MONGODB_DB_NAME
+
 
 @pytest.fixture(scope="session")
 def event_loop():
@@ -15,6 +15,7 @@ def event_loop():
     yield loop
     loop.close()
 
+
 @pytest.fixture
 async def mock_motor_client():
     """Create a mock MongoDB client."""
@@ -22,6 +23,7 @@ async def mock_motor_client():
     db = AsyncMock()
     client.__getitem__.return_value = db
     return client
+
 
 @pytest.fixture
 async def mock_iroh_node():
@@ -32,10 +34,12 @@ async def mock_iroh_node():
     node.net().node_id.return_value = "test_peer_id"
     return node
 
+
 @pytest.fixture
 def test_client():
     """Create a FastAPI test client."""
     return TestClient(app)
+
 
 @pytest.fixture
 def sample_metrics():
@@ -50,12 +54,13 @@ def sample_metrics():
                 "used_vram_gb": 4.5,
                 "free_vram_gb": 5.5,
                 "utilization_percent": 75.0,
-                "temperature_celsius": 65.0
+                "temperature_celsius": 65.0,
             }
         ],
         "total_free_vram_gb": 5.5,
-        "timestamp": "2024-01-01T00:00:00Z"
+        "timestamp": "2024-01-01T00:00:00Z",
     }
+
 
 @pytest.fixture
 def sample_model_config():
@@ -66,5 +71,5 @@ def sample_model_config():
         "num_hidden_layers": 12,
         "num_attention_heads": 12,
         "num_key_value_heads": 12,
-        "intermediate_size": 3072
-    } 
+        "intermediate_size": 3072,
+    }

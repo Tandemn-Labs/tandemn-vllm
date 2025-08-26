@@ -27,4 +27,4 @@ def get_adapter_for_config(config: PretrainedConfig) -> ShardingAdapter:
         if model_type.startswith(key):
             return adapter_cls(config)
     # Default: try LLaMA-style
-    return LlamaShardingAdapter(config) 
+    return LlamaShardingAdapter(config)

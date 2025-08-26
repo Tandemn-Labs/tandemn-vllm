@@ -1,19 +1,20 @@
-from pathlib import Path
-import json
 import asyncio
-import httpx
-import aiofiles
-import torch
-from typing import Dict, Any, List, Optional
-from fastapi import HTTPException
-from safetensors import safe_open  # type: ignore
-from src.utils.db_utils import get_active_peers, get_peer_metrics
-from src.utils.model_utils import distribute_layers_across_peers
-from functools import partial
-from src.config.settings import SERVER_PORT
+import json
 import os
 import subprocess
+from functools import partial
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+import aiofiles
+import httpx
+import torch
+from fastapi import HTTPException
+from safetensors import safe_open  # type: ignore
+
+from src.config.settings import SERVER_PORT
+from src.utils.db_utils import get_active_peers, get_peer_metrics
+from src.utils.model_utils import distribute_layers_across_peers
 
 
 def load_model_metadata(shard_folder: str):
@@ -23,34 +24,44 @@ def load_model_metadata(shard_folder: str):
     if s3_base:
         try:
             from urllib.parse import urlparse
+
             o = urlparse(s3_base)
             bucket = o.netloc
-            base_key = o.path.lstrip('/')
-            key = f"{base_key.rstrip('/')}/{model_dir_name}/layer_metadata.json" if model_dir_name else f"{base_key.rstrip('/')}/layer_metadata.json"
+            base_key = o.path.lstrip("/")
+            key = (
+                f"{base_key.rstrip('/')}/{model_dir_name}/layer_metadata.json"
+                if model_dir_name
+                else f"{base_key.rstrip('/')}/layer_metadata.json"
+            )
             try:
                 import boto3  # type: ignore
+
                 client = boto3.client("s3")
                 obj = client.get_object(Bucket=bucket, Key=key)
                 body = obj["Body"].read()
                 metadata = json.loads(body)
-                print(f"📊 Model metadata (S3): {metadata['num_layers']} layers, type: {metadata.get('model_type', 'unknown')}")
+                print(
+                    f"📊 Model metadata (S3): {metadata['num_layers']} layers, type: {metadata.get('model_type', 'unknown')}"
+                )
                 return metadata
             except ImportError:
                 # Fallback to aws cli if boto3 is not installed
                 import tempfile
+
                 with tempfile.TemporaryDirectory() as tmpdir:
                     tmp_path = Path(tmpdir) / "layer_metadata.json"
-                    cmd = [
-                        "aws", "s3", "cp",
-                        f"s3://{bucket}/{key}",
-                        str(tmp_path)
-                    ]
+                    cmd = ["aws", "s3", "cp", f"s3://{bucket}/{key}", str(tmp_path)]
                     result = subprocess.run(cmd, capture_output=True, text=True)
                     if result.returncode != 0:
-                        raise HTTPException(status_code=404, detail=f"Failed to read layer_metadata.json from S3 at s3://{bucket}/{key}: {result.stderr.strip()}")
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Failed to read layer_metadata.json from S3 at s3://{bucket}/{key}: {result.stderr.strip()}",
+                        )
                     with open(tmp_path, "r") as f:
                         metadata = json.load(f)
-                    print(f"📊 Model metadata (S3 via aws cli): {metadata['num_layers']} layers, type: {metadata.get('model_type', 'unknown')}")
+                    print(
+                        f"📊 Model metadata (S3 via aws cli): {metadata['num_layers']} layers, type: {metadata.get('model_type', 'unknown')}"
+                    )
                     return metadata
         except HTTPException:
             raise
@@ -62,17 +73,24 @@ def load_model_metadata(shard_folder: str):
     shard_path = Path(shard_folder)
     metadata_file = shard_path / "layer_metadata.json"
     if not metadata_file.exists() or not shard_path.exists():
-        raise HTTPException(status_code=404, detail=f"layer_metadata.json or shard folder not found: {shard_folder}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"layer_metadata.json or shard folder not found: {shard_folder}",
+        )
     with open(metadata_file, "r") as f:
         metadata = json.load(f)
-    print(f"📊 Model metadata: {metadata['num_layers']} layers, type: {metadata['model_type']}")
+    print(
+        f"📊 Model metadata: {metadata['num_layers']} layers, type: {metadata['model_type']}"
+    )
     return metadata
 
 
 async def get_peers_with_vram():
     active_peers = await get_active_peers()
     if len(active_peers) < 1:
-        raise HTTPException(status_code=400, detail="No active peers available for deployment")
+        raise HTTPException(
+            status_code=400, detail="No active peers available for deployment"
+        )
 
     peers_vram = {}
     for peer_id in active_peers:
@@ -86,19 +104,22 @@ async def get_peers_with_vram():
             print(f"❌ Error getting metrics for peer {peer_id}: {e}")
 
     if not peers_vram:
-        raise HTTPException(status_code=400, detail="No peers with VRAM information available")
-    
+        raise HTTPException(
+            status_code=400, detail="No peers with VRAM information available"
+        )
+
     print(f"👥 Found {len(peers_vram)} peers with VRAM data")
     return peers_vram
 
+
 def create_distribution_plan(metadata, peers_vram, q_bits: int = 32):
     # Use metadata provided by sharding to avoid hardcoded defaults
-    num_hidden_layers = int(metadata.get('num_layers'))
-    hidden_size = int(metadata.get('hidden_size'))
-    vocab_size = int(metadata.get('vocab_size', 32000))
-    num_attention_heads = int(metadata.get('num_attention_heads', 32))
-    num_key_value_heads = int(metadata.get('num_key_value_heads', num_attention_heads))
-    intermediate_size = int(metadata.get('intermediate_size', hidden_size * 4))
+    num_hidden_layers = int(metadata.get("num_layers"))
+    hidden_size = int(metadata.get("hidden_size"))
+    vocab_size = int(metadata.get("vocab_size", 32000))
+    num_attention_heads = int(metadata.get("num_attention_heads", 32))
+    num_key_value_heads = int(metadata.get("num_key_value_heads", num_attention_heads))
+    intermediate_size = int(metadata.get("intermediate_size", hidden_size * 4))
 
     config = {
         "num_hidden_layers": num_hidden_layers,
@@ -112,22 +133,27 @@ def create_distribution_plan(metadata, peers_vram, q_bits: int = 32):
     distribution_plan = distribute_layers_across_peers(
         config=config,
         peers_vram=peers_vram,
-        q_bits=q_bits  # Allow caller to choose precision for VRAM estimate
+        q_bits=q_bits,  # Allow caller to choose precision for VRAM estimate
     )
-    print(f"📋 Distribution plan created:")
+    print("📋 Distribution plan created:")
     print(f"   • Model can fit: {distribution_plan['can_fit_model']}")
-    print(f"   • Total VRAM needed: {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB")
+    print(
+        f"   • Total VRAM needed: {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB"
+    )
     print(f"   • Available VRAM: {distribution_plan['total_available_vram_gb']:.1f}GB")
     print(f"   • Peers involved: {len(distribution_plan['distribution'])}")
-    for peer_id, peer_info in distribution_plan['distribution'].items():
-        print(f"   • {peer_id}: {peer_info['assigned_layers']} layers, {peer_info['estimated_vram_usage']:.1f}GB")
+    for peer_id, peer_info in distribution_plan["distribution"].items():
+        print(
+            f"   • {peer_id}: {peer_info['assigned_layers']} layers, {peer_info['estimated_vram_usage']:.1f}GB"
+        )
 
     if not distribution_plan["can_fit_model"]:
         raise HTTPException(
             status_code=400,
-            detail=f"Model cannot fit in available VRAM. Need {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB, have {distribution_plan['total_available_vram_gb']:.1f}GB"
+            detail=f"Model cannot fit in available VRAM. Need {distribution_plan['model_info']['total_model_vram_gb']:.1f}GB, have {distribution_plan['total_available_vram_gb']:.1f}GB",
         )
     return distribution_plan
+
 
 # The distribution_plan returned by distribute_layers_across_peers looks like this:
 #
@@ -157,6 +183,7 @@ def create_distribution_plan(metadata, peers_vram, q_bits: int = 32):
 #     "total_available_vram_gb": float           # Total VRAM available across all peers (GB)
 # }
 
+
 def create_deployment_instructions(request, distribution_plan, peer_table, SERVER_IP):
     """
     Create deployment instructions for each peer based on the distribution plan.
@@ -166,7 +193,9 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
     peer_list = list(distribution_plan["distribution"].keys())
 
     # Determine base URL for model files: prefer S3 if configured
-    model_dir_name = Path(getattr(request, "shard_folder", "")).name or request.model_name.replace('/', '_')
+    model_dir_name = Path(
+        getattr(request, "shard_folder", "")
+    ).name or request.model_name.replace("/", "_")
     s3_base = os.getenv("S3_SHARDS_BASE")  # e.g., s3://tandemn-model-shards/shards
     prefer_s3 = bool(s3_base)
 
@@ -180,56 +209,64 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
         # Try to get tie_word_embeddings from model metadata
         metadata = load_model_metadata(getattr(request, "shard_folder", ""))
         tie_word_embeddings = metadata.get("tie_word_embeddings", False)
-    except:
+    except Exception as _:
         # Default to False if we can't read metadata
         tie_word_embeddings = False
 
     for i, (peer_id, peer_info) in enumerate(distribution_plan["distribution"].items()):
-        is_first_peer = (i == 0)
-        is_last_peer = (i == len(peer_list) - 1)
-        
-        assigned_layers = list(range(
-            sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i]),
-            sum(p["assigned_layers"] for p in list(distribution_plan["distribution"].values())[:i+1])
-        ))
+        is_first_peer = i == 0
+        is_last_peer = i == len(peer_list) - 1
+
+        assigned_layers = list(
+            range(
+                sum(
+                    p["assigned_layers"]
+                    for p in list(distribution_plan["distribution"].values())[:i]
+                ),
+                sum(
+                    p["assigned_layers"]
+                    for p in list(distribution_plan["distribution"].values())[: i + 1]
+                ),
+            )
+        )
 
         required_files = []
-        required_files.extend([
-            "config/config.json",
-            "layer_metadata.json",
-        ])
-        
+        required_files.extend(
+            [
+                "config/config.json",
+                "layer_metadata.json",
+            ]
+        )
+
         # Optional tokenizer/config artifacts that improve tokenizer initialization
         optional_files = [
-            "config/tokenizer.json",            # HF consolidated tokenizer
-            "config/tokenizer.model",           # SentencePiece for LLaMA-style models
+            "config/tokenizer.json",  # HF consolidated tokenizer
+            "config/tokenizer.model",  # SentencePiece for LLaMA-style models
             "config/tokenizer_config.json",
             "config/special_tokens_map.json",
             "config/generation_config.json",
             "config/added_tokens.json",
-            "config/vocab.json",                # BPE vocab
-            "config/merges.txt",                # BPE merges
+            "config/vocab.json",  # BPE vocab
+            "config/merges.txt",  # BPE merges
         ]
-        
+
         if is_first_peer:
             required_files.append("embedding/layer.safetensors")
-            
+
         if is_last_peer:
             # Always need norm for last peer
-            required_files.extend([
-                "norm/layer.safetensors"
-            ])
-            
+            required_files.extend(["norm/layer.safetensors"])
+
             # Check if lm_head file exists (not tied) or if we need embeddings (tied)
             # Try to determine if lm_head file exists
             lm_head_exists = True  # Default assumption
-            
+
             # If we have access to the shard folder, check if lm_head exists
             if hasattr(request, "shard_folder") and request.shard_folder:
                 shard_path = Path(request.shard_folder)
                 lm_head_path = shard_path / "lm_head" / "layer.safetensors"
                 lm_head_exists = lm_head_path.exists()
-            
+
             if lm_head_exists:
                 # Model has separate lm_head weights
                 required_files.append("lm_head/layer.safetensors")
@@ -238,11 +275,13 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
                 # This ensures the last peer can copy embed_tokens.weight to lm_head.weight
                 if "embedding/layer.safetensors" not in required_files:
                     required_files.append("embedding/layer.safetensors")
-                    print(f"ℹ️ Last peer {peer_id} will download embeddings (tied weights detected)")
-        
+                    print(
+                        f"ℹ️ Last peer {peer_id} will download embeddings (tied weights detected)"
+                    )
+
         for layer_idx in assigned_layers:
             required_files.append(f"layers/layer_{layer_idx}.safetensors")
-        
+
         next_peer_ticket = peer_list[i + 1] if (i + 1) < len(peer_list) else None
 
         deployment_instructions[peer_id] = {
@@ -270,10 +309,13 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
 # MODEL DOWNLOADING FUNCTIONS
 # ============================================================================
 
-async def download_file(url: str, local_path: Path, chunk_size: int = 16*1024*1024) -> bool:
+
+async def download_file(
+    url: str, local_path: Path, chunk_size: int = 16 * 1024 * 1024
+) -> bool:
     """
     Download a file from server with progress tracking and resume capability.
-    
+
     Args:
         url: Download URL (supports http(s):// and s3://)
         local_path: Local file path to save to
@@ -293,50 +335,64 @@ async def download_file(url: str, local_path: Path, chunk_size: int = 16*1024*10
                     async with httpx.AsyncClient() as client:
                         head_response = await client.head(url)
                         if head_response.status_code == 200:
-                            remote_size = int(head_response.headers.get("content-length", 0))
+                            remote_size = int(
+                                head_response.headers.get("content-length", 0)
+                            )
                             local_size = local_path.stat().st_size
 
                             if local_size == remote_size:
-                                print(f"✅ File already exists with correct size, skipping: {local_path.name} ({local_size:,} bytes)")
+                                print(
+                                    f"✅ File already exists with correct size, skipping: {local_path.name} ({local_size:,} bytes)"
+                                )
                                 return True
                             else:
-                                print(f"⚠️ File exists but size mismatch - redownloading: local={local_size:,}, remote={remote_size:,}")
+                                print(
+                                    f"⚠️ File exists but size mismatch - redownloading: local={local_size:,}, remote={remote_size:,}"
+                                )
                         else:
-                            print(f"⚠️ Could not verify remote file size (HEAD {head_response.status_code}), downloading anyway")
+                            print(
+                                f"⚠️ Could not verify remote file size (HEAD {head_response.status_code}), downloading anyway"
+                            )
                 except Exception as e:
                     print(f"⚠️ HEAD request failed: {e}, proceeding with download")
                     # If HEAD fails, just check local file exists and has content
-                    print(f"✅ File exists locally, assuming valid: {local_path.name} ({local_path.stat().st_size:,} bytes)")
+                    print(
+                        f"✅ File exists locally, assuming valid: {local_path.name} ({local_path.stat().st_size:,} bytes)"
+                    )
                     return True
             else:
                 # For s3, if file exists, assume valid
-                print(f"✅ File exists locally, assuming valid (s3): {local_path.name} ({local_path.stat().st_size:,} bytes)")
+                print(
+                    f"✅ File exists locally, assuming valid (s3): {local_path.name} ({local_path.stat().st_size:,} bytes)"
+                )
                 return True
 
         # S3 path: use boto3 if available; fallback to aws cli
         if url.startswith("s3://"):
             try:
                 from urllib.parse import urlparse
+
                 o = urlparse(url)
                 # urlparse yields scheme='s3', netloc='bucket', path='/key'
                 bucket = o.netloc
-                key = o.path.lstrip('/')
+                key = o.path.lstrip("/")
                 try:
                     import boto3  # type: ignore
+
                     client = boto3.client("s3")
                     client.download_file(bucket, key, str(local_path))
                     print(f"✅ Downloaded {local_path.name} from s3://{bucket}/{key}")
                     return True
                 except ImportError:
-                    print("ℹ️ boto3 not installed; falling back to aws cli for S3 download")
-                    cmd = [
-                        "aws", "s3", "cp",
-                        f"s3://{bucket}/{key}",
-                        str(local_path)
-                    ]
+                    print(
+                        "ℹ️ boto3 not installed; falling back to aws cli for S3 download"
+                    )
+                    cmd = ["aws", "s3", "cp", f"s3://{bucket}/{key}", str(local_path)]
                     result = subprocess.run(cmd, capture_output=True, text=True)
                     if result.returncode == 0:
-                        print(f"✅ Downloaded {local_path.name} via aws cli from s3://{bucket}/{key}")
+                        print(
+                            f"✅ Downloaded {local_path.name} via aws cli from s3://{bucket}/{key}"
+                        )
                         return True
                     else:
                         print(f"❌ aws cli download failed: {result.stderr}")
@@ -349,23 +405,28 @@ async def download_file(url: str, local_path: Path, chunk_size: int = 16*1024*10
         async with httpx.AsyncClient() as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
-                
+
                 total_size = int(response.headers.get("content-length", 0))
                 downloaded = 0
-                
+
                 async with aiofiles.open(local_path, "wb") as f:
                     async for chunk in response.aiter_bytes(chunk_size):
                         await f.write(chunk)
                         downloaded += len(chunk)
-                        
+
                         # Progress logging (every 100MB or if total < 100MB for minimal I/O overhead)
-                        if total_size > 0 and (downloaded % (100 * 1024 * 1024) == 0 or downloaded == total_size):
+                        if total_size > 0 and (
+                            downloaded % (100 * 1024 * 1024) == 0
+                            or downloaded == total_size
+                        ):
                             progress = (downloaded / total_size) * 100
-                            print(f"   📥 Downloading {local_path.name}: {progress:.1f}% ({downloaded:,}/{total_size:,} bytes)")
-        
+                            print(
+                                f"   📥 Downloading {local_path.name}: {progress:.1f}% ({downloaded:,}/{total_size:,} bytes)"
+                            )
+
         print(f"✅ Downloaded {local_path.name} ({downloaded:,} bytes)")
         return True
-        
+
     except Exception as e:
         print(f"❌ Failed to download {url}: {e}")
         return False
@@ -374,10 +435,10 @@ async def download_file(url: str, local_path: Path, chunk_size: int = 16*1024*10
 async def download_model_files(instructions: Dict[str, Any]) -> tuple[bool, Path]:
     """
     Download all required model files based on deployment instructions.
-    
+
     Args:
         instructions: Deployment instructions containing file list and URLs
-        
+
     Returns:
         tuple[bool, Path]: (success, model_directory_path)
     """
@@ -385,28 +446,30 @@ async def download_model_files(instructions: Dict[str, Any]) -> tuple[bool, Path
         # Create local model directory
         model_dir = Path(f"./deployed_models/{instructions['model_name']}")
         model_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Download required files
         base_url = instructions["server_download_url"]
         successful_downloads = 0
         total_files = len(instructions["required_files"])
-        
+
         print(f"📥 Starting download of {total_files} required files...")
-        
+
         for file_path in instructions["required_files"]:
             file_url = f"{base_url}/{file_path}"
             local_file_path = model_dir / file_path
-            
+
             print(f"📥 Downloading {file_path}...")
             if await download_file(file_url, local_file_path):
                 successful_downloads += 1
             else:
                 print(f"❌ Failed to download {file_path}")
-        
+
         # Attempt optional files without failing the deployment
         optional_files = instructions.get("optional_files", [])
         if optional_files:
-            print(f"📥 Attempting to download up to {len(optional_files)} optional files...")
+            print(
+                f"📥 Attempting to download up to {len(optional_files)} optional files..."
+            )
         optional_success = 0
         for file_path in optional_files:
             file_url = f"{base_url}/{file_path}"
@@ -417,9 +480,10 @@ async def download_model_files(instructions: Dict[str, Any]) -> tuple[bool, Path
             else:
                 print(f"ℹ️ Optional file not available: {file_path}")
         if optional_files:
-            print(f"✅ Optional files downloaded: {optional_success}/{len(optional_files)}")
-        
-        
+            print(
+                f"✅ Optional files downloaded: {optional_success}/{len(optional_files)}"
+            )
+
         # Validate tokenizer presence: at least one of the common tokenizer assets must exist
         tokenizer_candidates = [
             model_dir / "config/tokenizer.json",
@@ -427,11 +491,13 @@ async def download_model_files(instructions: Dict[str, Any]) -> tuple[bool, Path
             model_dir / "config/vocab.json",
         ]
         if not any(p.exists() and p.stat().st_size > 0 for p in tokenizer_candidates):
-            print("⚠️ No tokenizer asset found (tokenizer.json/tokenizer.model/vocab.json). Tokenizer init may fail.")
-        
+            print(
+                "⚠️ No tokenizer asset found (tokenizer.json/tokenizer.model/vocab.json). Tokenizer init may fail."
+            )
+
         print(f"✅ All {total_files} required files downloaded successfully")
         return True, model_dir
-        
+
     except Exception as e:
         print(f"❌ Error downloading model files: {e}")
         return False, Path(".")
@@ -441,9 +507,13 @@ async def download_model_files(instructions: Dict[str, Any]) -> tuple[bool, Path
 # MODEL LOADING FUNCTIONS
 # ============================================================================
 
-def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
-                              quantization: Optional[str] = None,
-                              dtype: Optional[str] = None):
+
+def create_dynamic_vllm_model(
+    model_dir: str,
+    assigned_layers: List[int],
+    quantization: Optional[str] = None,
+    dtype: Optional[str] = None,
+):
     """
     Create vLLM model with only assigned layers loaded by monkey-patching make_layers.
 
@@ -453,18 +523,21 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
         quantization: Optional vLLM quantization method (e.g., "bitsandbytes", "awq", "gptq")
         dtype: Optional dtype for activations/weights ("float16", "bfloat16", "float32", "auto")
     """
-    
+
     # Import vLLM lazily to avoid forcing it on the central server process
-    from vllm import LLM, SamplingParams
-    
+    from vllm import LLM
+
     # STEP 1: Monkey-patch vLLM's make_layers function (Prime Intellect's key insight)
     def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
         """Custom make_layers that creates real layers only for assigned indices."""
-        from vllm.model_executor.models.utils import PPMissingLayer, maybe_offload_to_cpu
-        
+        from vllm.model_executor.models.utils import (
+            PPMissingLayer,
+            maybe_offload_to_cpu,
+        )
+
         start_layer = min(assigned_layers) if assigned_layers else 0
         end_layer = max(assigned_layers) + 1 if assigned_layers else 0
-        
+
         modules = []
         for i in range(num_hidden_layers):
             if i in assigned_layers:
@@ -476,42 +549,43 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
                 # Create passthrough layer (Prime Intellect's memory optimization)
                 modules.append(PPMissingLayer())
                 print(f"  Created PPMissingLayer for layer {i}")
-        
+
         return start_layer, end_layer, torch.nn.ModuleList(modules)
-    
+
     # Apply the monkey patch
     import vllm.model_executor.models.utils as model_utils
+
     original_make_layers = model_utils.make_layers
     model_utils.make_layers = _selective_make_layers
-    
+
     try:
         # STEP 2: Create vLLM model (will use our patched make_layers)
         llm = LLM(
             model=model_dir,
             tensor_parallel_size=1,
             enforce_eager=True,  # Required for custom layer loading
-            max_model_len=50,   # Small for demo
+            max_model_len=50,  # Small for demo
             disable_log_stats=True,
             skip_tokenizer_init=False,
             gpu_memory_utilization=0.8,  # Use much less memory
             use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
-            load_format="dummy",     # ← this is the magic flag
+            load_format="dummy",  # ← this is the magic flag
             dtype=(dtype or "float16"),
-            quantization=quantization  # vLLM will select kernels/flows accordingly
+            quantization=quantization,  # vLLM will select kernels/flows accordingly
         )
 
         # STEP 3: Load weights for assigned layers + essential components (replicating selective_layer_loading_fixed.py)
         try:
             # model_dir may be a config/ subfolder; shards root is its parent
             shards_root = Path(model_dir).resolve().parent
-            
+
             # Navigate to underlying torch model
             model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
             model = model_runner.model
-            
+
             # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
             all_weights = {}
-            
+
             # Helper: load all tensors from a safetensors file
             def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
                 """Load all tensors from a safetensors file."""
@@ -521,14 +595,14 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
                         for key in f.keys():
                             tensors[key] = f.get_tensor(key)
                 return tensors
-            
+
             # Load embedding (always needed for first peer)
             embed_path = shards_root / "embedding" / "layer.safetensors"
             if embed_path.exists():
                 embed_weights = load_safetensors_file(embed_path)
                 all_weights.update(embed_weights)
                 print(f"✅ Loaded embedding weights from {embed_path}")
-            
+
             # Load lm_head (always needed for last peer)
             lm_head_path = shards_root / "lm_head" / "layer.safetensors"
             if lm_head_path.exists():
@@ -537,23 +611,29 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
                 print(f"✅ Loaded lm_head weights from {lm_head_path}")
             else:
                 # Handle tied embeddings case - copy embed_tokens weights to lm_head
-                print(f"ℹ️ No separate lm_head file found - checking for tied embeddings")
+                print("ℹ️ No separate lm_head file found - checking for tied embeddings")
                 if "model.embed_tokens.weight" in all_weights:
                     # Llama models with tied embeddings
-                    all_weights["lm_head.weight"] = all_weights["model.embed_tokens.weight"]
-                    print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
+                    all_weights["lm_head.weight"] = all_weights[
+                        "model.embed_tokens.weight"
+                    ]
+                    print(
+                        "✅ Using tied embeddings - copied embed_tokens weights to lm_head"
+                    )
                 elif "embed_tokens.weight" in all_weights:
                     # Alternative naming
                     all_weights["lm_head.weight"] = all_weights["embed_tokens.weight"]
-                    print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
-            
+                    print(
+                        "✅ Using tied embeddings - copied embed_tokens weights to lm_head"
+                    )
+
             # Load model.norm (always needed for last peer)
             norm_path = shards_root / "norm" / "layer.safetensors"
             if norm_path.exists():
                 norm_weights = load_safetensors_file(norm_path)
                 all_weights.update(norm_weights)
                 print(f"✅ Loaded model.norm weights from {norm_path}")
-            
+
             # Load only specified transformer layers
             for layer_idx in assigned_layers:
                 layer_path = shards_root / "layers" / f"layer_{layer_idx}.safetensors"
@@ -563,14 +643,14 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
                     print(f"✅ Loaded layer {layer_idx} weights from {layer_path}")
                 else:
                     print(f"⚠️ Warning: Layer {layer_idx} not found at {layer_path}")
-            
+
             # STEP 4: Apply the loaded weights to the model (exact replication of selective_layer_loading_fixed.py)
-            print(f"\n🔧 APPLYING LOADED WEIGHTS TO MODEL...")
+            print("\n🔧 APPLYING LOADED WEIGHTS TO MODEL...")
             print(f"   Total weights loaded: {len(all_weights)}")
-            
+
             applied_count = 0
             missing_params = []
-            
+
             for name, param in model.named_parameters():
                 if name in all_weights:
                     with torch.no_grad():
@@ -579,38 +659,48 @@ def create_dynamic_vllm_model(model_dir: str, assigned_layers: List[int],
                 else:
                     # Check if this parameter belongs to a layer we should have loaded
                     is_expected_missing = False
-                    
+
                     # Check if it's from an unassigned layer
                     for i in range(100):  # Assuming max 100 layers
                         if f".layers.{i}." in name and i not in assigned_layers:
                             is_expected_missing = True
                             break
-                    
+
                     if not is_expected_missing:
                         missing_params.append(name)
-            
-            print(f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters")
-            
-            if missing_params and len(missing_params) < 20:  # Only show first 20 to avoid spam
-                print(f"⚠️ Parameters without loaded weights (first 20): {missing_params[:20]}")
+
+            print(
+                f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters"
+            )
+
+            if (
+                missing_params and len(missing_params) < 20
+            ):  # Only show first 20 to avoid spam
+                print(
+                    f"⚠️ Parameters without loaded weights (first 20): {missing_params[:20]}"
+                )
             elif missing_params:
-                print(f"⚠️ {len(missing_params)} parameters without loaded weights (expected for unassigned layers)")
-                
+                print(
+                    f"⚠️ {len(missing_params)} parameters without loaded weights (expected for unassigned layers)"
+                )
+
         except Exception as e:
             print(f"⚠️ Weight loading/injection failed: {e}")
             import traceback
+
             traceback.print_exc()
-        
-        print(f"\n✅ Successfully created vLLM model with selective layers!")
+
+        print("\n✅ Successfully created vLLM model with selective layers!")
         print(f"   Our monkey-patch created real layers for: {assigned_layers}")
         print(f"   Quantization: {quantization} | dtype: {dtype or 'float16'}")
-        print(f"   All other layers are PPMissingLayer (passthrough)")
-        
+        print("   All other layers are PPMissingLayer (passthrough)")
+
         return llm
-        
+
     finally:
         # Restore original function
         model_utils.make_layers = original_make_layers
+
 
 def create_async_vllm_engine_with_selective_layers(
     model_dir: str,
@@ -627,13 +717,17 @@ def create_async_vllm_engine_with_selective_layers(
     """
 
     # Import vLLM lazily to avoid forcing it on the central server process
-    from vllm.engine.async_llm_engine import AsyncLLMEngine  # v0 async engine
     from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.async_llm_engine import AsyncLLMEngine  # v0 async engine
     from vllm.usage.usage_lib import UsageContext
 
     # STEP 1: Monkey-patch make_layers so only assigned layers are real.
     def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
-        from vllm.model_executor.models.utils import PPMissingLayer, maybe_offload_to_cpu
+        from vllm.model_executor.models.utils import (
+            PPMissingLayer,
+            maybe_offload_to_cpu,
+        )
+
         modules = []
         for i in range(num_hidden_layers):
             if i in assigned_layers:
@@ -642,11 +736,14 @@ def create_async_vllm_engine_with_selective_layers(
                 print(f"  [Async] Created REAL layer {i}")
             else:
                 modules.append(PPMissingLayer())
-        return (min(assigned_layers) if assigned_layers else 0,
-                (max(assigned_layers) + 1) if assigned_layers else 0,
-                torch.nn.ModuleList(modules))
+        return (
+            min(assigned_layers) if assigned_layers else 0,
+            (max(assigned_layers) + 1) if assigned_layers else 0,
+            torch.nn.ModuleList(modules),
+        )
 
     import vllm.model_executor.models.utils as model_utils
+
     original_make_layers = model_utils.make_layers
     model_utils.make_layers = _selective_make_layers
 
@@ -657,7 +754,7 @@ def create_async_vllm_engine_with_selective_layers(
             tensor_parallel_size=1,
             enforce_eager=True,
             load_format="dummy",
-            max_model_len=128, # small for demo
+            max_model_len=128,  # small for demo
             disable_log_stats=True,
             gpu_memory_utilization=0.8,
             skip_tokenizer_init=False,
@@ -665,7 +762,7 @@ def create_async_vllm_engine_with_selective_layers(
             max_num_batched_tokens=max_num_batched_tokens,
             quantization=quantization,
             dtype=dtype or "float16",
-            block_size=16
+            block_size=16,
         )
 
         # STEP 3: Create AsyncLLMEngine (v0 path, in-process)
@@ -677,14 +774,14 @@ def create_async_vllm_engine_with_selective_layers(
 
         # STEP 4: Inject weights into the underlying model
         shards_root = Path(model_dir).resolve().parent
-        # this is where the model instance is stored 
+        # this is where the model instance is stored
         # in sync vllm we had the model in llm.llm_engine.model_executor.driver_worker.model_runner
-        # so a slight change. 
+        # so a slight change.
         model = async_engine.engine.model_executor.driver_worker.model_runner.model
 
         # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
         all_weights = {}
-            
+
         # Helper: load all tensors from a safetensors file
         def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
             """Load all tensors from a safetensors file."""
@@ -701,7 +798,7 @@ def create_async_vllm_engine_with_selective_layers(
             embed_weights = load_safetensors_file(embed_path)
             all_weights.update(embed_weights)
             print(f"✅ Loaded embedding weights from {embed_path}")
-        
+
         # Load lm_head (always needed for last peer)
         lm_head_path = shards_root / "lm_head" / "layer.safetensors"
         if lm_head_path.exists():
@@ -710,23 +807,27 @@ def create_async_vllm_engine_with_selective_layers(
             print(f"✅ Loaded lm_head weights from {lm_head_path}")
         else:
             # Handle tied embeddings case - copy embed_tokens weights to lm_head
-            print(f"ℹ️ No separate lm_head file found - checking for tied embeddings")
+            print("ℹ️ No separate lm_head file found - checking for tied embeddings")
             if "model.embed_tokens.weight" in all_weights:
                 # Llama models with tied embeddings
                 all_weights["lm_head.weight"] = all_weights["model.embed_tokens.weight"]
-                print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
+                print(
+                    "✅ Using tied embeddings - copied embed_tokens weights to lm_head"
+                )
             if "embed_tokens.weight" in all_weights:
                 # Alternative naming
                 all_weights["lm_head.weight"] = all_weights["embed_tokens.weight"]
-                print(f"✅ Using tied embeddings - copied embed_tokens weights to lm_head")
-        
+                print(
+                    "✅ Using tied embeddings - copied embed_tokens weights to lm_head"
+                )
+
         # Load model.norm (always needed for last peer)
         norm_path = shards_root / "norm" / "layer.safetensors"
         if norm_path.exists():
             norm_weights = load_safetensors_file(norm_path)
             all_weights.update(norm_weights)
             print(f"✅ Loaded model.norm weights from {norm_path}")
-        
+
         # Load only specified transformer layers
         for layer_idx in assigned_layers:
             layer_path = shards_root / "layers" / f"layer_{layer_idx}.safetensors"
@@ -737,9 +838,9 @@ def create_async_vllm_engine_with_selective_layers(
             else:
                 print(f"⚠️ Warning: Layer {layer_idx} not found at {layer_path}")
 
-        print(f"\n🔧 APPLYING LOADED WEIGHTS TO MODEL...")
+        print("\n🔧 APPLYING LOADED WEIGHTS TO MODEL...")
         print(f"   Total weights loaded: {len(all_weights)}")
-        
+
         applied_count = 0
         missing_params = []
         print(model)
@@ -751,40 +852,51 @@ def create_async_vllm_engine_with_selective_layers(
             else:
                 # Check if this parameter belongs to a layer we should have loaded
                 is_expected_missing = False
-                
+
                 # Check if it's from an unassigned layer
                 for i in range(400):  # Assuming max 100 layers
                     if f".layers.{i}." in name and i not in assigned_layers:
                         is_expected_missing = True
                         break
-                
+
                 if not is_expected_missing:
                     missing_params.append(name)
-        
-        print(f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters")
-        
-        if missing_params and len(missing_params) < 20:  # Only show first 20 to avoid spam
-            print(f"⚠️ Parameters without loaded weights (first 20): {missing_params[:20]}")
+
+        print(
+            f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters"
+        )
+
+        if (
+            missing_params and len(missing_params) < 20
+        ):  # Only show first 20 to avoid spam
+            print(
+                f"⚠️ Parameters without loaded weights (first 20): {missing_params[:20]}"
+            )
         elif missing_params:
-            print(f"⚠️ {len(missing_params)} parameters without loaded weights (expected for unassigned layers)")
-            
+            print(
+                f"⚠️ {len(missing_params)} parameters without loaded weights (expected for unassigned layers)"
+            )
+
         print("✅ Created AsyncLLMEngine (v0) with selective layers")
         return async_engine
 
     finally:
         model_utils.make_layers = original_make_layers
 
-async def load_model_with_selective_layers(model_dir: Path,
-                                           assigned_layers: List[int],
-                                           quantization: Optional[str] = None,
-                                           dtype: Optional[str] = None,
-                                           *,
-                                           use_async_engine: bool = False,
-                                           max_num_seqs: int = 1,
-                                           max_num_batched_tokens: int = 2048):
+
+async def load_model_with_selective_layers(
+    model_dir: Path,
+    assigned_layers: List[int],
+    quantization: Optional[str] = None,
+    dtype: Optional[str] = None,
+    *,
+    use_async_engine: bool = False,
+    max_num_seqs: int = 1,
+    max_num_batched_tokens: int = 2048,
+):
     """
     Load vLLM model with selective layers in a background thread.
-    
+
     Args:
         model_dir: Path to model directory
         assigned_layers: List of layer indices to load
@@ -793,10 +905,10 @@ async def load_model_with_selective_layers(model_dir: Path,
         use_async_engine: If True, initialize AsyncLLMEngine (v0) instead of LLM
         max_num_seqs: Scheduler cap to avoid intra-step mixing (ring-buffer behavior)
         max_num_batched_tokens: Upper bound on tokens per batch
-        
+
     Returns:
         Union[LLM, AsyncLLMEngine]: Loaded model/engine instance
-        
+
     Raises:
         ValueError: If model loading fails
     """
@@ -805,14 +917,16 @@ async def load_model_with_selective_layers(model_dir: Path,
         config_dir = model_dir / "config"
         if not config_dir.exists():
             raise ValueError(f"Config directory not found: {config_dir}")
-        
+
         print("🔧 Loading model with selective layers...")
         print("Loading only a partial model for vLLM Inference")
 
         loop = asyncio.get_running_loop()
-        
+
         if use_async_engine:
-            print("⚙️ Using AsyncLLMEngine (v0) path with scheduler limits for ring-buffer behavior")
+            print(
+                "⚙️ Using AsyncLLMEngine (v0) path with scheduler limits for ring-buffer behavior"
+            )
             create_async_engine_fn = partial(
                 create_async_vllm_engine_with_selective_layers,
                 str(config_dir),
@@ -837,8 +951,15 @@ async def load_model_with_selective_layers(model_dir: Path,
             raise ValueError("Model loading returned None")
 
         print("✅ Model loaded successfully!")
+
+        print(type(loaded_model), dir(loaded_model))
+        executor = loaded_model.engine.model_executor
+        print(
+            f"Executor:{executor.cache_config.num_gpu_blocks}, {executor.cache_config.block_size}, \
+            {executor.model_config.max_model_len}"
+        )
         return loaded_model
-        
+
     except Exception as e:
         print(f"❌ Model loading failed: {e}")
         raise ValueError(f"Model loading failed: {e}")
@@ -848,10 +969,18 @@ async def load_model_with_selective_layers(model_dir: Path,
 # DEPLOYMENT ORCHESTRATION FUNCTIONS
 # ============================================================================
 
-async def report_deployment_completion(model_name: str, peer_id: str, success: bool, server_host: str, server_port: int):
+
+async def report_deployment_completion(
+    server_host: str,
+    server_port: int,
+    model_name: str,
+    peer_id: str,
+    success: bool,
+    max_req_in_batch: int = 1,
+):
     """
     Notify the central server that this peer has finished deploying.
-    
+
     Args:
         model_name: Name of the deployed model
         peer_id: ID of the peer reporting completion
@@ -863,7 +992,8 @@ async def report_deployment_completion(model_name: str, peer_id: str, success: b
     payload = {
         "model_name": model_name,
         "peer_id": peer_id,
-        "success": success
+        "success": success,
+        "max_req_in_batch": max_req_in_batch,
     }
     try:
         async with httpx.AsyncClient() as client:
@@ -876,27 +1006,29 @@ async def report_deployment_completion(model_name: str, peer_id: str, success: b
 
 class DeploymentAttemptTracker:
     """Track deployment attempts to prevent infinite retries"""
-    
+
     def __init__(self):
         self.attempts: Dict[str, int] = {}
-    
+
     def get_attempt_key(self, model_name: str, assigned_layers: List[int]) -> str:
         """Create unique key for deployment attempt tracking"""
         return f"{model_name}_{hash(str(assigned_layers))}"
-    
-    def should_attempt_deployment(self, model_name: str, assigned_layers: List[int], max_attempts: int = 3) -> bool:
+
+    def should_attempt_deployment(
+        self, model_name: str, assigned_layers: List[int], max_attempts: int = 3
+    ) -> bool:
         """Check if deployment should be attempted"""
         attempt_key = self.get_attempt_key(model_name, assigned_layers)
         current_attempts = self.attempts.get(attempt_key, 0)
         return current_attempts < max_attempts
-    
+
     def record_attempt(self, model_name: str, assigned_layers: List[int]) -> int:
         """Record a deployment attempt and return current attempt number"""
         attempt_key = self.get_attempt_key(model_name, assigned_layers)
         current_attempts = self.attempts.get(attempt_key, 0) + 1
         self.attempts[attempt_key] = current_attempts
         return current_attempts
-    
+
     def clear_attempts(self, model_name: str, assigned_layers: List[int]):
         """Clear attempts for successful deployment"""
         attempt_key = self.get_attempt_key(model_name, assigned_layers)
@@ -910,41 +1042,48 @@ deployment_tracker = DeploymentAttemptTracker()
 async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool, Any]:
     """
     Orchestrate the complete model deployment process.
-    
+
     This function coordinates downloading, loading, and setup of a distributed model
     based on deployment instructions from the central server.
-    
+
     Args:
         instructions: Deployment instructions containing model info, layers, files, etc.
-        
+
     Returns:
         tuple[bool, Any]: (success, loaded_model_or_none)
     """
-    model_name = instructions.get('model_name', 'unknown')
-    assigned_layers = instructions.get('assigned_layers', [])
-    quantization = instructions.get('quantization')  # e.g. "bitsandbytes", "awq", "gptq"
-    dtype = instructions.get('dtype')  # e.g. "bfloat16", "float16", "auto"
-    use_async_engine = bool(instructions.get('use_async_engine') or (instructions.get('engine_type') == 'async'))
-    max_num_seqs = int(instructions.get('max_num_seqs', 1))
-    max_num_batched_tokens = int(instructions.get('max_num_batched_tokens', 2048))
-    
-    print(f"🚀 Starting model deployment orchestration...")
+    model_name = instructions.get("model_name", "unknown")
+    assigned_layers = instructions.get("assigned_layers", [])
+    quantization = instructions.get(
+        "quantization"
+    )  # e.g. "bitsandbytes", "awq", "gptq"
+    dtype = instructions.get("dtype")  # e.g. "bfloat16", "float16", "auto"
+    use_async_engine = bool(
+        instructions.get("use_async_engine")
+        or (instructions.get("engine_type") == "async")
+    )
+    max_num_seqs = int(instructions.get("max_num_seqs", 1))
+    max_num_batched_tokens = int(instructions.get("max_num_batched_tokens", 2048))
+
+    print("🚀 Starting model deployment orchestration...")
     print(f"   Model: {model_name}")
     print(f"   Assigned layers: {assigned_layers}")
     print(f"   Is first peer: {instructions.get('is_first_peer', False)}")
     print(f"   Is last peer: {instructions.get('is_last_peer', False)}")
     print(f"   Required files: {len(instructions.get('required_files', []))}")
     print(f"   Quantization: {quantization} | dtype: {dtype}")
-    print(f"   Engine: {'AsyncLLMEngine(v0)' if use_async_engine else 'LLM'} | max_num_seqs={max_num_seqs} | max_num_batched_tokens={max_num_batched_tokens}")
+    print(
+        f"   Engine: {'AsyncLLMEngine(v0)' if use_async_engine else 'LLM'} | max_num_seqs={max_num_seqs} | max_num_batched_tokens={max_num_batched_tokens}"
+    )
 
     # Check deployment attempts
     if not deployment_tracker.should_attempt_deployment(model_name, assigned_layers):
         print(f"❌ Maximum deployment attempts reached for {model_name}, giving up")
         return False, None
-    
+
     attempt_num = deployment_tracker.record_attempt(model_name, assigned_layers)
     print(f"🔄 Deployment attempt {attempt_num}/3")
-    
+
     try:
         # Phase 1: Download model files
         print("📥 Phase 1: Downloading model files...")
@@ -952,7 +1091,7 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
         if not download_success:
             print("❌ File download phase failed")
             return False, None
-        
+
         # Phase 2: Load model with selective layers
         print("🔧 Phase 2: Loading model with selective layers...")
         try:
@@ -968,17 +1107,19 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
         except ValueError as e:
             print(f"❌ Model loading phase failed: {e}")
             return False, None
-        
+
         # Phase 3: Success - clear attempts and return
         deployment_tracker.clear_attempts(model_name, assigned_layers)
-        
-        print(f"✅ Model deployment orchestration completed successfully!")
-        print(f"   Peer role: {'First' if instructions.get('is_first_peer') else 'Last' if instructions.get('is_last_peer') else 'Middle'}")
+
+        print("✅ Model deployment orchestration completed successfully!")
+        print(
+            f"   Peer role: {'First' if instructions.get('is_first_peer') else 'Last' if instructions.get('is_last_peer') else 'Middle'}"
+        )
         print(f"   Loaded layers: {assigned_layers}")
         # memory saving is rough / unchanged here
-        
+
         return True, loaded_model
-        
+
     except Exception as e:
         print(f"❌ Model deployment orchestration failed: {e}")
         return False, None

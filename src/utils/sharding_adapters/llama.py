@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Dict
 
-from transformers import PretrainedConfig
 import torch
 
 from .base import ShardingAdapter, LayerShard
@@ -11,13 +10,19 @@ from .base import ShardingAdapter, LayerShard
 class LlamaShardingAdapter(ShardingAdapter):
     """Sharding adapter for LLaMA-family models into vLLM-compatible keys."""
 
-    def shard_embedding(self, hf_weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def shard_embedding(
+        self, hf_weights: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
         out: Dict[str, torch.Tensor] = {}
         if "model.embed_tokens.weight" in hf_weights:
-            out["model.embed_tokens.weight"] = hf_weights["model.embed_tokens.weight"].detach().cpu()
+            out["model.embed_tokens.weight"] = (
+                hf_weights["model.embed_tokens.weight"].detach().cpu()
+            )
         return out
 
-    def shard_layer(self, layer_idx: int, hf_weights: Dict[str, torch.Tensor]) -> LayerShard:
+    def shard_layer(
+        self, layer_idx: int, hf_weights: Dict[str, torch.Tensor]
+    ) -> LayerShard:
         p = f"model.layers.{layer_idx}"
         out: Dict[str, torch.Tensor] = {}
 
@@ -57,15 +62,19 @@ class LlamaShardingAdapter(ShardingAdapter):
 
         return LayerShard(weights=out)
 
-    def shard_lm_head(self, hf_weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def shard_lm_head(
+        self, hf_weights: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
         out: Dict[str, torch.Tensor] = {}
         # If tied, lm_head may not be present
         if "lm_head.weight" in hf_weights:
             out["lm_head.weight"] = hf_weights["lm_head.weight"].detach().cpu()
         return out
 
-    def shard_model_norm(self, hf_weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def shard_model_norm(
+        self, hf_weights: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
         out: Dict[str, torch.Tensor] = {}
         if "model.norm.weight" in hf_weights:
             out["model.norm.weight"] = hf_weights["model.norm.weight"].detach().cpu()
-        return out 
+        return out

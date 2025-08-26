@@ -1,10 +1,9 @@
 # src/utils/tensor_transport.py
-import asyncio
 from typing import Any, Dict, Optional
 
 # The wheel you built with build_pyo3_bindings.sh
-import tensor_iroh as tp  
-import numpy as np                         # local import to avoid hard dep
+import tensor_iroh as tp
+import numpy as np  # local import to avoid hard dep
 import torch
 
 
@@ -15,18 +14,19 @@ class TensorTransport:
     • Prints the self-ticket on first start (so you can copy-paste / log it).
     • Exposes send() / recv() coroutines that accept / return torch tensors.
     """
+
     # -------- life-cycle --------------------------------------------------
 
     def __init__(self) -> None:
         self._node: Optional[tp.PyTensorNode] = None
-        self._ticket: Optional[str] = None          # Cached NodeAddr string
+        self._ticket: Optional[str] = None  # Cached NodeAddr string
 
     async def start(self) -> None:
-        if self._node is not None:       # already running
+        if self._node is not None:  # already running
             return
 
         self._node = tp.PyTensorNode()
-        await self._node.start()         # async start
+        await self._node.start()  # async start
 
         # Fetch the node-ticket (= shareable address string)
         self._ticket = await self._node.get_node_addr()
@@ -62,8 +62,10 @@ class TensorTransport:
             array = tensor
         else:
             raise TypeError("tensor must be torch.Tensor or numpy.ndarray")
-        
-        data = tp.PyTensorData(array.tobytes(), list(array.shape), str(array.dtype), False)
+
+        data = tp.PyTensorData(
+            array.tobytes(), list(array.shape), str(array.dtype), False
+        )
         await self._node.send_tensor(peer_addr, name, data)
 
     async def recv(self) -> Optional[Dict[str, Any]]:
