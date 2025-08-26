@@ -2,11 +2,14 @@ import asyncio
 import json
 import os
 import subprocess
+import tempfile
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import aiofiles
+import boto3  # type: ignore
 import httpx
 import torch
 from fastapi import HTTPException
@@ -23,8 +26,6 @@ def load_model_metadata(shard_folder: str):
     model_dir_name = Path(shard_folder).name if shard_folder else ""
     if s3_base:
         try:
-            from urllib.parse import urlparse
-
             o = urlparse(s3_base)
             bucket = o.netloc
             base_key = o.path.lstrip("/")
@@ -34,8 +35,6 @@ def load_model_metadata(shard_folder: str):
                 else f"{base_key.rstrip('/')}/layer_metadata.json"
             )
             try:
-                import boto3  # type: ignore
-
                 client = boto3.client("s3")
                 obj = client.get_object(Bucket=bucket, Key=key)
                 body = obj["Body"].read()
@@ -46,8 +45,6 @@ def load_model_metadata(shard_folder: str):
                 return metadata
             except ImportError:
                 # Fallback to aws cli if boto3 is not installed
-                import tempfile
-
                 with tempfile.TemporaryDirectory() as tmpdir:
                     tmp_path = Path(tmpdir) / "layer_metadata.json"
                     cmd = ["aws", "s3", "cp", f"s3://{bucket}/{key}", str(tmp_path)]
@@ -257,26 +254,60 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
             # Always need norm for last peer
             required_files.extend(["norm/layer.safetensors"])
 
-            # Check if lm_head file exists (not tied) or if we need embeddings (tied)
-            # Try to determine if lm_head file exists
-            lm_head_exists = True  # Default assumption
-
-            # If we have access to the shard folder, check if lm_head exists
-            if hasattr(request, "shard_folder") and request.shard_folder:
-                shard_path = Path(request.shard_folder)
-                lm_head_path = shard_path / "lm_head" / "layer.safetensors"
-                lm_head_exists = lm_head_path.exists()
+            # Check if lm_head/layer.safetensors exists in the model folder (S3 or local)
+            # If it exists, embeddings are NOT tied, regardless of config
+            lm_head_exists = False
+            if prefer_s3:
+                # S3: check if lm_head/layer.safetensors exists in the S3 folder
+                try:
+                    o = urlparse(s3_base)
+                    bucket = o.netloc
+                    base_key = o.path.lstrip("/")
+                    lm_head_key = f"{base_key.rstrip('/')}/{model_dir_name}/lm_head/layer.safetensors"
+                    client = boto3.client("s3")
+                    response = client.list_objects_v2(Bucket=bucket, Prefix=lm_head_key)
+                    if "Contents" in response:
+                        for obj in response["Contents"]:
+                            if obj["Key"] == lm_head_key:
+                                lm_head_exists = True
+                                print(
+                                    f"🔍 S3: Found lm_head/layer.safetensors at {lm_head_key}"
+                                )
+                                break
+                except Exception as e:
+                    print(f"⚠️ Could not check S3 for lm_head/layer.safetensors: {e}")
+            else:
+                # Local: check if lm_head/layer.safetensors exists in the local folder
+                local_lm_head_path = (
+                    Path(getattr(request, "shard_folder", ""))
+                    / "lm_head"
+                    / "layer.safetensors"
+                )
+                if local_lm_head_path.exists():
+                    lm_head_exists = True
+                    print(
+                        f"🔍 Local: Found lm_head/layer.safetensors at {local_lm_head_path}"
+                    )
+            # # First check tie_word_embeddings from metadata (most reliable)
+            # if not tie_word_embeddings:
+            #     # Model config says weights are NOT tied, so lm_head should exist
+            #     lm_head_exists = True
+            #     print(f"ℹ️ Model has tie_word_embeddings=False, expecting separate lm_head")
+            # else:
+            #     # Weights are tied, no separate lm_head
+            #     lm_head_exists = False
+            #     print(f"ℹ️ Model has tie_word_embeddings=True, using embeddings for lm_head")
 
             if lm_head_exists:
                 # Model has separate lm_head weights
                 required_files.append("lm_head/layer.safetensors")
+                print(f"✅ Last peer {peer_id} will download lm_head weights")
             else:
-                # Model likely has tied embeddings - last peer needs embedding file too
-                # This ensures the last peer can copy embed_tokens.weight to lm_head.weight
+                # Model has tied embeddings - last peer needs embedding file too
                 if "embedding/layer.safetensors" not in required_files:
                     required_files.append("embedding/layer.safetensors")
                     print(
-                        f"ℹ️ Last peer {peer_id} will download embeddings (tied weights detected)"
+                        f"ℹ️ Last peer {peer_id} will download embeddings (tied weights)"
                     )
 
         for layer_idx in assigned_layers:
@@ -754,7 +785,7 @@ def create_async_vllm_engine_with_selective_layers(
             tensor_parallel_size=1,
             enforce_eager=True,
             load_format="dummy",
-            max_model_len=4000,  # small for demo
+            max_model_len=2048,  # small for demo
             disable_log_stats=False,
             gpu_memory_utilization=0.8,
             skip_tokenizer_init=False,
