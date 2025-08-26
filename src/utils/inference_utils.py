@@ -9,9 +9,9 @@ from typing import Any, Dict, List, Optional
 import httpx  # type: ignore
 import numpy as np
 import torch
-from vllm import LLM  # type: ignore
 
 from src.utils.tensor_protocol_adapter import TensorTransport
+from vllm import LLM  # type: ignore
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)

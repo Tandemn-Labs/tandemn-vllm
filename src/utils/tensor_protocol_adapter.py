@@ -1,9 +1,10 @@
 # src/utils/tensor_transport.py
 from typing import Any, Dict, Optional
 
+import numpy as np  # local import to avoid hard dep
+
 # The wheel you built with build_pyo3_bindings.sh
 import tensor_iroh as tp
-import numpy as np  # local import to avoid hard dep
 import torch
 
 

@@ -895,14 +895,14 @@ async def deploy_model(request: ModelDeploymentRequest):
         distribution_plan = create_distribution_plan(
             metadata, peers_vram, q_bits=qbits_for_plan
         )
-
         # 4. Create optimized deployment instructions for each peer
-        # ? dicts are ordered, but do we know what's the order being returned? Impt since this ordering is used for the pipeline later in /infer
         deployment_instructions = create_deployment_instructions(
             request, distribution_plan, peer_table, SERVER_IP
         )
-
         # Propagate async engine preferences (if provided) into each peer's instructions
+        if isinstance(request.engine_type, str) or isinstance(
+            request.use_async_engine, bool
+        ):
         if isinstance(request.engine_type, str) or isinstance(
             request.use_async_engine, bool
         ):
@@ -917,21 +917,19 @@ async def deploy_model(request: ModelDeploymentRequest):
                     instr["max_num_batched_tokens"] = int(
                         request.max_num_batched_tokens
                     )
-
         # 5. Persist deployment tracking information BEFORE broadcasting
         active_deployments[request.model_name].update(
             {
                 "instructions_sent_at": time.time(),
                 "deployment_map": {
-                    peerid: instr["assigned_layers"]
-                    for peerid, instr in deployment_instructions.items()
+                    pid: instr["assigned_layers"]
+                    for pid, instr in deployment_instructions.items()
                 },
                 "completion_status": {
-                    peerid: "pending" for peerid in deployment_instructions.keys()
+                    pid: "pending" for pid in deployment_instructions.keys()
                 },
             }
         )
-
         # 6. Send deployment instructions to each peer via Iroh
         send_tasks = []
         peer_ids = []
@@ -966,7 +964,7 @@ async def deploy_model(request: ModelDeploymentRequest):
                 "deployment_map": {
                     peer_id: info["assigned_layers"]
                     for peer_id, info in deployment_instructions.items()
-                },  # ? why is this item updated again
+                },
                 "completion_status": {
                     peer_id: "pending" for peer_id in deployment_instructions.keys()
                 },
@@ -1023,11 +1021,11 @@ async def get_deployment_status(model_name: str):
     }
 
 
+
 class DeploymentCompleteData(BaseModel):
     model_name: str
     peer_id: str
     success: bool
-    max_req_in_batch: int
 
 
 @app.post("/deployment_complete")
@@ -1036,6 +1034,9 @@ async def deployment_complete(data: DeploymentCompleteData):
     """
     Receive deployment‐done reports from peers.
     """
+    print(
+        f"🔍 [DEBUG] Deployment complete received for model {data.model_name} from peer {data.peer_id}"
+    )
     print(
         f"🔍 [DEBUG] Deployment complete received for model {data.model_name} from peer {data.peer_id}"
     )
