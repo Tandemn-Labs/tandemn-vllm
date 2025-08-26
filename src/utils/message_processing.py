@@ -7,7 +7,8 @@ Eliminates code duplication across message handlers and centralizes error handli
 
 import json
 import traceback
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
 
 

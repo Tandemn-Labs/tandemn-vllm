@@ -1,8 +1,10 @@
-import psutil
-import pynvml
-from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import psutil
+import pynvml
+
 
 
 @dataclass

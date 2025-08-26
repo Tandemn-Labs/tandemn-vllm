@@ -1003,12 +1003,7 @@ async def load_model_with_selective_layers(
 
 
 async def report_deployment_completion(
-    server_host: str,
-    server_port: int,
-    model_name: str,
-    peer_id: str,
-    success: bool,
-    max_req_in_batch: int = 1,
+    model_name: str, peer_id: str, success: bool, server_host: str, server_port: int
 ):
     """
     Notify the central server that this peer has finished deploying.
@@ -1021,12 +1016,7 @@ async def report_deployment_completion(
         server_port: Server port
     """
     url = f"http://{server_host}:{server_port}/deployment_complete"
-    payload = {
-        "model_name": model_name,
-        "peer_id": peer_id,
-        "success": success,
-        "max_req_in_batch": max_req_in_batch,
-    }
+    payload = {"model_name": model_name, "peer_id": peer_id, "success": success}
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(url, json=payload)

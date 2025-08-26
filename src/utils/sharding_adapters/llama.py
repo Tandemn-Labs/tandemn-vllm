@@ -182,7 +182,9 @@ class LlamaShardingAdapter(ShardingAdapter):
             # CRITICAL: Also check for unquantized lm_head (common in AWQ models!)
             if "lm_head.weight" in hf_weights:
                 out["lm_head.weight"] = hf_weights["lm_head.weight"].detach().cpu()
-                print(f"✅ Found unquantized lm_head.weight in AWQ model (size: {hf_weights['lm_head.weight'].shape})")
+                print(
+                    f"✅ Found unquantized lm_head.weight in AWQ model (size: {hf_weights['lm_head.weight'].shape})"
+                )
         else:
             if "lm_head.weight" in hf_weights:
                 out["lm_head.weight"] = hf_weights["lm_head.weight"].detach().cpu()

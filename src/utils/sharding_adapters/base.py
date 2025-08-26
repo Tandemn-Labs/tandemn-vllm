@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Dict
 from dataclasses import dataclass
+from typing import Dict
 
-from transformers import PretrainedConfig
 import torch
+from transformers import PretrainedConfig
 
 
 @dataclass

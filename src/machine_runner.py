@@ -49,7 +49,17 @@ peer_ticket_map: dict[
 ] = {}  # peer_id  → ticket string (filled in heartbeat) #? Check if hostnames are being set even
 current_peer_ticket = None  # this is the global variable for the current peer ticket
 deployed_model = None  # this is the global variable for the deployed model
+peer_ticket_map: dict[
+    str, str
+] = {}  # peer_id  → ticket string (filled in heartbeat) #? Check if hostnames are being set even
+current_peer_ticket = None  # this is the global variable for the current peer ticket
+deployed_model = None  # this is the global variable for the deployed model
 deployment_status = "idle"  # idle, downloading, loading, ready, failed
+start_inference_run = None  # this is the global variable for the inference run
+assigned_layers_global = []  # this is the global variable for the assigned layers
+central_server_ticket = (
+    None  # this is the global variable for the central server ticket
+)
 start_inference_run = None  # this is the global variable for the inference run
 assigned_layers_global = []  # this is the global variable for the assigned layers
 central_server_ticket = (
@@ -62,11 +72,15 @@ COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
 PEER_COLOR = COLORS[
     int(socket.gethostname().__hash__()) % len(COLORS)
 ]  # deterministic per host
+PEER_COLOR = COLORS[
+    int(socket.gethostname().__hash__()) % len(COLORS)
+]  # deterministic per host
 
 
 # ============================================================================
 # UNIFIED MESSAGE GATEWAY - SINGLE POINT FOR ALL TENSOR TRANSPORT MESSAGES
 # ============================================================================
+
 
 
 async def unified_message_gateway():
@@ -78,6 +92,7 @@ async def unified_message_gateway():
     global tensor_transport, start_inference_run, current_peer_ticket
     print("🌐 Starting UNIFIED Message Gateway...")
 
+
     while True:
         try:
             # Single point of message reception
@@ -86,13 +101,20 @@ async def unified_message_gateway():
                 await asyncio.sleep(0)
                 continue
 
+
             # Get message metadata
             name = msg.get("name", "")
             tensor = msg.get("tensor")
 
+
             if tensor is None:
                 print("⚠️ Received message without tensor payload")
                 continue
+
+            print(
+                f"📨 Gateway received message: '{name}' (tensor shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'})"
+            )
+
 
             print(
                 f"📨 Gateway received message: '{name}' (tensor shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'})"
@@ -104,7 +126,12 @@ async def unified_message_gateway():
                 if name.lower() in ["deploy", "deployment"] or "deploy" in name.lower():
                     await handle_deployment_message(tensor)
 
+
                 # 2. INFERENCE TRIGGERS
+                elif (
+                    name.lower() in ["inference", "inference_trigger"]
+                    or "inference" in name.lower()
+                ):
                 elif (
                     name.lower() in ["inference", "inference_trigger"]
                     or "inference" in name.lower()
