@@ -6,26 +6,30 @@ This approach processes safetensors files directly without loading the entire mo
 
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from src.utils.sharding_utils import (
     shard_model_by_layers_safetensors,
     get_model_safetensors_files,
-    extract_layer_weights_from_safetensors
+    extract_layer_weights_from_safetensors,
 )
+
 
 def demo_safetensors_sharding():
     """Demonstrate safetensors-based sharding."""
-    
+
     # Example model (use a smaller model for demo)
-    model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"  # Much smaller than Llama-3.1-8B
+    model_name = (
+        "meta-llama/Meta-Llama-3.1-8B-Instruct"  # Much smaller than Llama-3.1-8B
+    )
     hf_token = None  # Set your token if needed
-    
+
     print("🔪 Safetensors-Based Layer Sharding Demo")
     print("=" * 50)
     print(f"Model: {model_name}")
     print()
-    
+
     # Step 1: List safetensors files
     print("📋 Step 1: Listing safetensors files...")
     safetensors_files = get_model_safetensors_files(model_name, hf_token)
@@ -33,7 +37,7 @@ def demo_safetensors_sharding():
     for file in safetensors_files:
         print(f"  - {file}")
     print()
-    
+
     # Step 2: Extract a single layer as example
     print("🔍 Step 2: Extracting layer 0 weights...")
     try:
@@ -48,19 +52,16 @@ def demo_safetensors_sharding():
     except Exception as e:
         print(f"❌ Error extracting layer 0: {e}")
         print()
-    
+
     # Step 3: Full sharding (commented out to avoid long execution)
     print("🚀 Step 3: Full model sharding (commented out for demo)")
     print("To run full sharding, uncomment the code below:")
     print()
-    
 
     # Uncomment to run full sharding
     output_dir = f"./shards/{model_name.replace('/', '_')}"
     result = shard_model_by_layers_safetensors(
-        model_name=model_name,
-        output_dir=output_dir,
-        hf_token=hf_token
+        model_name=model_name, output_dir=output_dir, hf_token=hf_token
     )
     print(f"✅ Sharding completed: {result['total_components']} components")
     print(f"📁 Output: {result['output_dir']}")
@@ -68,7 +69,7 @@ def demo_safetensors_sharding():
 
 def demo_memory_efficiency():
     """Demonstrate memory efficiency of safetensors approach."""
-    
+
     print("💾 Memory Efficiency Comparison")
     print("=" * 40)
     print()
@@ -91,6 +92,7 @@ def demo_memory_efficiency():
     print("  5. Clean up memory after each file")
     print()
 
+
 if __name__ == "__main__":
     demo_memory_efficiency()
-    demo_safetensors_sharding() 
+    demo_safetensors_sharding()

@@ -19,7 +19,7 @@ setup(
         "pytest-cov>=4.1.0",
         "iroh>=0.1.0",
         "aiohttp>=3.9.1",
-        "pynvml>=11.5.0"
+        "pynvml>=11.5.0",
     ],
     python_requires=">=3.8",
-) 
+)
