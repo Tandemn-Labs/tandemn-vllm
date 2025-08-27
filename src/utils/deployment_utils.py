@@ -749,9 +749,16 @@ def create_async_vllm_engine_with_selective_layers(
     """
 
     # Import vLLM lazily to avoid forcing it on the central server process
+    from vllm.config import KVTransferConfig
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.engine.async_llm_engine import AsyncLLMEngine  # v0 async engine
     from vllm.usage.usage_lib import UsageContext
+
+    ktc = KVTransferConfig(
+        kv_connector="LMCacheConnector",  # v0 connector
+        kv_role="kv_both",  # single process does store+retrieve
+        # For multi-process prefill/decode, use kv_producer/kv_consumer below
+    )
 
     # STEP 1: Monkey-patch make_layers so only assigned layers are real.
     def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
@@ -795,6 +802,8 @@ def create_async_vllm_engine_with_selective_layers(
             quantization=quantization,
             dtype=dtype or "float16",  # activations
             block_size=16,
+            kv_transfer_config=ktc,
+            enable_chunked_prefill=True,  # recommended for v0 + LMCache
         )
 
         # STEP 3: Create AsyncLLMEngine (v0 path, in-process)
