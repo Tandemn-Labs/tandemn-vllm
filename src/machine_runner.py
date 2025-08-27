@@ -82,7 +82,6 @@ PEER_COLOR = COLORS[
 # ============================================================================
 
 
-
 async def unified_message_gateway():
     """
     Single gateway that receives ALL messages from tensor_transport and routes them
@@ -92,7 +91,6 @@ async def unified_message_gateway():
     global tensor_transport, start_inference_run, current_peer_ticket
     print("🌐 Starting UNIFIED Message Gateway...")
 
-
     while True:
         try:
             # Single point of message reception
@@ -101,11 +99,9 @@ async def unified_message_gateway():
                 await asyncio.sleep(0)
                 continue
 
-
             # Get message metadata
             name = msg.get("name", "")
             tensor = msg.get("tensor")
-
 
             if tensor is None:
                 print("⚠️ Received message without tensor payload")
@@ -114,7 +110,6 @@ async def unified_message_gateway():
             print(
                 f"📨 Gateway received message: '{name}' (tensor shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'})"
             )
-
 
             print(
                 f"📨 Gateway received message: '{name}' (tensor shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'})"
@@ -126,16 +121,15 @@ async def unified_message_gateway():
                 if name.lower() in ["deploy", "deployment"] or "deploy" in name.lower():
                     await handle_deployment_message(tensor)
 
-
                 # 2. INFERENCE TRIGGERS
                 elif (
                     name.lower() in ["inference", "inference_trigger"]
                     or "inference" in name.lower()
                 ):
-                elif (
-                    name.lower() in ["inference", "inference_trigger"]
-                    or "inference" in name.lower()
-                ):
+                    # elif (
+                    #     name.lower() in ["inference", "inference_trigger"]
+                    #     or "inference" in name.lower()
+                    # ):
                     await handle_inference_trigger_message(tensor)
 
                 # 3. INFERENCE DATA (hidden states, residuals, sampler outputs)
@@ -465,7 +459,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
                 model_name=model_name,
                 peer_id=current_peer_ticket,
                 success=False,
-                max_req_in_batch=5,
+                # max_req_in_batch=5,
             )
             return False
 
@@ -500,7 +494,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             model_name=model_name,
             peer_id=current_peer_ticket,
             success=True,
-            max_req_in_batch=5,
+            # max_req_in_batch=5,
         )
 
         return True
@@ -517,7 +511,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
                 model_name=model_name,
                 peer_id=current_peer_ticket,
                 success=False,
-                max_req_in_batch=5,
+                # max_req_in_batch=5,
             )
         except Exception as _:
             pass  # Don't fail on reporting failure

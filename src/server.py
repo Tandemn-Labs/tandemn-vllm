@@ -903,9 +903,9 @@ async def deploy_model(request: ModelDeploymentRequest):
         if isinstance(request.engine_type, str) or isinstance(
             request.use_async_engine, bool
         ):
-        if isinstance(request.engine_type, str) or isinstance(
-            request.use_async_engine, bool
-        ):
+            # if isinstance(request.engine_type, str) or isinstance(
+            #     request.use_async_engine, bool
+            # ):
             for peer_id, instr in deployment_instructions.items():
                 if request.engine_type is not None:
                     instr["engine_type"] = request.engine_type
@@ -1021,7 +1021,6 @@ async def get_deployment_status(model_name: str):
     }
 
 
-
 class DeploymentCompleteData(BaseModel):
     model_name: str
     peer_id: str
@@ -1044,12 +1043,12 @@ async def deployment_complete(data: DeploymentCompleteData):
         raise HTTPException(404, f"No deployment found for model {data.model_name}")
 
     status_map = active_deployments[data.model_name]["completion_status"]
-    max_req_map = active_deployments[data.model_name]["max_req_in_batch"]
+    # max_req_map = active_deployments[data.model_name]["max_req_in_batch"]
     if data.peer_id not in status_map:
         raise HTTPException(400, f"Peer {data.peer_id} not in deployment")
 
     status_map[data.peer_id] = "success" if data.success else "failed"
-    max_req_map[data.peer_id] = data.max_req_in_batch
+    # max_req_map[data.peer_id] = data.max_req_in_batch
 
     # If every peer succeeded, mark the whole deployment ready; if any failed, fail it.
     if all(s == "success" for s in status_map.values()):
