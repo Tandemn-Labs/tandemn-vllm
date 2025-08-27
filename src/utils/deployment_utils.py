@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -410,23 +411,46 @@ async def download_file(
                 try:
                     import boto3  # type: ignore
 
-                    client = boto3.client("s3")
-                    client.download_file(bucket, key, str(local_path))
-                    print(f"✅ Downloaded {local_path.name} from s3://{bucket}/{key}")
-                    return True
+                    # Run S3 download in thread pool to avoid blocking event loop
+                    loop = asyncio.get_running_loop()
+                    
+                    def download_s3_file():
+                        client = boto3.client("s3")
+                        client.download_file(bucket, key, str(local_path))
+                        return True
+                    
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        success = await loop.run_in_executor(executor, download_s3_file)
+                    
+                    if success:
+                        print(f"✅ Downloaded {local_path.name} from s3://{bucket}/{key}")
+                        return True
+                    else:
+                        return False
+                        
                 except ImportError:
                     print(
                         "ℹ️ boto3 not installed; falling back to aws cli for S3 download"
                     )
-                    cmd = ["aws", "s3", "cp", f"s3://{bucket}/{key}", str(local_path)]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    if result.returncode == 0:
+                    
+                    # Run aws cli in thread pool to avoid blocking event loop
+                    loop = asyncio.get_running_loop()
+                    
+                    def run_aws_cli():
+                        cmd = ["aws", "s3", "cp", f"s3://{bucket}/{key}", str(local_path)]
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        return result.returncode == 0, result.stderr
+                    
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        success, stderr = await loop.run_in_executor(executor, run_aws_cli)
+                    
+                    if success:
                         print(
                             f"✅ Downloaded {local_path.name} via aws cli from s3://{bucket}/{key}"
                         )
                         return True
                     else:
-                        print(f"❌ aws cli download failed: {result.stderr}")
+                        print(f"❌ aws cli download failed: {stderr}")
                         return False
             except Exception as e:
                 print(f"❌ Failed to download from S3 URL {url}: {e}")
