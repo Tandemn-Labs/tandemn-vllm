@@ -367,9 +367,11 @@ def distribute_layers_across_peers(
             break
 
         # HACK: For the peer with highest VRAM (first in sorted list), simulate only 4GB
-        # if i == 0:
-        #     print(f"🔧 [HACK] Simulating 4GB VRAM for highest VRAM peer {peer_id} (actual: {available_vram}GB)")
-        #     available_vram = 0.25
+        if i == 0:
+            print(
+                f"🔧 [HACK] Simulating 4GB VRAM for highest VRAM peer {peer_id} (actual: {available_vram}GB)"
+            )
+            available_vram = 0.5
 
         # Calculate max layers for this peer
         peer_calculation = calculate_max_layers_for_peer(

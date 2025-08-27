@@ -5,18 +5,17 @@ Refactored to support multiple model families via sharding adapters in
 `src/utils/sharding_adapters`.
 """
 
-import os
 import json
-from typing import Optional, Dict, Any, List
-from pathlib import Path
-
-import tempfile
-import subprocess
+import os
 import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import torch
-from safetensors.torch import save_file
 from huggingface_hub import hf_hub_download, list_repo_files
+from safetensors.torch import save_file
 from transformers import AutoConfig, AutoTokenizer
 
 from .sharding_adapters import get_adapter_for_config
@@ -120,13 +119,13 @@ def shard_model_by_layers_safetensors(
     """
     print(f"🔪 Starting safetensors-based layer sharding for {model_name}")
 
-	# Output setup
-	s3_base = os.getenv("S3_SHARDS_BASE")  # e.g., s3://tandemn-model-shards/shards
-	use_s3 = bool(s3_base)
-	model_dir_name = model_name.replace('/', '_')
-	dest_root_uri = _join_s3_uri(s3_base, model_dir_name) if use_s3 else output_dir
-	stream_upload = use_s3  # enable per-file upload when S3 is configured
-	delete_local_after_upload = True  # free disk space once each file is uploaded
+    # Output setup
+    s3_base = os.getenv("S3_SHARDS_BASE")  # e.g., s3://tandemn-model-shards/shards
+    use_s3 = bool(s3_base)
+    model_dir_name = model_name.replace("/", "_")
+    dest_root_uri = _join_s3_uri(s3_base, model_dir_name) if use_s3 else output_dir
+    stream_upload = use_s3  # enable per-file upload when S3 is configured
+    delete_local_after_upload = True  # free disk space once each file is uploaded
 
     if use_s3:
         tmpdir = tempfile.mkdtemp(prefix="shards-")
@@ -157,30 +156,30 @@ def shard_model_by_layers_safetensors(
     config.save_pretrained(config_dir)
     tokenizer.save_pretrained(config_dir)
 
-	# Stream-upload config/tokenizer artifacts immediately (if S3)
-	if stream_upload:
-		uploaded_ct = 0
-		for file in config_dir.rglob("*"):
-			if file.is_file():
-				relative_path = file.relative_to(output_path).as_posix()
-				s3_uri = _join_s3_uri(dest_root_uri, relative_path)
-				if _s3_upload_file(file, s3_uri):
-					uploaded_ct += 1
-					if delete_local_after_upload:
-						try:
-							file.unlink(missing_ok=True)
-						except Exception:
-							pass
-				else:
-					print(f"❌ Failed to upload config file to {s3_uri}")
-		print(f"✅ Stream-uploaded {uploaded_ct} config/tokenizer files")
+    # Stream-upload config/tokenizer artifacts immediately (if S3)
+    if stream_upload:
+        uploaded_ct = 0
+        for file in config_dir.rglob("*"):
+            if file.is_file():
+                relative_path = file.relative_to(output_path).as_posix()
+                s3_uri = _join_s3_uri(dest_root_uri, relative_path)
+                if _s3_upload_file(file, s3_uri):
+                    uploaded_ct += 1
+                    if delete_local_after_upload:
+                        try:
+                            file.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                else:
+                    print(f"❌ Failed to upload config file to {s3_uri}")
+        print(f"✅ Stream-uploaded {uploaded_ct} config/tokenizer files")
 
-	# Read all safetensors once and build an index in memory
-	print("📥 Downloading safetensors...")
-	paths = download_all_safetensors(model_name, hf_token, cache_dir)
-	if not paths:
-		raise ValueError(f"No safetensors files found for {model_name}")
-	print(f"📦 Found {len(paths)} safetensors shards")
+    # Read all safetensors once and build an index in memory
+    print("📥 Downloading safetensors...")
+    paths = download_all_safetensors(model_name, hf_token, cache_dir)
+    if not paths:
+        raise ValueError(f"No safetensors files found for {model_name}")
+    print(f"📦 Found {len(paths)} safetensors shards")
 
     print("📦 Consolidating weights index...")
     hf_weights = consolidate_weights_from_files(paths)
@@ -190,174 +189,184 @@ def shard_model_by_layers_safetensors(
     if num_layers is None or hidden_size is None:
         raise ValueError("Config missing num_hidden_layers/hidden_size")
 
-	metadata = {
-		"model_name": model_name,
-		"model_type": getattr(config, "model_type", "unknown"),
-		"num_layers": int(num_layers),
-		"hidden_size": int(hidden_size),
-		"vocab_size": int(getattr(config, "vocab_size", 0)),
-		"num_attention_heads": int(getattr(config, "num_attention_heads", 0)),
-		"num_key_value_heads": int(getattr(config, "num_key_value_heads", 0)),
-		"intermediate_size": int(getattr(config, "intermediate_size", hidden_size * 4)),
-		"tie_word_embeddings": bool(getattr(config, "tie_word_embeddings", False)),
-		"layer_components": [],
-	}
+    metadata = {
+        "model_name": model_name,
+        "model_type": getattr(config, "model_type", "unknown"),
+        "num_layers": int(num_layers),
+        "hidden_size": int(hidden_size),
+        "vocab_size": int(getattr(config, "vocab_size", 0)),
+        "num_attention_heads": int(getattr(config, "num_attention_heads", 0)),
+        "num_key_value_heads": int(getattr(config, "num_key_value_heads", 0)),
+        "intermediate_size": int(getattr(config, "intermediate_size", hidden_size * 4)),
+        "tie_word_embeddings": bool(getattr(config, "tie_word_embeddings", False)),
+        "layer_components": [],
+    }
 
-	# Embedding
-	try:
-		emb = adapter.shard_embedding(hf_weights)
-		if emb:
-			emb_path = output_path / "embedding" / "layer.safetensors"
-			emb_path.parent.mkdir(exist_ok=True)
-			save_file(emb, str(emb_path))
-			metadata["layer_components"].append({
-				"type": "embedding",
-				"path": "embedding/layer.safetensors",
-				"component_name": "model.embed_tokens",
-			})
-			print("✅ Saved embedding weights")
-			# Stream-upload
-			if stream_upload:
-				s3_uri = _join_s3_uri(dest_root_uri, "embedding/layer.safetensors")
-				if _s3_upload_file(emb_path, s3_uri):
-					if delete_local_after_upload:
-						try:
-							emb_path.unlink(missing_ok=True)
-						except Exception:
-							pass
-				else:
-					print(f"❌ Failed to upload {emb_path} to {s3_uri}")
-	except Exception as e:
-		print(f"⚠️ Embedding export failed: {e}")
+    # Embedding
+    try:
+        emb = adapter.shard_embedding(hf_weights)
+        if emb:
+            emb_path = output_path / "embedding" / "layer.safetensors"
+            emb_path.parent.mkdir(exist_ok=True)
+            save_file(emb, str(emb_path))
+            metadata["layer_components"].append(
+                {
+                    "type": "embedding",
+                    "path": "embedding/layer.safetensors",
+                    "component_name": "model.embed_tokens",
+                }
+            )
+            print("✅ Saved embedding weights")
+            # Stream-upload
+            if stream_upload:
+                s3_uri = _join_s3_uri(dest_root_uri, "embedding/layer.safetensors")
+                if _s3_upload_file(emb_path, s3_uri):
+                    if delete_local_after_upload:
+                        try:
+                            emb_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                else:
+                    print(f"❌ Failed to upload {emb_path} to {s3_uri}")
+    except Exception as e:
+        print(f"⚠️ Embedding export failed: {e}")
 
-	# Layers
-	layers_dir = output_path / "layers"
-	layers_dir.mkdir(exist_ok=True)
-	for i in range(int(num_layers)):
-		try:
-			print(f"🔪 Processing layer {i}/{num_layers-1}...")
-			layer_shard = adapter.shard_layer(i, hf_weights)
-			if layer_shard.weights:
-				layer_path = layers_dir / f"layer_{i}.safetensors"
-				save_file(layer_shard.weights, str(layer_path))
-				metadata["layer_components"].append({
-					"type": "transformer_layer",
-					"layer_index": i,
-					"path": f"layers/layer_{i}.safetensors",
-					"component_name": f"model.layers.{i}",
-				})
-				print(f"✅ Saved layer {i} with {len(layer_shard.weights)} weights")
-				# Stream-upload
-				if stream_upload:
-					s3_uri = _join_s3_uri(dest_root_uri, f"layers/layer_{i}.safetensors")
-					if _s3_upload_file(layer_path, s3_uri):
-						if delete_local_after_upload:
-							try:
-								layer_path.unlink(missing_ok=True)
-							except Exception:
-								pass
-					else:
-						print(f"❌ Failed to upload {layer_path} to {s3_uri}")
-			else:
-				print(f"⚠️ No exportable weights for layer {i}")
-		except Exception as e:
-			print(f"❌ Error processing layer {i}: {e}")
+    # Layers
+    layers_dir = output_path / "layers"
+    layers_dir.mkdir(exist_ok=True)
+    for i in range(int(num_layers)):
+        try:
+            print(f"🔪 Processing layer {i}/{num_layers - 1}...")
+            layer_shard = adapter.shard_layer(i, hf_weights)
+            if layer_shard.weights:
+                layer_path = layers_dir / f"layer_{i}.safetensors"
+                save_file(layer_shard.weights, str(layer_path))
+                metadata["layer_components"].append(
+                    {
+                        "type": "transformer_layer",
+                        "layer_index": i,
+                        "path": f"layers/layer_{i}.safetensors",
+                        "component_name": f"model.layers.{i}",
+                    }
+                )
+                print(f"✅ Saved layer {i} with {len(layer_shard.weights)} weights")
+                # Stream-upload
+                if stream_upload:
+                    s3_uri = _join_s3_uri(
+                        dest_root_uri, f"layers/layer_{i}.safetensors"
+                    )
+                    if _s3_upload_file(layer_path, s3_uri):
+                        if delete_local_after_upload:
+                            try:
+                                layer_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    else:
+                        print(f"❌ Failed to upload {layer_path} to {s3_uri}")
+            else:
+                print(f"⚠️ No exportable weights for layer {i}")
+        except Exception as e:
+            print(f"❌ Error processing layer {i}: {e}")
 
-	# LM head
-	try:
-		lmh = adapter.shard_lm_head(hf_weights)
-		if lmh:
-			lm_path = output_path / "lm_head" / "layer.safetensors"
-			lm_path.parent.mkdir(exist_ok=True)
-			save_file(lmh, str(lm_path))
-			metadata["layer_components"].append({
-				"type": "lm_head",
-				"path": "lm_head/layer.safetensors",
-				"component_name": "lm_head",
-			})
-			print("✅ Saved lm_head weights")
-			# Stream-upload
-			if stream_upload:
-				s3_uri = _join_s3_uri(dest_root_uri, "lm_head/layer.safetensors")
-				if _s3_upload_file(lm_path, s3_uri):
-					if delete_local_after_upload:
-						try:
-							lm_path.unlink(missing_ok=True)
-						except Exception:
-							pass
-				else:
-					print(f"❌ Failed to upload {lm_path} to {s3_uri}")
-		else:
-			print("ℹ️ lm_head is tied or absent; skipping explicit save")
-	except Exception as e:
-		print(f"⚠️ LM head export failed: {e}")
+    # LM head
+    try:
+        lmh = adapter.shard_lm_head(hf_weights)
+        if lmh:
+            lm_path = output_path / "lm_head" / "layer.safetensors"
+            lm_path.parent.mkdir(exist_ok=True)
+            save_file(lmh, str(lm_path))
+            metadata["layer_components"].append(
+                {
+                    "type": "lm_head",
+                    "path": "lm_head/layer.safetensors",
+                    "component_name": "lm_head",
+                }
+            )
+            print("✅ Saved lm_head weights")
+            # Stream-upload
+            if stream_upload:
+                s3_uri = _join_s3_uri(dest_root_uri, "lm_head/layer.safetensors")
+                if _s3_upload_file(lm_path, s3_uri):
+                    if delete_local_after_upload:
+                        try:
+                            lm_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                else:
+                    print(f"❌ Failed to upload {lm_path} to {s3_uri}")
+        else:
+            print("ℹ️ lm_head is tied or absent; skipping explicit save")
+    except Exception as e:
+        print(f"⚠️ LM head export failed: {e}")
 
-	# Final norm
-	try:
-		norm = adapter.shard_model_norm(hf_weights)
-		if norm:
-			norm_path = output_path / "norm" / "layer.safetensors"
-			norm_path.parent.mkdir(exist_ok=True)
-			save_file(norm, str(norm_path))
-			metadata["layer_components"].append({
-				"type": "norm",
-				"path": "norm/layer.safetensors",
-				"component_name": "model.norm",
-			})
-			print("✅ Saved model.norm weights")
-			# Stream-upload
-			if stream_upload:
-				s3_uri = _join_s3_uri(dest_root_uri, "norm/layer.safetensors")
-				if _s3_upload_file(norm_path, s3_uri):
-					if delete_local_after_upload:
-						try:
-							norm_path.unlink(missing_ok=True)
-						except Exception:
-							pass
-				else:
-					print(f"❌ Failed to upload {norm_path} to {s3_uri}")
-	except Exception as e:
-		print(f"⚠️ Model norm export failed: {e}")
+    # Final norm
+    try:
+        norm = adapter.shard_model_norm(hf_weights)
+        if norm:
+            norm_path = output_path / "norm" / "layer.safetensors"
+            norm_path.parent.mkdir(exist_ok=True)
+            save_file(norm, str(norm_path))
+            metadata["layer_components"].append(
+                {
+                    "type": "norm",
+                    "path": "norm/layer.safetensors",
+                    "component_name": "model.norm",
+                }
+            )
+            print("✅ Saved model.norm weights")
+            # Stream-upload
+            if stream_upload:
+                s3_uri = _join_s3_uri(dest_root_uri, "norm/layer.safetensors")
+                if _s3_upload_file(norm_path, s3_uri):
+                    if delete_local_after_upload:
+                        try:
+                            norm_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                else:
+                    print(f"❌ Failed to upload {norm_path} to {s3_uri}")
+    except Exception as e:
+        print(f"⚠️ Model norm export failed: {e}")
 
     # Save metadata
     metadata_path = output_path / "layer_metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-	# Stream-upload metadata last
-	if stream_upload:
-		s3_uri = _join_s3_uri(dest_root_uri, "layer_metadata.json")
-		if _s3_upload_file(metadata_path, s3_uri):
-			if delete_local_after_upload:
-				try:
-					metadata_path.unlink(missing_ok=True)
-				except Exception:
-					pass
-		else:
-			print(f"❌ Failed to upload metadata to {s3_uri}")
+    # Stream-upload metadata last
+    if stream_upload:
+        s3_uri = _join_s3_uri(dest_root_uri, "layer_metadata.json")
+        if _s3_upload_file(metadata_path, s3_uri):
+            if delete_local_after_upload:
+                try:
+                    metadata_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        else:
+            print(f"❌ Failed to upload metadata to {s3_uri}")
 
-	# If streaming uploads were used, skip the final bulk upload
-	if use_s3 and not stream_upload:
-		print(f"🔪 Uploading to S3: {dest_root_uri}")
-		uploaded=0
-		for file in output_path.rglob("*"):
-			if file.is_file():
-				relative_path = file.relative_to(output_path).as_posix()
-				s3_uri = _join_s3_uri(dest_root_uri, relative_path)
-				if not _s3_upload_file(file, s3_uri):
-					print(f"❌ Failed to upload {file} to {s3_uri}")
-				else:
-					uploaded += 1
-		print(f"✅ Successfully uploaded {uploaded} files to S3")
+    # If streaming uploads were used, skip the final bulk upload
+    if use_s3 and not stream_upload:
+        print(f"🔪 Uploading to S3: {dest_root_uri}")
+        uploaded = 0
+        for file in output_path.rglob("*"):
+            if file.is_file():
+                relative_path = file.relative_to(output_path).as_posix()
+                s3_uri = _join_s3_uri(dest_root_uri, relative_path)
+                if not _s3_upload_file(file, s3_uri):
+                    print(f"❌ Failed to upload {file} to {s3_uri}")
+                else:
+                    uploaded += 1
+        print(f"✅ Successfully uploaded {uploaded} files to S3")
 
-	# Cleanup temp directory when using S3
-	if use_s3:
-		try:
-			shutil.rmtree(output_path, ignore_errors=True)
-			print(f"🔪 Removed temporary directory: {output_path}")
-		except Exception as e:
-			print(f"⚠️ Failed to remove temporary directory: {e}")
-			pass
+    # Cleanup temp directory when using S3
+    if use_s3:
+        try:
+            shutil.rmtree(output_path, ignore_errors=True)
+            print(f"🔪 Removed temporary directory: {output_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to remove temporary directory: {e}")
+            pass
 
     print(
         f"✅ Successfully sharded model into {len(metadata['layer_components'])} components"
