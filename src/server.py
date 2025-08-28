@@ -14,6 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
+import src.utils.req_batcher as req_batcher
 from src.utils.deployment_utils import (
     create_deployment_instructions,
     create_distribution_plan,
@@ -85,6 +86,9 @@ colorama_init(autoreset=True)
 COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
 peer_color_map = {}
 
+# Maximum time we want to wait to fill up batches (in seconds)
+MAX_TIME_PER_BATCH = 1
+
 
 def _get_peer_color(peer_id: str):
     if peer_id not in peer_color_map:
@@ -139,10 +143,7 @@ class ModelDeploymentRequest(BaseModel):
     qbits: Optional[int] = None  # e.g. 4 or 8 for VRAM plan
     dtype: Optional[str] = None  # e.g. "bfloat16", "float16", "auto"
     # NEW: optional async engine selection & scheduler tuning
-    engine_type: Optional[str] = (
-        None  # "async" to enable v0 AsyncLLMEngine; default None/"llm"
-    )
-    use_async_engine: Optional[bool] = None  # alternative toggle; True = async engine
+    use_async_engine: Optional[bool] = None  # True = AsyncLLMEngine, False/None = LLM
     max_num_seqs: Optional[int] = None
     max_num_batched_tokens: Optional[int] = None
 
@@ -880,6 +881,7 @@ async def deploy_model(request: ModelDeploymentRequest):
         active_deployments[request.model_name] = {
             "started_at": time.time(),
             "status": "in_progress",
+            "max_req_in_batch": {},
         }
 
         print(f"🚀 Starting deployment for {request.model_name}")
@@ -900,17 +902,9 @@ async def deploy_model(request: ModelDeploymentRequest):
             request, distribution_plan, peer_table, SERVER_IP
         )
         # Propagate async engine preferences (if provided) into each peer's instructions
-        if isinstance(request.engine_type, str) or isinstance(
-            request.use_async_engine, bool
-        ):
-            # if isinstance(request.engine_type, str) or isinstance(
-            #     request.use_async_engine, bool
-            # ):
+        if request.use_async_engine is not None:
             for peer_id, instr in deployment_instructions.items():
-                if request.engine_type is not None:
-                    instr["engine_type"] = request.engine_type
-                if request.use_async_engine is not None:
-                    instr["use_async_engine"] = bool(request.use_async_engine)
+                instr["use_async_engine"] = bool(request.use_async_engine)
                 if request.max_num_seqs is not None:
                     instr["max_num_seqs"] = int(request.max_num_seqs)
                 if request.max_num_batched_tokens is not None:
@@ -1025,6 +1019,7 @@ class DeploymentCompleteData(BaseModel):
     model_name: str
     peer_id: str
     success: bool
+    max_req_in_batch: int
 
 
 @app.post("/deployment_complete")
@@ -1043,17 +1038,27 @@ async def deployment_complete(data: DeploymentCompleteData):
         raise HTTPException(404, f"No deployment found for model {data.model_name}")
 
     status_map = active_deployments[data.model_name]["completion_status"]
-    # max_req_map = active_deployments[data.model_name]["max_req_in_batch"]
+    max_req_map = active_deployments[data.model_name]["max_req_in_batch"]
     if data.peer_id not in status_map:
         raise HTTPException(400, f"Peer {data.peer_id} not in deployment")
 
     status_map[data.peer_id] = "success" if data.success else "failed"
-    # max_req_map[data.peer_id] = data.max_req_in_batch
+    max_req_map[data.peer_id] = data.max_req_in_batch
+
+    async def test(batch: List[req_batcher.Request]):
+        pass
 
     # If every peer succeeded, mark the whole deployment ready; if any failed, fail it.
     if all(s == "success" for s in status_map.values()):
         active_deployments[data.model_name]["status"] = "ready"
-        print(f"✅ Deployment for {data.model_name} is now READY")
+        max_req = max(max_req_map.values())
+        print(
+            f"✅ Deployment for {data.model_name} is now READY, Max req / batch is {max_req}"
+        )
+        active_deployments[data.model_name]["batcher"] = req_batcher.Batcher(
+            data.model_name, max_req, MAX_TIME_PER_BATCH, test
+        )
+
     elif any(s == "failed" for s in status_map.values()):
         active_deployments[data.model_name]["status"] = "failed"
         print(f"❌ Deployment for {data.model_name} has FAILED")
@@ -1131,7 +1136,7 @@ async def infer(request: InferenceRequest):
 
     # 2. Send the trigger to the first peer #? comment doesn't match action
     request_id = f"req_{int(time.time() * 1000)}_{len(active_inferences)}"  # ? Is this sustainable as a request_id
-    active_inferences[request_id] = {
+    active_inferences[request_id] = {  # TODO: Might have to change this
         "status": "processing",
         "model_name": request.model_name,
         "request_id": request_id,

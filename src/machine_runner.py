@@ -459,7 +459,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
                 model_name=model_name,
                 peer_id=current_peer_ticket,
                 success=False,
-                # max_req_in_batch=5,
+                max_req_in_batch=5,
             )
             return False
 
@@ -479,6 +479,9 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             pipeline=instructions.get("pipeline"),
         )
 
+        print(type(deployed_model))
+        print(deployed_model)
+
         # Update global assigned layers
         global assigned_layers_global
         assigned_layers_global = instructions["assigned_layers"]
@@ -494,7 +497,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             model_name=model_name,
             peer_id=current_peer_ticket,
             success=True,
-            # max_req_in_batch=5,
+            max_req_in_batch=5,
         )
 
         return True
@@ -511,7 +514,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
                 model_name=model_name,
                 peer_id=current_peer_ticket,
                 success=False,
-                # max_req_in_batch=5,
+                max_req_in_batch=5,
             )
         except Exception as _:
             pass  # Don't fail on reporting failure

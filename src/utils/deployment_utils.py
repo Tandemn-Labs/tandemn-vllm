@@ -561,6 +561,7 @@ def create_dynamic_vllm_model(
     # STEP 1: Monkey-patch vLLM's make_layers function (Prime Intellect's key insight)
     def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
         """Custom make_layers that creates real layers only for assigned indices."""
+
         from vllm.model_executor.models.utils import (
             PPMissingLayer,
             maybe_offload_to_cpu,
@@ -595,10 +596,10 @@ def create_dynamic_vllm_model(
             model=model_dir,
             tensor_parallel_size=1,
             enforce_eager=True,  # Required for custom layer loading
-            max_model_len=50,  # Small for demo
+            max_model_len=120,  # Small for demo
             disable_log_stats=True,
             skip_tokenizer_init=False,
-            gpu_memory_utilization=0.8,  # Use much less memory
+            gpu_memory_utilization=0.9,  # Use much less memory
             use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
             load_format="dummy",  # ← this is the magic flag
             dtype=(dtype or "float16"),
@@ -651,7 +652,7 @@ def create_dynamic_vllm_model(
                     print(
                         "✅ Using tied embeddings - copied embed_tokens weights to lm_head"
                     )
-                elif "embed_tokens.weight" in all_weights:
+                if "embed_tokens.weight" in all_weights:
                     # Alternative naming
                     all_weights["lm_head.weight"] = all_weights["embed_tokens.weight"]
                     print(
@@ -785,9 +786,9 @@ def create_async_vllm_engine_with_selective_layers(
             tensor_parallel_size=1,
             enforce_eager=True,
             load_format="dummy",
-            max_model_len=2048,  # small for demo
+            max_model_len=120,  # small for demo
             disable_log_stats=False,
-            gpu_memory_utilization=0.8,
+            gpu_memory_utilization=0.9,
             skip_tokenizer_init=False,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
@@ -985,11 +986,11 @@ async def load_model_with_selective_layers(
         print("✅ Model loaded successfully!")
 
         print(type(loaded_model), dir(loaded_model))
-        executor = loaded_model.engine.model_executor
-        print(
-            f"Executor:{executor.cache_config.num_gpu_blocks}, {executor.cache_config.block_size}, \
-            {executor.model_config.max_model_len}"
-        )
+        # executor = loaded_model.engine.model_executor
+        # print(
+        #     f"Executor:{executor.cache_config.num_gpu_blocks}, {executor.cache_config.block_size}, \
+        #     {executor.model_config.max_model_len}"
+        # )
         return loaded_model
 
     except Exception as e:
@@ -1003,7 +1004,12 @@ async def load_model_with_selective_layers(
 
 
 async def report_deployment_completion(
-    model_name: str, peer_id: str, success: bool, server_host: str, server_port: int
+    model_name: str,
+    peer_id: str,
+    success: bool,
+    server_host: str,
+    server_port: int,
+    max_req_in_batch: int,
 ):
     """
     Notify the central server that this peer has finished deploying.
@@ -1016,7 +1022,12 @@ async def report_deployment_completion(
         server_port: Server port
     """
     url = f"http://{server_host}:{server_port}/deployment_complete"
-    payload = {"model_name": model_name, "peer_id": peer_id, "success": success}
+    payload = {
+        "model_name": model_name,
+        "peer_id": peer_id,
+        "success": success,
+        "max_req_in_batch": max_req_in_batch,
+    }
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(url, json=payload)
@@ -1080,10 +1091,7 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
         "quantization"
     )  # e.g. "bitsandbytes", "awq", "gptq"
     dtype = instructions.get("dtype")  # e.g. "bfloat16", "float16", "auto"
-    use_async_engine = bool(
-        instructions.get("use_async_engine")
-        or (instructions.get("engine_type") == "async")
-    )
+    use_async_engine = bool(instructions.get("use_async_engine", False))
     max_num_seqs = int(instructions.get("max_num_seqs", 1))
     max_num_batched_tokens = int(instructions.get("max_num_batched_tokens", 2048))
 
