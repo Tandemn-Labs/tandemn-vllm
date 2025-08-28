@@ -334,6 +334,7 @@ def distribute_layers_across_peers(
 ) -> Dict[str, Any]:
     """
     Distribute model layers optimally across multiple GPU peers.
+    Uses balanced distribution to achieve similar VRAM utilization percentage across all peers.
 
     Args:
         config: Model configuration dictionary
@@ -354,71 +355,173 @@ def distribute_layers_across_peers(
         f"🔍 Model {config.get('model_name')} has {total_layers} layers and requires {total_model_vram_gb} GB of VRAM"
     )
 
-    # Sort peers by available VRAM (descending)
-    sorted_peers = sorted(peers_vram.items(), key=lambda x: x[1], reverse=True)
+    # Calculate effective VRAM for each peer (with safety margin)
+    effective_vram = {
+        peer_id: vram * (1 - safety_margin) for peer_id, vram in peers_vram.items()
+    }
 
+    # Calculate total effective VRAM across all peers
+    total_effective_vram = sum(effective_vram.values())
+
+    # Check if model can fit at all
+    if total_effective_vram < total_model_vram_gb:
+        print(
+            f"⚠️ Warning: Total effective VRAM ({total_effective_vram:.2f}GB) "
+            f"may be insufficient for model ({total_model_vram_gb:.2f}GB)"
+        )
+
+    # Find the peer with highest VRAM to handle embeddings
+    embedding_peer = max(peers_vram.items(), key=lambda x: x[1])[0]
+
+    # Calculate effective capacity in terms of layers for each peer
+    peer_capacities = {}
+    for peer_id, vram in effective_vram.items():
+        if peer_id == embedding_peer:
+            # This peer handles embeddings, so subtract that from capacity
+            available_for_layers = vram - embedding_vram_gb
+            max_layers = max(0, int(available_for_layers / vram_per_layer_gb))
+        else:
+            max_layers = int(vram / vram_per_layer_gb)
+        peer_capacities[peer_id] = max_layers
+
+    total_capacity = sum(peer_capacities.values())
+
+    # If total capacity is less than total layers, we need to adjust
+    if total_capacity < total_layers:
+        print(
+            f"⚠️ Total capacity ({total_capacity} layers) < model layers ({total_layers}). "
+            f"Will distribute what's possible."
+        )
+
+    # Calculate proportional distribution based on capacity
     distribution = {}
+    assigned_so_far = 0
     remaining_layers = total_layers
-    total_available_vram = sum(peers_vram.values())
-    embedding_assigned = False
 
-    for i, (peer_id, available_vram) in enumerate(sorted_peers):
+    # Sort peers by capacity for consistent assignment (largest capacity first)
+    sorted_peers = sorted(peer_capacities.items(), key=lambda x: x[1], reverse=True)
+
+    for i, (peer_id, capacity) in enumerate(sorted_peers):
         if remaining_layers <= 0:
             break
 
-        # HACK: For the peer with highest VRAM (first in sorted list), simulate only 4GB
-        if i == 0:
-            print(
-                f"🔧 [HACK] Simulating 4GB VRAM for highest VRAM peer {peer_id} (actual: {available_vram}GB)"
-            )
-            available_vram = 0.25
-
-        # Calculate max layers for this peer
-        peer_calculation = calculate_max_layers_for_peer(
-            config, available_vram, q_bits, safety_margin, batch_size, seq_length
-        )
-
-        # Determine how many layers to assign
-        if not embedding_assigned and available_vram >= embedding_vram_gb:
-            # First peer with enough space gets embeddings + layers
-            max_layers_for_peer = peer_calculation["max_layers_with_embeddings"]
-            will_handle_embeddings = True
-            embedding_assigned = True
+        # Calculate proportional share of remaining layers
+        if i == len(sorted_peers) - 1:  # Last peer gets all remaining
+            assigned_layers = min(capacity, remaining_layers)
         else:
-            # Other peers get only layers
-            max_layers_for_peer = peer_calculation["max_layers_only"]
-            will_handle_embeddings = False
-
-        # Don't assign more layers than remaining
-        assigned_layers = min(max_layers_for_peer, remaining_layers)
+            # Calculate this peer's proportion of total remaining capacity
+            remaining_capacity = sum(cap for pid, cap in sorted_peers[i:])
+            if remaining_capacity > 0:
+                proportion = capacity / remaining_capacity
+                target_layers = int(remaining_layers * proportion)
+                # Ensure at least 1 layer if peer has capacity and layers remain
+                if target_layers == 0 and capacity > 0 and remaining_layers > 0:
+                    target_layers = 1
+                assigned_layers = min(capacity, target_layers, remaining_layers)
+            else:
+                assigned_layers = 0
 
         if assigned_layers > 0:
+            # Calculate actual VRAM usage
+            is_embedding_peer = peer_id == embedding_peer
+            vram_usage = (embedding_vram_gb if is_embedding_peer else 0) + (
+                assigned_layers * vram_per_layer_gb
+            )
+
             distribution[peer_id] = {
                 "assigned_layers": assigned_layers,
-                "handles_embeddings": will_handle_embeddings,
-                "available_vram_gb": available_vram,
-                "estimated_vram_usage": round(
-                    (embedding_vram_gb if will_handle_embeddings else 0)
-                    + (assigned_layers * vram_per_layer_gb),
-                    3,
-                ),
+                "handles_embeddings": is_embedding_peer,
+                "available_vram_gb": peers_vram[peer_id],
+                "estimated_vram_usage": round(vram_usage, 3),
                 "vram_utilization_percent": round(
-                    (
-                        (embedding_vram_gb if will_handle_embeddings else 0)
-                        + (assigned_layers * vram_per_layer_gb)
-                    )
-                    / available_vram
-                    * 100,
-                    1,
+                    vram_usage / peers_vram[peer_id] * 100, 1
                 ),
             }
             remaining_layers -= assigned_layers
+            assigned_so_far += assigned_layers
 
-    # Check if we can fit the entire model
+    # Balance check: Try to equalize utilization percentages if there's significant imbalance
+    if len(distribution) > 1:
+        utilizations = [d["vram_utilization_percent"] for d in distribution.values()]
+        max_util = max(utilizations)
+        min_util = min(utilizations)
+
+        # If there's more than 20% difference, try to rebalance
+        if max_util - min_util > 20:
+            print(
+                f"🔄 Rebalancing distribution (util range: {min_util:.1f}% - {max_util:.1f}%)"
+            )
+
+            # Calculate target utilization (average)
+            target_utilization = sum(utilizations) / len(utilizations)
+
+            # Recalculate distribution based on target utilization
+            new_distribution = {}
+            remaining_layers = total_layers
+
+            for peer_id, vram in sorted(
+                peers_vram.items(), key=lambda x: x[1], reverse=True
+            ):
+                if remaining_layers <= 0:
+                    break
+
+                is_embedding_peer = peer_id == embedding_peer
+
+                # Calculate target VRAM usage based on target utilization
+                target_vram_usage = (
+                    vram * (target_utilization / 100) * (1 - safety_margin)
+                )
+
+                # Subtract embeddings if this peer handles them
+                if is_embedding_peer:
+                    available_for_layers = target_vram_usage - embedding_vram_gb
+                else:
+                    available_for_layers = target_vram_usage
+
+                # Calculate layers
+                target_layers = max(0, int(available_for_layers / vram_per_layer_gb))
+                assigned_layers = min(target_layers, remaining_layers)
+
+                if assigned_layers > 0 or is_embedding_peer:
+                    vram_usage = (embedding_vram_gb if is_embedding_peer else 0) + (
+                        assigned_layers * vram_per_layer_gb
+                    )
+
+                    new_distribution[peer_id] = {
+                        "assigned_layers": assigned_layers,
+                        "handles_embeddings": is_embedding_peer,
+                        "available_vram_gb": vram,
+                        "estimated_vram_usage": round(vram_usage, 3),
+                        "vram_utilization_percent": round(vram_usage / vram * 100, 1),
+                    }
+                    remaining_layers -= assigned_layers
+
+            # Use rebalanced distribution if it assigned all layers
+            if remaining_layers == 0:
+                distribution = new_distribution
+                print("✅ Rebalancing successful")
+            else:
+                print(
+                    f"⚠️ Rebalancing left {remaining_layers} layers unassigned, keeping original"
+                )
+
+    # Final statistics
     total_assigned_layers = sum(
         peer["assigned_layers"] for peer in distribution.values()
     )
+    embedding_assigned = any(
+        peer["handles_embeddings"] for peer in distribution.values()
+    )
     can_fit_model = total_assigned_layers >= total_layers and embedding_assigned
+
+    # Print distribution summary
+    print("\n📊 Layer Distribution Summary:")
+    for peer_id, info in distribution.items():
+        print(
+            f"   {peer_id}: {info['assigned_layers']} layers, "
+            f"{info['vram_utilization_percent']:.1f}% VRAM utilization"
+            f"{' (+ embeddings)' if info['handles_embeddings'] else ''}"
+        )
 
     return {
         "distribution": distribution,
@@ -432,8 +535,8 @@ def distribute_layers_across_peers(
             "seq_length": seq_length,
         },
         "can_fit_model": can_fit_model,
-        "remaining_layers": remaining_layers,
+        "remaining_layers": total_layers - total_assigned_layers,
         "total_peers": len(peers_vram),
         "utilized_peers": len(distribution),
-        "total_available_vram_gb": round(total_available_vram, 3),
+        "total_available_vram_gb": round(sum(peers_vram.values()), 3),
     }
