@@ -9,9 +9,9 @@ from typing import Any, Dict, List, Optional
 import httpx  # type: ignore
 import numpy as np
 import torch
+from vllm import LLM  # type: ignore
 
 from src.utils.tensor_protocol_adapter import TensorTransport
-from vllm import LLM  # type: ignore
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
@@ -213,7 +213,7 @@ def register_inference_hooks(
     Create pre and post hooks for the inference pipeline, to transfer hidden states
     """
     # get the model runner worker, model itself and the sampler
-    try:
+    try:  # ? Not sure if this is a stable way to multiplex between the two, why not check the type?
         if hasattr(llm, "llm_engine"):
             model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
         elif hasattr(llm, "engine"):
@@ -475,6 +475,10 @@ def register_inference_hooks(
         - For the last peer: broadcasts sampler output to all other peers
         - For non-last peers: waits for sampler output from the last peer
         """
+
+        print("Sampler hook output: ", type(output))
+        print(output)
+
         # Get request-specific context safely
         with context_lock:
             active_contexts = [
