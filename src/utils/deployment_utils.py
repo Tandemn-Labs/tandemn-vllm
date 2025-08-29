@@ -788,24 +788,48 @@ def create_async_vllm_engine_with_selective_layers(
 
     try:
         # STEP 2: Build AsyncEngineArgs mirroring your LLM init
+        # engine_args = AsyncEngineArgs(
+        #     model=model_dir,
+        #     tensor_parallel_size=1,
+        #     enforce_eager=True,
+        #     load_format="dummy",
+        #     max_model_len=2048,  # small for demo
+        #     disable_log_stats=False,
+        #     gpu_memory_utilization=0.8,
+        #     skip_tokenizer_init=False,
+        #     max_num_seqs=max_num_seqs,
+        #     max_num_batched_tokens=max_num_batched_tokens,
+        #     quantization=quantization,
+        #     dtype=dtype or "float16",  # activations
+        #     block_size=16,
+        #     kv_transfer_config=ktc,
+        #     enable_chunked_prefill=True,  # recommended for v0 + LMCache
+        # )
         engine_args = AsyncEngineArgs(
             model=model_dir,
             tensor_parallel_size=1,
             enforce_eager=True,
             load_format="dummy",
-            max_model_len=120,  # small for demo
+            max_model_len=16400,  # Changed from 2048 to enable 128K context
             disable_log_stats=False,
-            gpu_memory_utilization=0.98,
+            gpu_memory_utilization=0.9,  # Increased from 0.8 for more memory
             skip_tokenizer_init=False,
             max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_batched_tokens=16400,
             quantization=quantization,
             dtype=dtype or "float16",  # activations
             block_size=16,
             kv_transfer_config=ktc,
-            enable_chunked_prefill=True,  # recommended for v0 + LMCache
+            enable_chunked_prefill=False,  # recommended for v0 + LMCache
+            rope_scaling={  # Add RoPE scaling configuration
+                "rope_type": "llama3",
+                "factor": 32.0,
+                "high_freq_factor": 4.0,
+                "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 8192,
+            },
+            rope_theta=500000.0,
         )
-
         # STEP 3: Create AsyncLLMEngine (v0 path, in-process)
         async_engine = AsyncLLMEngine.from_engine_args(
             engine_args=engine_args,
