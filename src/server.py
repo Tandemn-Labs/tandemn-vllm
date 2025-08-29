@@ -110,7 +110,7 @@ class HeartbeatRequest(BaseModel):
 
 # still has to change
 class InferenceResponse(BaseModel):
-    request_id: str
+    request_id: uuid.UUID
     status: str  # "processing", "completed", "failed"
     result: Optional[str] = None
     processing_time: Optional[float] = None
@@ -1067,8 +1067,8 @@ async def deployment_complete(data: DeploymentCompleteData):
 
 
 class CompletionData(BaseModel):
-    request_id: str
-    output_text: str
+    batch_id: str
+    output_text: List[str]
     peer_id: str
     timestamp: int
 
@@ -1078,9 +1078,9 @@ async def completion(completion: CompletionData):
     """
     Receive completion data from a peer.
     """
-    request_id = completion.request_id
-    if request_id in active_inferences:
-        inference_state = active_inferences[request_id]
+    batch_id = completion.batch_id
+    if batch_id in active_inferences:
+        inference_state = active_inferences[batch_id]
         inference_state["status"] = "completed"
         inference_state["result"] = completion.output_text
         inference_state["completed_at"] = time.time()
@@ -1089,9 +1089,14 @@ async def completion(completion: CompletionData):
         )
         print(f"Result: {completion.output_text}")
         print(
-            f"✅ Inference {request_id} completed in {inference_state['processing_time']:.2f}s"
+            f"✅ Inference {batch_id} completed in {inference_state['processing_time']:.2f}s"
         )
     return {"status": "ok"}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def hello_world():
+    return "<html><body><h1>Hello, World!</h1><p>This is a bare debug page.</p></body></html>"
 
 
 # new inference request model
@@ -1099,11 +1104,6 @@ class InferenceRequest(BaseModel):
     model_name: str
     input_text: str
     max_tokens: int = 100
-
-
-@app.get("/", response_class=HTMLResponse)
-async def hello_world():
-    return "<html><body><h1>Hello, World!</h1><p>This is a bare debug page.</p></body></html>"
 
 
 # IROH STARTS HERE
@@ -1134,8 +1134,8 @@ async def infer(request: InferenceRequest):
             detail=f"No deployment map found for model {request.model_name}",
         )
 
-    # 2. Send the trigger to the first peer #? comment doesn't match action
-    request_id = f"req_{int(time.time() * 1000)}_{len(active_inferences)}"  # ? Is this sustainable as a request_id
+    # 2. Initialize request_id and add it to active_inferences
+    request_id = uuid.uuid4()
     active_inferences[request_id] = {  # TODO: Might have to change this
         "status": "processing",
         "model_name": request.model_name,
@@ -1153,15 +1153,25 @@ async def infer(request: InferenceRequest):
     # 4. Create the instruction payload
     inference_payload = {
         "action": "start_inference",  # ? Is this action spurious since it's sent to the infer endpoint
-        "request_id": request_id,
+        "batch_id": request_id,
         "model_name": request.model_name,
-        "input_text": request.input_text,
+        "input_text": [request.input_text for i in range(5)],
         "pipeline": pipeline,
-        "sampling_params": sampling_params,
+        "sampling_params": [sampling_params for i in range(5)],
         "assigned_layers": deployment_map,
         "timestamp": time.time(),
     }
-    instruction_payload = json.dumps(inference_payload).encode()
+
+    # Custom encoder, only handles UUID for now # TODO: there is a correct way to do this lol
+    def custom_encode(o):
+        try:
+            # Only UUID
+            if isinstance(o, uuid.UUID):
+                return str(o)
+        except Exception as e:
+            print(f"Error in json dump: {e}")
+
+    instruction_payload = json.dumps(inference_payload, default=custom_encode).encode()
     instruction_payload = np.frombuffer(instruction_payload, dtype=np.uint8)
 
     # 5. Broadcast the instruction payload to ALL peers in the pipeline concurrently

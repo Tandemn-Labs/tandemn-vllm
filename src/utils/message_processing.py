@@ -187,7 +187,7 @@ def validate_inference_trigger_message(msg: Dict[str, Any]) -> bool:
     if msg.get("action") != "start_inference":
         return False
 
-    required_fields = ["request_id", "pipeline"]
+    required_fields = ["batch_id", "pipeline"]
     return all(field in msg for field in required_fields)
 
 

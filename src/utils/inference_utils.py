@@ -117,29 +117,30 @@ def cleanup_request_context(request_id: str):
 
 
 async def send_final_result_to_server(
-    request_id: str,
-    output_obj,
+    batch_id: str,
+    final_text: List[str],
     peer_id: str,
     server_url: str = "http://{SERVER_IP}:8000",
 ):
     try:
         # vLLM ≥0.4 returns CompletionSequenceGroupOutput
-        print(f"🔍 Output object type: {type(output_obj)}")
-        if isinstance(output_obj, str):
-            final_text = output_obj
+        print(f"🔍 Output object type: {type(final_text)}")
+        # if isinstance(output_obj, str):
+        #     final_text = output_obj
 
-        elif hasattr(output_obj, "sequences"):  # CompletionSequenceGroupOutput
-            final_text = output_obj.sequences[0].text
+        # elif hasattr(output_obj, "sequences"):  # CompletionSequenceGroupOutput
+        #     final_text = output_obj.sequences[0].text
 
-        elif hasattr(output_obj, "outputs"):  # RequestOutput
-            final_text = output_obj.outputs[0].text
+        # elif hasattr(output_obj, "outputs"):  # RequestOutput
+        #     final_text = output_obj.outputs[0].text
 
-        elif hasattr(output_obj, "text"):  # SequenceOutput (older)
-            final_text = output_obj.text
-        else:
-            raise ValueError(f"Unknown output type: {type(output_obj)}")
+        # elif hasattr(output_obj, "text"):  # SequenceOutput (older)
+        #     final_text = output_obj.text
+        # else:
+        #     raise ValueError(f"Unknown output type: {type(output_obj)}")
+
         completion_data = {
-            "request_id": request_id,
+            "batch_id": batch_id,
             "output_text": final_text,
             "peer_id": peer_id,
             "timestamp": int(time.time()),
@@ -150,7 +151,7 @@ async def send_final_result_to_server(
             )
             if response.status_code == 200:
                 print(f"🔍 Response: {final_text}")
-                print(f"✅ Sent final result to server for request {request_id}")
+                print(f"✅ Sent final result to server for batch {batch_id}")
             else:
                 print(
                     f"❌ Failed to send completion: {response.status_code} - {response.text}"
@@ -229,8 +230,8 @@ def register_inference_hooks(
     model = model_runner.model
     sampler = model_runner.sampler
 
-    # Per-request context storage, maps uuid to dict of metadata
-    hook_contexts = {}
+    # Per-batch context storage, maps uuid to dict of metadata
+    batch_metadata = {}
 
     # context_lock protects hook_contexts and all fields inside each context
     # (request_id, current_step, active, is_first/last, routing info). Hooks
@@ -291,29 +292,29 @@ def register_inference_hooks(
         # Get request-specific context with minimal overhead
         with context_lock:
             active_contexts = [
-                ctx for ctx in hook_contexts.values() if ctx.get("active", False)
+                ctx for ctx in batch_metadata.values() if ctx.get("active", False)
             ]
             if not active_contexts:
                 return args
 
             hook_context = active_contexts[0]  # ?
-            request_id = hook_context["request_id"]
+            batch_id = hook_context["batch_id"]
             current_step = hook_context["current_step"]
-            print(f"🔍 Pre-hook called for request {request_id} step {current_step}")
+            print(f"🔍 Pre-hook called for request {batch_id} step {current_step}")
 
             # Skip ALL checks if first peer
             if hook_context["is_first_peer"]:
                 return args
 
         # Wait for data (unavoidable, but optimized)
-        event = STEP_EVENTS[request_id].setdefault(current_step, threading.Event())
+        event = STEP_EVENTS[batch_id].setdefault(current_step, threading.Event())
         if not event.wait(timeout=1000.0):
-            cleanup_request_context(request_id)
+            cleanup_request_context(batch_id)
             return args
 
         # Direct memory access (minimal locking)
         with CONTEXT_LOCK:
-            step_data = INFERENCE_CONTEXT[request_id][str(current_step)]
+            step_data = INFERENCE_CONTEXT[batch_id][str(current_step)]
             hidden_states = step_data["hidden_state"]
             residual = step_data["residual"]
 
@@ -333,31 +334,34 @@ def register_inference_hooks(
 
         # Single conditional for step - ultra optimized reshaping
         if current_step:  # Decode phase
+            hidden_reshaped = hidden_states.to(device, non_blocking=True)
+            positions_reshaped = positions.to(device, non_blocking=True)
+            residual_reshaped = residual.to(device, non_blocking=True)
             # Pre-computed shapes for decode (single token)
             # Ensure tensors are on correct device
             # print(f"🔍 Pre-hook reshaping for request {request_id} step {current_step}", hidden_states, hidden_states.shape)
-            hidden_reshaped = hidden_states.view(1, 1, payload_hidden_size).to(
-                device, non_blocking=True
-            )
+            # hidden_reshaped = hidden_states.view(1, 1, payload_hidden_size).to(
+            #     device, non_blocking=True
+            # )
             # print(f"🔍 Pre-hook reshaped hidden_states: {hidden_reshaped}", hidden_reshaped.shape)
             # print(f"🔍 Pre-hook residual: {residual}", residual.shape)
-            residual_reshaped = residual.view(1, 1, payload_hidden_size).to(
-                device, non_blocking=True
-            )
+            # residual_reshaped = residual.view(1, 1, payload_hidden_size).to(
+            #     device, non_blocking=True
+            # )
             # print(f"🔍 Pre-hook residual_reshaped: {residual_reshaped}", residual_reshaped.shape)
             # print(f"🔍 Pre-hook positions: {positions}", positions.shape)
-            positions_reshaped = (
-                positions.view(1, 1).to(device, non_blocking=True)
-                if positions.numel() == 1
-                else positions.view(1, -1)[:, -1:].to(device, non_blocking=True)
-            )
+            # positions_reshaped = (
+            #     positions.view(1, 1).to(device, non_blocking=True)
+            #     if positions.numel() == 1
+            #     else positions.view(1, -1)[:, -1:].to(device, non_blocking=True)
+            # )
             # print(f"🔍 Pre-hook positions_reshaped: {positions_reshaped}", positions_reshaped.shape)
 
             # Clean up old data immediately
             if current_step > 1:
-                INFERENCE_CONTEXT[request_id].pop(str(current_step - 2), None)
-                STEP_EVENTS[request_id].pop(current_step - 2, None)
-                STEP_EVENTS_SAMPLER[request_id].pop(current_step - 2, None)
+                INFERENCE_CONTEXT[batch_id].pop(str(current_step - 2), None)
+                STEP_EVENTS[batch_id].pop(current_step - 2, None)
+                STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 2, None)
 
             return (positions_reshaped, hidden_reshaped, residual_reshaped)
         else:  # Prompt phase
@@ -389,7 +393,7 @@ def register_inference_hooks(
         # Get context with minimal overhead
         with context_lock:
             active_contexts = [
-                ctx for ctx in hook_contexts.values() if ctx.get("active", False)
+                ctx for ctx in batch_metadata.values() if ctx.get("active", False)
             ]
             if not active_contexts:
                 return
@@ -400,7 +404,7 @@ def register_inference_hooks(
             if hook_context["is_last_peer"]:
                 return
 
-            request_id = hook_context["request_id"]
+            request_id = hook_context["batch_id"]
             current_step = hook_context["current_step"]
 
             print(f"post-hook: {request_id}, {current_step}")
@@ -412,43 +416,58 @@ def register_inference_hooks(
             hook_context[context_key] = True
 
         hidden_states, residual = output
-        # print(f"🔍 Post-hook called for request {request_id} step {current_step}", hidden_states, hidden_states.shape)
-        # print(f"🔍 Post-hook residual: {residual}", residual.shape)
+        print(
+            f"🔍 Post-hook called for request {request_id} step {current_step}",
+            hidden_states,
+            hidden_states.shape,
+        )
+        print(f"🔍 Post-hook residual: {residual}", residual.shape)
 
         # Single slice operation for decode (no validation)
         if current_step > 0:
+            print("=" * 80)
+            print("it is probably failing here for current_step", current_step)
+            print("=" * 80)
             # Ultra-fast slicing for single token
-            if hidden_states.dim() == 3 and hidden_states.shape[1] > 1:
-                hidden_states = hidden_states[:, -1:, :]
-                residual = residual[:, -1:, :]
-            elif hidden_states.dim() == 2 and hidden_states.shape[0] > 1:
-                hidden_states = hidden_states[-1:, :]
-                residual = residual[-1:, :]
-        # print(f"🔍 Post-hook hidden_states: {hidden_states}", hidden_states.shape, f"id {id(hidden_states)}")
-        # print(f"🔍 Post-hook residual: {residual}", residual.shape)
-        # Normalize ranks before sending to ensure both tensors match
-        if current_step == 0:
-            # Prompt phase: ensure (seq, hidden)
-            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
-                hidden_states = hidden_states.squeeze(0)
-            if residual.dim() == 3 and residual.size(0) == 1:
-                residual = residual.squeeze(0)
-            if hidden_states.dim() == 3:
-                hidden_states = hidden_states.view(-1, hidden_states.size(-1))
-            if residual.dim() == 3:
-                residual = residual.view(-1, residual.size(-1))
-        else:
-            # Decode phase: ensure (1, hidden)
-            if hidden_states.dim() >= 2:
-                hidden_states = hidden_states.view(-1, hidden_states.size(-1))[-1:, :]
-            else:
-                hidden_states = hidden_states.view(1, -1)
-            if residual.dim() >= 2:
-                residual = residual.view(-1, residual.size(-1))[-1:, :]
-            else:
-                residual = residual.view(1, -1)
-        # print(f"🔍 Post-hook hidden_states: {hidden_states}", hidden_states.shape, f"id {id(hidden_states)}")
-        # print(f"🔍 Post-hook residual: {residual}", residual.shape)
+            # if hidden_states.dim() == 3 and hidden_states.shape[1] > 1:
+            #     hidden_states = hidden_states[:, -1:, :]
+            #     residual = residual[:, -1:, :]
+            # elif hidden_states.dim() == 2 and hidden_states.shape[0] > 1:
+            #     hidden_states = hidden_states[-1:, :]
+            #     residual = residual[-1:, :]
+        print(
+            f"🔍 Post-hook hidden_states: {hidden_states}",
+            hidden_states.shape,
+            f"id {id(hidden_states)}",
+        )
+        print(f"🔍 Post-hook residual: {residual}", residual.shape)
+        # # Normalize ranks before sending to ensure both tensors match
+        # if current_step == 0:
+        #     # Prompt phase: ensure (seq, hidden)
+        #     if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+        #         hidden_states = hidden_states.squeeze(0)
+        #     if residual.dim() == 3 and residual.size(0) == 1:
+        #         residual = residual.squeeze(0)
+        #     if hidden_states.dim() == 3:
+        #         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+        #     if residual.dim() == 3:
+        #         residual = residual.view(-1, residual.size(-1))
+        # else:
+        #     # Decode phase: ensure (1, hidden)
+        #     if hidden_states.dim() >= 2:
+        #         hidden_states = hidden_states.view(-1, hidden_states.size(-1))[-1:, :]
+        #     else:
+        #         hidden_states = hidden_states.view(1, -1)
+        #     if residual.dim() >= 2:
+        #         residual = residual.view(-1, residual.size(-1))[-1:, :]
+        #     else:
+        #         residual = residual.view(1, -1)
+        print(
+            f"🔍 Post-hook hidden_states: {hidden_states}",
+            hidden_states.shape,
+            f"id {id(hidden_states)}",
+        )
+        print(f"🔍 Post-hook residual: {residual}", residual.shape)
         # Direct tensor sending (skip CPU conversion if possible)
         next_peer_id = hook_context["next_peer_id"]
         next_peer_ticket = hook_context["next_peer_ticket"]
@@ -482,14 +501,14 @@ def register_inference_hooks(
         # Get request-specific context safely
         with context_lock:
             active_contexts = [
-                ctx for ctx in hook_contexts.values() if ctx.get("active", False)
+                ctx for ctx in batch_metadata.values() if ctx.get("active", False)
             ]
             if not active_contexts:
                 print("❌ No active inference context found in sampler_post_hook")
                 return output
 
             hook_context = active_contexts[0]
-            request_id = hook_context["request_id"]
+            request_id = hook_context["batch_id"]
             current_step = hook_context.get("current_step", 0)
             is_last_peer = hook_context.get("is_last_peer", False)
             pipeline = hook_context["pipeline"]
@@ -631,11 +650,14 @@ def register_inference_hooks(
             return virtual_output
 
     def start_inference_run(
-        request_id: str, pipeline: List[str], input_text: str, sampling_params: Any
+        batch_id: str,
+        pipeline: List[str],
+        input_text: List[str],
+        sampling_params: Any,
     ):
         """The main inference runner"""
         # Generate unique execution ID to avoid collisions
-        execution_id = str(uuid.uuid4())[:8]
+        execution_id = str(uuid.uuid4())[:8]  # ? Need to find where this is used
 
         # Predefine hook handles for safe, idempotent cleanup
         pre_hook_handle = None
@@ -661,8 +683,8 @@ def register_inference_hooks(
 
                 # Initialize thread-safe context for this request
                 with context_lock:
-                    hook_contexts[execution_id] = {
-                        "request_id": request_id,
+                    batch_metadata[execution_id] = {
+                        "batch_id": batch_id,
                         "pipeline": pipeline,
                         "input_text": input_text,
                         "is_first_peer": is_first,
@@ -696,7 +718,7 @@ def register_inference_hooks(
                 )
 
                 # Report sizes once for visibility
-                model_hidden = hook_contexts[execution_id].get("hidden_size")
+                model_hidden = batch_metadata[execution_id].get("hidden_size")
                 if model_hidden is not None:
                     print(f"ℹ️ Model-reported hidden/residual size: {model_hidden}")
                 vocab_size = get_model_vocab_size()
@@ -713,13 +735,11 @@ def register_inference_hooks(
                     # AsyncLLMEngine (v0): generate is an async generator and requires request_id
                     async def _collect_async_outputs():
                         last_output = None
-                        print(f"async-llm-generate: {request_id}")
                         async for out in llm.generate(
                             input_text,  # prompt as string
                             sampling_params,
-                            request_id,
+                            batch_id,
                         ):
-                            print(f"In async-llm-generate: {out}")
                             last_output = out
                         return last_output
 
@@ -731,45 +751,50 @@ def register_inference_hooks(
                     completions = [final_output] if final_output is not None else []
                 else:
                     # Blocking LLM path
-                    print(f"llm-generate: {request_id}")
+                    print(f"llm-generate: {batch_id}")
                     completions = llm.generate(
-                        [input_text], sampling_params=sampling_params
+                        prompts=input_text, sampling_params=sampling_params
                     )
 
                 # If last peer, send final result to server
                 if is_last and completions:
-                    comp = completions[0]
-                    final_text = comp.outputs[0].text
+                    final_text = [comp.outputs[0].text for comp in completions]
+                    print(f"Final text (before sending) - len({len(final_text)})")
+
+                    for i in range(len(final_text)):
+                        print(f"\nOutput number {i}\n", "+" * 50)
+                        print(f"{final_text[i]}\n")
+
                     try:
                         # Use a unique sent flag per request to avoid collisions
-                        request_sent_key = f"final_sent_{request_id}"
+                        request_sent_key = f"final_sent_{batch_id}"
                         with context_lock:
-                            if not hook_contexts[execution_id].get(
+                            if not batch_metadata[execution_id].get(
                                 request_sent_key, False
                             ):
-                                hook_contexts[execution_id][request_sent_key] = True
+                                batch_metadata[execution_id][request_sent_key] = True
                                 asyncio.run_coroutine_threadsafe(
                                     send_final_result_to_server(
-                                        request_id, final_text, peer_id, server_url
+                                        batch_id, final_text, peer_id, server_url
                                     ),
                                     main_loop,
                                 )
-                            print(f"🎯 Final result sent for {request_id}")
+                            print(f"🎯 Final result sent for {batch_id}")
                     except Exception as e:
                         print(f"❌ Failed to schedule send_final_result_to_server: {e}")
 
-                print(f"🎉 Inference run completed for {request_id}")
+                print(f"🎉 Inference run completed for {batch_id}")
 
             except Exception as e:
-                print(f"❌ Error in inference run for {request_id}: {e}")
+                print(f"❌ Error in inference run for {batch_id}: {e}")
                 import traceback
 
                 traceback.print_exc()
             finally:
                 # Mark context inactive early to avoid further hook activity for this execution
                 with context_lock:
-                    if execution_id in hook_contexts:
-                        hook_contexts[execution_id]["active"] = False
+                    if execution_id in batch_metadata:
+                        batch_metadata[execution_id]["active"] = False
 
                 # Always clean up hooks idempotently, even on error/early exit
                 try:
@@ -791,11 +816,11 @@ def register_inference_hooks(
                 finally:
                     # Remove context entry now that hooks are torn down
                     with context_lock:
-                        if execution_id in hook_contexts:
-                            del hook_contexts[execution_id]
+                        if execution_id in batch_metadata:
+                            del batch_metadata[execution_id]
 
                 # Always clean up per-request transport/context
-                cleanup_request_context(request_id)
+                cleanup_request_context(batch_id)
 
         return
 
@@ -934,12 +959,12 @@ async def send_inference_tensors_fast(
         # combined_tensor = np.concatenate([hidden_np.reshape(1, *hidden_np.shape), residual_np.reshape(1, *residual_np.shape)], axis=0)
         # print(f"🔍 Combined tensor: {combined_tensor}", combined_tensor.shape)
         # Normalize to 2D (seq, hidden)
-        hidden_np = hidden_np.reshape(-1, hidden_np.shape[-1])
-        residual_np = residual_np.reshape(-1, residual_np.shape[-1])
+        # hidden_np = hidden_np.reshape(-1, hidden_np.shape[-1])
+        # residual_np = residual_np.reshape(-1, residual_np.shape[-1])
         # For decode steps, ensure (1, hidden)
-        if step_idx > 0:
-            hidden_np = hidden_np[-1:, :]
-            residual_np = residual_np[-1:, :]
+        # if step_idx > 0:
+        #     hidden_np = hidden_np[-1:, :]
+        #     residual_np = residual_np[-1:, :]
         # Stack along a new axis to form (2, seq_or_1, hidden)
         combined_tensor = np.stack([hidden_np, residual_np], axis=0)
         # Calculate payload size
