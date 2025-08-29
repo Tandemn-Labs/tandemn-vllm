@@ -201,18 +201,18 @@ async def handle_inference_trigger_message(tensor):
             print("❌ Invalid inference trigger message format")
             return
 
-        request_id = trigger.get("request_id")
+        batch_id = trigger.get("batch_id")
         pipeline = trigger.get("pipeline")
 
         # Log inference trigger received
         extra_info = (
-            f"Request ID: {request_id}, Input: {trigger.get('input_text', '')[:50]}..."
+            f"Batch ID: {batch_id}, Input: {trigger.get('input_text', '')[:50]}..."
         )
         log_message_received("inference_trigger", trigger, extra_info)
 
         # Initialize INFERENCE_CONTEXT for this request
-        if request_id not in INFERENCE_CONTEXT:
-            INFERENCE_CONTEXT[request_id] = {}
+        if batch_id not in INFERENCE_CONTEXT:
+            INFERENCE_CONTEXT[batch_id] = {}
 
         # Check if inference runner is initialized
         if not start_inference_run:
@@ -246,21 +246,23 @@ async def handle_inference_trigger_message(tensor):
             loop = asyncio.get_running_loop()
 
             # Extract parameters
-            input_text = trigger.get("input_text", "")
-            sampling_params = SamplingParams(**trigger.get("sampling_params", {}))
+            input_text_list = trigger.get("input_text", "")
+            sampling_params = [
+                SamplingParams(**item) for item in trigger.get("sampling_params")
+            ]
             _ = trigger.get("assigned_layers", {})
 
             print("�� Starting inference run in background thread...")
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,
-                request_id,
+                batch_id,
                 pipeline,
-                input_text,
+                input_text_list,
                 sampling_params,
             )
 
-            print(f"✅ Inference started for request {request_id}")
+            print(f"✅ Inference started for request {batch_id}")
 
         except Exception as e:
             print(f"❌ Failed to start inference: {e}")
