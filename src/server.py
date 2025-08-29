@@ -1045,9 +1045,6 @@ async def deployment_complete(data: DeploymentCompleteData):
     status_map[data.peer_id] = "success" if data.success else "failed"
     max_req_map[data.peer_id] = data.max_req_in_batch
 
-    async def test(batch: List[req_batcher.Request]):
-        pass
-
     # If every peer succeeded, mark the whole deployment ready; if any failed, fail it.
     if all(s == "success" for s in status_map.values()):
         active_deployments[data.model_name]["status"] = "ready"
@@ -1056,7 +1053,7 @@ async def deployment_complete(data: DeploymentCompleteData):
             f"✅ Deployment for {data.model_name} is now READY, Max req / batch is {max_req}"
         )
         active_deployments[data.model_name]["batcher"] = req_batcher.Batcher(
-            data.model_name, max_req, MAX_TIME_PER_BATCH, test
+            data.model_name, max_req, MAX_TIME_PER_BATCH, send_batch
         )
 
     elif any(s == "failed" for s in status_map.values()):
@@ -1079,6 +1076,7 @@ async def completion(completion: CompletionData):
     Receive completion data from a peer.
     """
     batch_id = completion.batch_id
+    print(f"Completion: {completion}")
     if batch_id in active_inferences:
         inference_state = active_inferences[batch_id]
         inference_state["status"] = "completed"
@@ -1136,28 +1134,45 @@ async def infer(request: InferenceRequest):
 
     # 2. Initialize request_id and add it to active_inferences
     request_id = uuid.uuid4()
-    active_inferences[request_id] = {  # TODO: Might have to change this
-        "status": "processing",
-        "model_name": request.model_name,
-        "request_id": request_id,
+
+    req = req_batcher.Request(
+        id=uuid.uuid4(),
+        prompt=request.input_text,
+        model_name=request.model_name,
+        sampling_params={"max_tokens": request.max_tokens},
+    )
+
+    task = asyncio.create_task(
+        active_deployments[request.model_name]["batcher"].add(req)
+    )
+    await task
+
+    return InferenceResponse(
+        request_id=request_id, status="batched", result=None, processing_time=None
+    )
+
+
+async def send_batch(batch_id: uuid.UUID, model_name: str, queue: List[Request]):
+    global active_deployments, active_inferences
+
+    active_inferences[batch_id] = {
+        "status": "batch submitted",
+        "model_name": model_name,
+        "request_id": [req.id for req in queue],
         "started_at": time.time(),
         "result": None,
     }
 
-    # 3. Construct the pipeline from the deployment map
-    # The map is {peer_id: [layer_indices]}, we need an ordered list of peer_ids
-    pipeline = list(deployment_map.keys())  # ? noting again the order
+    deployment_map = active_deployments[model_name]["deployment_map"]
+    pipeline = list(deployment_map.keys())
 
-    # 4. Prepare input text and sampling parameters
-    sampling_params = {"max_tokens": request.max_tokens}
-    # 4. Create the instruction payload
     inference_payload = {
         "action": "start_inference",  # ? Is this action spurious since it's sent to the infer endpoint
-        "batch_id": request_id,
-        "model_name": request.model_name,
-        "input_text": [request.input_text for i in range(5)],
+        "batch_id": batch_id,
+        "model_name": model_name,
+        "input_text": [req.prompt for req in queue],
         "pipeline": pipeline,
-        "sampling_params": [sampling_params for i in range(5)],
+        "sampling_params": [req.sampling_params for req in queue],
         "assigned_layers": deployment_map,
         "timestamp": time.time(),
     }
@@ -1174,13 +1189,13 @@ async def infer(request: InferenceRequest):
     instruction_payload = json.dumps(inference_payload, default=custom_encode).encode()
     instruction_payload = np.frombuffer(instruction_payload, dtype=np.uint8)
 
-    # 5. Broadcast the instruction payload to ALL peers in the pipeline concurrently
     trigger_tasks = [
         asyncio.create_task(
             tensor_transport.send(peer_ticket, "inference", instruction_payload)
         )
         for peer_ticket in pipeline
     ]
+
     trigger_results = await asyncio.gather(*trigger_tasks, return_exceptions=True)
     for peer_ticket, res in zip(pipeline, trigger_results):
         if isinstance(res, Exception):
@@ -1190,9 +1205,8 @@ async def infer(request: InferenceRequest):
         else:
             print(f"📤 Sent inference trigger to peer: {peer_ticket[:8]}...")
 
-    print(f"🚀 Inference {request_id} started for model {request.model_name}")
-    return InferenceResponse(
-        request_id=request_id, status="processing", result=None, processing_time=None
+    print(
+        f"🚀 Batch sent out for {batch_id}, batch size is {len(queue)}, model {model_name}"
     )
 
 
