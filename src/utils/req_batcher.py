@@ -1,13 +1,15 @@
 import asyncio
 import time
+import uuid
 from collections.abc import Coroutine
-from typing import Any, Callable, List, NamedTuple
+from typing import Any, Callable, Dict, NamedTuple
 
 
 class Request(NamedTuple):
+    id: uuid.UUID
     prompt: str
-    max_tokens: int
     model_name: str
+    sampling_params: Dict[Any, Any]
 
 
 class Batcher:
@@ -16,7 +18,7 @@ class Batcher:
         model_name: str,
         max_req: int,
         max_time: int,
-        process_req_fn: Callable[[List[Request]], Coroutine[Any, Any, int]],
+        process_req_fn: Callable[Any, Coroutine[Any, Any, int]],
     ):
         self.model_name = model_name
         self.max_req = max_req
@@ -70,7 +72,11 @@ class Batcher:
         self._queue.clear()
 
         try:
-            task = asyncio.create_task(self.process_req_fn(queue))
+            task = asyncio.create_task(
+                self.process_req_fn(
+                    batch_id=uuid.uuid4(), model_name=self.model_name, queue=queue
+                )
+            )
             self._inflight.add(task)
 
             def _done(t: asyncio.Task) -> None:
@@ -85,6 +91,11 @@ class Batcher:
 
         except Exception as e:
             print(f"Error creating task in batcher: {e}")
+
+            import traceback
+
+            traceback.print_exc()
+
             # Re-queue the requests if task creation failed
             self._queue.extend(queue)
 

@@ -300,7 +300,7 @@ def register_inference_hooks(
             hook_context = active_contexts[0]  # ?
             batch_id = hook_context["batch_id"]
             current_step = hook_context["current_step"]
-            print(f"🔍 Pre-hook called for request {batch_id} step {current_step}")
+            # print(f"🔍 Pre-hook called for request {batch_id} step {current_step}")
 
             # Skip ALL checks if first peer
             if hook_context["is_first_peer"]:
@@ -328,9 +328,10 @@ def register_inference_hooks(
                 hook_context["hidden_size"] = payload_hidden_size
                 print(f"🔧 Inferred hidden size from payload: {payload_hidden_size}")
             elif hook_context["hidden_size"] != payload_hidden_size:
-                print(
-                    f"⚠️ Hidden size mismatch: model={hook_context['hidden_size']} payload={payload_hidden_size}. Using payload size."
-                )
+                pass
+                # print(
+                #     f"⚠️ Hidden size mismatch: model={hook_context['hidden_size']} payload={payload_hidden_size}. Using payload size."
+                # )
 
         # Single conditional for step - ultra optimized reshaping
         if current_step:  # Decode phase
@@ -416,31 +417,31 @@ def register_inference_hooks(
             hook_context[context_key] = True
 
         hidden_states, residual = output
-        print(
-            f"🔍 Post-hook called for request {request_id} step {current_step}",
-            hidden_states,
-            hidden_states.shape,
-        )
-        print(f"🔍 Post-hook residual: {residual}", residual.shape)
+        # print(
+        #     f"🔍 Post-hook called for request {request_id} step {current_step}",
+        #     hidden_states,
+        #     hidden_states.shape,
+        # )
+        # print(f"🔍 Post-hook residual: {residual}", residual.shape)
 
         # Single slice operation for decode (no validation)
-        if current_step > 0:
-            print("=" * 80)
-            print("it is probably failing here for current_step", current_step)
-            print("=" * 80)
-            # Ultra-fast slicing for single token
-            # if hidden_states.dim() == 3 and hidden_states.shape[1] > 1:
-            #     hidden_states = hidden_states[:, -1:, :]
-            #     residual = residual[:, -1:, :]
-            # elif hidden_states.dim() == 2 and hidden_states.shape[0] > 1:
-            #     hidden_states = hidden_states[-1:, :]
-            #     residual = residual[-1:, :]
-        print(
-            f"🔍 Post-hook hidden_states: {hidden_states}",
-            hidden_states.shape,
-            f"id {id(hidden_states)}",
-        )
-        print(f"🔍 Post-hook residual: {residual}", residual.shape)
+        # if current_step > 0:
+        #     print("=" * 80)
+        #     print("it is probably failing here for current_step", current_step)
+        #     print("=" * 80)
+        # Ultra-fast slicing for single token
+        # if hidden_states.dim() == 3 and hidden_states.shape[1] > 1:
+        #     hidden_states = hidden_states[:, -1:, :]
+        #     residual = residual[:, -1:, :]
+        # elif hidden_states.dim() == 2 and hidden_states.shape[0] > 1:
+        #     hidden_states = hidden_states[-1:, :]
+        #     residual = residual[-1:, :]
+        # print(
+        #     f"🔍 Post-hook hidden_states: {hidden_states}",
+        #     hidden_states.shape,
+        #     f"id {id(hidden_states)}",
+        # )
+        # print(f"🔍 Post-hook residual: {residual}", residual.shape)
         # # Normalize ranks before sending to ensure both tensors match
         # if current_step == 0:
         #     # Prompt phase: ensure (seq, hidden)
@@ -462,12 +463,12 @@ def register_inference_hooks(
         #         residual = residual.view(-1, residual.size(-1))[-1:, :]
         #     else:
         #         residual = residual.view(1, -1)
-        print(
-            f"🔍 Post-hook hidden_states: {hidden_states}",
-            hidden_states.shape,
-            f"id {id(hidden_states)}",
-        )
-        print(f"🔍 Post-hook residual: {residual}", residual.shape)
+        # print(
+        #     f"🔍 Post-hook hidden_states: {hidden_states}",
+        #     hidden_states.shape,
+        #     f"id {id(hidden_states)}",
+        # )
+        # print(f"🔍 Post-hook residual: {residual}", residual.shape)
         # Direct tensor sending (skip CPU conversion if possible)
         next_peer_id = hook_context["next_peer_id"]
         next_peer_ticket = hook_context["next_peer_ticket"]
