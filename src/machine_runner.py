@@ -452,6 +452,15 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         # Use the new orchestrator to handle the deployment
         success, loaded_model = await deploy_model_orchestrator(instructions)
 
+        # vllm.LLM (non-async)
+        if hasattr(loaded_model, "llm_engine"):
+            print(type(loaded_model), dir(loaded_model))
+            executor = loaded_model.llm_engine.model_executor
+            max_concurrency = (
+                executor.cache_config.num_gpu_blocks * executor.cache_config.block_size
+            ) / executor.model_config.max_model_len
+            print(f"Max concurrency is {max_concurrency}")
+
         if not success or loaded_model is None:
             print("❌ Model deployment orchestration failed")
             deployment_status = "failed"
@@ -499,7 +508,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             model_name=model_name,
             peer_id=current_peer_ticket,
             success=True,
-            max_req_in_batch=5,
+            max_req_in_batch=int(max_concurrency),
         )
 
         return True

@@ -1048,7 +1048,7 @@ async def deployment_complete(data: DeploymentCompleteData):
     # If every peer succeeded, mark the whole deployment ready; if any failed, fail it.
     if all(s == "success" for s in status_map.values()):
         active_deployments[data.model_name]["status"] = "ready"
-        max_req = max(max_req_map.values())
+        max_req = min(max_req_map.values())
         print(
             f"✅ Deployment for {data.model_name} is now READY, Max req / batch is {max_req}"
         )
@@ -1076,7 +1076,7 @@ async def completion(completion: CompletionData):
     Receive completion data from a peer.
     """
     batch_id = completion.batch_id
-    print(f"Completion: {completion}")
+    # print(f"Completion: {completion}")
     if batch_id in active_inferences:
         inference_state = active_inferences[batch_id]
         inference_state["status"] = "completed"
@@ -1155,7 +1155,7 @@ async def infer(request: InferenceRequest):
 async def send_batch(batch_id: uuid.UUID, model_name: str, queue: List[Request]):
     global active_deployments, active_inferences
 
-    active_inferences[batch_id] = {
+    active_inferences[str(batch_id)] = {
         "status": "batch submitted",
         "model_name": model_name,
         "request_id": [req.id for req in queue],
