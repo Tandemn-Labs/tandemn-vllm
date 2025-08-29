@@ -599,7 +599,7 @@ def create_dynamic_vllm_model(
             max_model_len=120,  # Small for demo
             disable_log_stats=True,
             skip_tokenizer_init=False,
-            gpu_memory_utilization=0.9,  # Use much less memory
+            gpu_memory_utilization=0.98,  # Use much less memory
             use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
             load_format="dummy",  # ← this is the magic flag
             dtype=(dtype or "float16"),
@@ -788,7 +788,7 @@ def create_async_vllm_engine_with_selective_layers(
             load_format="dummy",
             max_model_len=120,  # small for demo
             disable_log_stats=False,
-            gpu_memory_utilization=0.9,
+            gpu_memory_utilization=0.98,
             skip_tokenizer_init=False,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
@@ -986,11 +986,11 @@ async def load_model_with_selective_layers(
         print("✅ Model loaded successfully!")
 
         print(type(loaded_model), dir(loaded_model))
-        # executor = loaded_model.engine.model_executor
-        # print(
-        #     f"Executor:{executor.cache_config.num_gpu_blocks}, {executor.cache_config.block_size}, \
-        #     {executor.model_config.max_model_len}"
-        # )
+        executor = loaded_model.llm_engine.model_executor
+        print(
+            f"Executor:{executor.cache_config.num_gpu_blocks}, {executor.cache_config.block_size}, \
+            {executor.model_config.max_model_len}"
+        )
         return loaded_model
 
     except Exception as e:
