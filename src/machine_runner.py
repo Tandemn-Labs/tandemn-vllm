@@ -256,6 +256,10 @@ async def handle_inference_trigger_message(tensor):
             _ = trigger.get("assigned_layers", {})
 
             print("�� Starting inference run in background thread...")
+            print(
+                f"Thread - {threading.current_thread().name}, {threading.current_thread().ident}"
+            )
+            print(f"asyncio loop - {id(loop)}, {loop}")
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,
@@ -607,6 +611,9 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
 async def main():
     """Main function to run the distributed computation node"""
     global current_peer_ticket, peer_ticket_map, tensor_transport
+
+    loop = asyncio.get_running_loop()
+    print(f"In main - asyncio loop is {id(loop)}")
 
     # Set up Tensor_Iroh and get the ticket #################################
     tensor_transport = TensorTransport()

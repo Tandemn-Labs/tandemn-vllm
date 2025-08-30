@@ -124,7 +124,7 @@ async def send_final_result_to_server(
 ):
     try:
         # vLLM ≥0.4 returns CompletionSequenceGroupOutput
-        print(f"🔍 Output object type: {type(final_text)}")
+        # print(f"🔍 Output object type: {type(final_text)}")
         # if isinstance(output_obj, str):
         #     final_text = output_obj
 
@@ -239,6 +239,7 @@ def register_inference_hooks(
     context_lock = threading.RLock()
 
     main_loop = asyncio.get_running_loop()
+    # print(f"In register hooks - asyncio loop is {id(main_loop)}")
 
     # Discover hidden/vocab sizes from model config or layers where possible
     def get_model_hidden_size() -> Optional[int]:
@@ -300,7 +301,11 @@ def register_inference_hooks(
             hook_context = active_contexts[0]  # ?
             batch_id = hook_context["batch_id"]
             current_step = hook_context["current_step"]
-            # print(f"🔍 Pre-hook called for request {batch_id} step {current_step}")
+            # print(
+            #     f"🔍 Pre-hook called for request {batch_id} step {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
+            # )
+            # loop = asyncio.get_running_loop()
+            # print(f"asyncio loop - {id(loop)}, {loop}")
 
             # Skip ALL checks if first peer
             if hook_context["is_first_peer"]:
@@ -326,7 +331,7 @@ def register_inference_hooks(
         with context_lock:
             if hook_context.get("hidden_size") is None:
                 hook_context["hidden_size"] = payload_hidden_size
-                print(f"🔧 Inferred hidden size from payload: {payload_hidden_size}")
+                # print(f"🔧 Inferred hidden size from payload: {payload_hidden_size}")
             elif hook_context["hidden_size"] != payload_hidden_size:
                 pass
                 # print(
@@ -366,26 +371,29 @@ def register_inference_hooks(
 
             return (positions_reshaped, hidden_reshaped, residual_reshaped)
         else:  # Prompt phase
-            seq_len = hidden_states.shape[0]  # sequence length
+            _ = hidden_states.shape[0]  # sequence length
+            hidden_reshaped = hidden_states.to(device, non_blocking=True)
+            positions_reshaped = positions.to(device, non_blocking=True)
+            residual_reshaped = residual.to(device, non_blocking=True)
             # Reshape with minimal operations
             # print(f"🔍 Pre-hook reshaping for request {request_id} step {current_step}", hidden_states, hidden_states.shape)
-            hidden_reshaped = hidden_states.view(1, seq_len, payload_hidden_size).to(
-                device, non_blocking=True
-            )
+            # hidden_reshaped = hidden_states.view(1, seq_len, payload_hidden_size).to(
+            #     device, non_blocking=True
+            # )
             # print(f"🔍 Pre-hook reshaped hidden_states: {hidden_reshaped}", hidden_reshaped.shape)
             # print(f"🔍 Pre-hook residual: {residual}", residual.shape)
-            residual_reshaped = residual.view(1, seq_len, payload_hidden_size).to(
-                device, non_blocking=True
-            )
+            # residual_reshaped = residual.view(1, seq_len, payload_hidden_size).to(
+            # device, non_blocking=True
+            # )
             # print(f"🔍 Pre-hook residual_reshaped: {residual_reshaped}", residual_reshaped.shape)
             # print(f"🔍 Pre-hook positions: {positions}", positions.shape)
             # Handle positions efficiently
-            if positions.dim() == 1:
-                positions = positions.unsqueeze(0)
-            positions_reshaped = (
-                positions[:, -seq_len:] if positions.shape[1] >= seq_len else positions
-            )
-            positions_reshaped = positions_reshaped.to(device, non_blocking=True)
+            # if positions.dim() == 1:
+            # positions = positions.unsqueeze(0)
+            # positions_reshaped = (
+            # positions[:, -seq_len:] if positions.shape[1] >= seq_len else positions
+            # )
+            # positions_reshaped = positions_reshaped.to(device, non_blocking=True)
             # print(f"🔍 Pre-hook positions_reshaped: {positions_reshaped}", positions_reshaped.shape)
             return (positions_reshaped, hidden_reshaped, residual_reshaped)
 
@@ -408,7 +416,11 @@ def register_inference_hooks(
             request_id = hook_context["batch_id"]
             current_step = hook_context["current_step"]
 
-            print(f"post-hook: {request_id}, {current_step}")
+            # print(
+            #     f"post-hook: {request_id}, {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
+            # )
+            # loop = asyncio.get_running_loop()
+            # print(f"asyncio loop - {id(loop)}, {loop}")
 
             # Fast duplicate check
             context_key = f"sent_step_{current_step}"
@@ -416,7 +428,11 @@ def register_inference_hooks(
                 return
             hook_context[context_key] = True
 
+        # print(f"post-hook: output-type - {type(output)}")
         hidden_states, residual = output
+        # print(
+        #     f"post-hook: hidden_states type - {type(hidden_states)}, residual type - {type(residual)}"
+        # )
         # print(
         #     f"🔍 Post-hook called for request {request_id} step {current_step}",
         #     hidden_states,
@@ -474,6 +490,9 @@ def register_inference_hooks(
         next_peer_ticket = hook_context["next_peer_ticket"]
 
         # Async send with minimal conversion
+        # print(
+        #     f"main_loop given to send_inference_tensors_fast - {id(main_loop)}, {main_loop}"
+        # )
         asyncio.run_coroutine_threadsafe(
             send_inference_tensors_fast(
                 node,
@@ -486,6 +505,7 @@ def register_inference_hooks(
             ),
             main_loop,
         )
+        # print("post-hook - after calling coro to send data")
 
         # NOTE: Step increment moved to sampler_post_hook to ensure it happens on ALL peers
 
@@ -495,9 +515,6 @@ def register_inference_hooks(
         - For the last peer: broadcasts sampler output to all other peers
         - For non-last peers: waits for sampler output from the last peer
         """
-
-        print("Sampler hook output: ", type(output))
-        print(output)
 
         # Get request-specific context safely
         with context_lock:
@@ -515,7 +532,11 @@ def register_inference_hooks(
             pipeline = hook_context["pipeline"]
             peer_id = hook_context["peer_id"]
 
-            print(f"sampler-post-hook: {request_id}, {current_step}")
+            # print(
+            #     f"sampler-post-hook: {request_id}, {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
+            # )
+            # loop = asyncio.get_running_loop()
+            # print(f"asyncio loop - {id(loop)}, {loop}")
 
         if is_last_peer:
             # Serialize the entire SamplerOutput object
@@ -637,6 +658,7 @@ def register_inference_hooks(
                 return received_output
 
             # Clean up old data to prevent memory growth
+            # print("sampler-post-hook - Attempting to grab CONTEXT_LOCK")
             with CONTEXT_LOCK:
                 if current_step > 0:
                     INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
@@ -644,11 +666,12 @@ def register_inference_hooks(
                     STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
 
             # Increment step immediately (no waiting!)
+            # print("sampler-post-hook - Attempting to grab context_lock")
             with context_lock:
                 hook_context["current_step"] = current_step + 1
 
-            print("sampler-post-hook: middle-peer, returned same sampler")
-            return virtual_output
+            # print("sampler-post-hook: middle-peer, returned same sampler")
+            return output
 
     def start_inference_run(
         batch_id: str,
@@ -849,14 +872,14 @@ async def send_hidden_state_tensor(
             )
 
         # Calculate payload size
-        payload_size_bytes = data_to_send.nbytes
-        payload_size_mb = payload_size_bytes / (1024 * 1024)
+        # payload_size_bytes = data_to_send.nbytes
+        # payload_size_mb = payload_size_bytes / (1024 * 1024)
 
         tensor_type = "residual" if is_residual else "hidden_state"
-        print(
-            f"📊 {tensor_type.capitalize()} tensor payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
-        )
-        print(f"   - Tensor shape: {data_to_send.shape}, dtype: {data_to_send.dtype}")
+        # print(
+        #     f"📊 {tensor_type.capitalize()} tensor payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
+        # )
+        # print(f"   - Tensor shape: {data_to_send.shape}, dtype: {data_to_send.dtype}")
 
         # Compose a name for the tensor message
         tensor_name = f"{request_id}_step{step_idx}_{tensor_type}"
@@ -865,9 +888,9 @@ async def send_hidden_state_tensor(
             next_peer_ticket, name=tensor_name, tensor=data_to_send
         )
 
-        print(
-            f"📤 Sent {tensor_type} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport"
-        )
+        # print(
+        #     f"📤 Sent {tensor_type} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport"
+        # )
     except Exception as e:
         print(
             f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}"
@@ -898,17 +921,17 @@ async def send_inference_tensors(
         combined_tensor = np.stack([hidden_states, residual], axis=0)
 
         # Calculate payload size
-        payload_size_bytes = combined_tensor.nbytes
-        payload_size_mb = payload_size_bytes / (1024 * 1024)
+        # payload_size_bytes = combined_tensor.nbytes
+        # payload_size_mb = payload_size_bytes / (1024 * 1024)
 
-        print(
-            f"📊 Payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
-        )
-        print(
-            f"   - Hidden states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}"
-        )
-        print(f"   - Residual shape: {residual.shape}, dtype: {residual.dtype}")
-        print(f"   - Combined tensor shape: {combined_tensor.shape}")
+        # print(
+        #     f"📊 Payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
+        # )
+        # print(
+        #     f"   - Hidden states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}"
+        # )
+        # print(f"   - Residual shape: {residual.shape}, dtype: {residual.dtype}")
+        # print(f"   - Combined tensor shape: {combined_tensor.shape}")
 
         # Compose a name for the tensor message
         tensor_name = f"{request_id}_step{step_idx}_combined"
@@ -938,17 +961,20 @@ async def send_inference_tensors_fast(
     Accepts torch tensors directly and does lazy conversion only when needed.
     """
     try:
+        print("send_inference_tensors_fast - beginning of fn")
         if not next_peer_ticket:
             raise ValueError("next_peer_ticket must be provided")
 
         # Convert to numpy with minimal overhead
         # Use .detach() to avoid autograd overhead, .cpu() only if needed
-        print(
-            f"🔍 Hidden states: {hidden_states}",
-            hidden_states.shape,
-            f"id {id(hidden_states)}",
-        )
-        print(f"🔍 Residual: {residual}", residual.shape)
+        # print(
+        #     f"🔍 Hidden states: {hidden_states}",
+        #     hidden_states.shape,
+        #     f"id {id(hidden_states)}",
+        # )
+        # print(f"🔍 Residual: {residual}", residual.shape)
+        # print(f"send_ITF - {hidden_states.detach()}")
+        # print(f"send_ITF - {residual.detach()}")
         if hidden_states.is_cuda:
             hidden_np = hidden_states.detach().cpu().numpy()
             residual_np = residual.detach().cpu().numpy()
@@ -967,17 +993,21 @@ async def send_inference_tensors_fast(
         #     hidden_np = hidden_np[-1:, :]
         #     residual_np = residual_np[-1:, :]
         # Stack along a new axis to form (2, seq_or_1, hidden)
+
+        # print(f"send_ITF - hidden_np shape - {hidden_np.shape}")
+        # print(f"send_ITF - residual shape - {residual_np.shape}")
+
         combined_tensor = np.stack([hidden_np, residual_np], axis=0)
         # Calculate payload size
-        payload_size_bytes = combined_tensor.nbytes
-        payload_size_mb = payload_size_bytes / (1024 * 1024)
+        # payload_size_bytes = combined_tensor.nbytes
+        # payload_size_mb = payload_size_bytes / (1024 * 1024)
 
-        print(
-            f"📊 Payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
-        )
-        print(f"   - Hidden states shape: {hidden_np.shape}, dtype: {hidden_np.dtype}")
-        print(f"   - Residual shape: {residual_np.shape}, dtype: {residual_np.dtype}")
-        print(f"   - Combined tensor shape: {combined_tensor.shape}")
+        # print(
+        #     f"📊 Payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
+        # )
+        # print(f"   - Hidden states shape: {hidden_np.shape}, dtype: {hidden_np.dtype}")
+        # print(f"   - Residual shape: {residual_np.shape}, dtype: {residual_np.dtype}")
+        # print(f"   - Combined tensor shape: {combined_tensor.shape}")
 
         # Fast send
         await tensor_transport.send(
@@ -986,8 +1016,9 @@ async def send_inference_tensors_fast(
             tensor=combined_tensor,
         )
 
-    except Exception:
+    except Exception as e:
         # Minimal error handling - no printing in hot path
+        print(f"send_inference_tensors_fast - Error: {e}")
         pass
 
 
@@ -1009,15 +1040,15 @@ async def send_sampler_output(
             )
 
         # Calculate payload size
-        payload_size_bytes = sampler_output_bytes.nbytes
-        payload_size_mb = payload_size_bytes / (1024 * 1024)
+        # payload_size_bytes = sampler_output_bytes.nbytes
+        # payload_size_mb = payload_size_bytes / (1024 * 1024)
 
-        print(
-            f"📊 Sampler output payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
-        )
-        print(
-            f"   - Sampler output shape: {sampler_output_bytes.shape}, dtype: {sampler_output_bytes.dtype}"
-        )
+        # print(
+        #     f"📊 Sampler output payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
+        # )
+        # print(
+        #     f"   - Sampler output shape: {sampler_output_bytes.shape}, dtype: {sampler_output_bytes.dtype}"
+        # )
 
         # Compose a name for the tensor message
         tensor_name = f"{request_id}_step{step_idx}_sampler_output"
@@ -1026,9 +1057,9 @@ async def send_sampler_output(
             next_peer_ticket, name=tensor_name, tensor=sampler_output_bytes
         )
 
-        print(
-            f"📤 Sent sampler_output for {request_id} step {step_idx} to {next_peer_id[:8]}..."
-        )
+        # print(
+        #     f"📤 Sent sampler_output for {request_id} step {step_idx} to {next_peer_id[:8]}..."
+        # )
     except Exception as e:
         print(
             f"❌ Failed to send sampler output for {request_id} to {next_peer_id}: {e}"
