@@ -721,20 +721,21 @@ def create_dynamic_vllm_model(
             for name, param in model.named_parameters():
                 if name in all_weights:
                     with torch.no_grad():
-                        param.copy_(all_weights[name].to(param.dtype).to(param.device))
+                        pinned_tensor = all_weights[name].pin_memory()
+                        param.copy_(pinned_tensor.to(param.device, non_blocking=True))
                         applied_count += 1
-                else:
-                    # Check if this parameter belongs to a layer we should have loaded
-                    is_expected_missing = False
+                # else:
+                #     # Check if this parameter belongs to a layer we should have loaded
+                #     is_expected_missing = False
 
-                    # Check if it's from an unassigned layer
-                    for i in range(100):  # Assuming max 100 layers
-                        if f".layers.{i}." in name and i not in assigned_layers:
-                            is_expected_missing = True
-                            break
+                #     # Check if it's from an unassigned layer
+                #     for i in range(100):  # Assuming max 100 layers
+                #         if f".layers.{i}." in name and i not in assigned_layers:
+                #             is_expected_missing = True
+                #             break
 
-                    if not is_expected_missing:
-                        missing_params.append(name)
+                #     if not is_expected_missing:
+                #         missing_params.append(name)
 
             # Wait for all transfers to complete
             torch.cuda.synchronize()
