@@ -581,6 +581,7 @@ def create_dynamic_vllm_model(
 
     # Import vLLM lazily to avoid forcing it on the central server process
     from vllm import LLM
+    import time
 
     # STEP 1: Monkey-patch vLLM's make_layers function (Prime Intellect's key insight)
     def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
@@ -640,8 +641,9 @@ def create_dynamic_vllm_model(
             model = model_runner.model
 
             # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
+            cpu_loading_start_time = time.time()
             all_weights = {}
-
+            
             # Helper: load all tensors from a safetensors file
             def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
                 """Load all tensors from a safetensors file."""
@@ -700,12 +702,21 @@ def create_dynamic_vllm_model(
                 else:
                     print(f"⚠️ Warning: Layer {layer_idx} not found at {layer_path}")
 
+            cpu_loading_duration = time.time() - cpu_loading_start_time
+            total_cpu_size_gb = sum(tensor.numel() * tensor.element_size() for tensor in all_weights.values()) / (1024**3)
+            print(f"⏱️ CPU loading duration: {cpu_loading_duration:.3f}s")
+
             # STEP 4: Apply the loaded weights to the model (exact replication of selective_layer_loading_fixed.py)
             print("\n🔧 APPLYING LOADED WEIGHTS TO MODEL...")
             print(f"   Total weights loaded: {len(all_weights)}")
 
             applied_count = 0
             missing_params = []
+
+
+            # Time the GPU transfer
+            torch.cuda.synchronize()
+            gpu_transfer_start_time = time.time()
 
             for name, param in model.named_parameters():
                 if name in all_weights:
@@ -724,6 +735,13 @@ def create_dynamic_vllm_model(
 
                     if not is_expected_missing:
                         missing_params.append(name)
+
+            # Wait for all transfers to complete
+            torch.cuda.synchronize()
+            gpu_transfer_duration = time.time() - gpu_transfer_start_time
+            gpu_bandwidth = total_cpu_size_gb / gpu_transfer_duration if gpu_transfer_duration > 0 else 0
+            print(f"🔧 GPU transfer completed: {applied_count} parameters in {gpu_transfer_duration:.2f}s")
+            print(f"⚡ GPU transfer: {gpu_transfer_duration:.2f}s, {gpu_bandwidth:.1f} GB/s")
 
             print(
                 f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters"
