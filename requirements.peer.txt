@@ -20,3 +20,9 @@ iroh==0.35.0
 motor==3.3.1
 pymongo==4.6.1
 boto3 
+# LMCache runtime dependencies
+sortedcontainers==2.4.0
+infinistore==0.2.35
+redis==6.4.0
+pybind11
+nvtx==0.2.13
