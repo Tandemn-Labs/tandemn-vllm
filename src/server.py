@@ -146,6 +146,7 @@ class ModelDeploymentRequest(BaseModel):
     use_async_engine: Optional[bool] = None  # True = AsyncLLMEngine, False/None = LLM
     max_num_seqs: Optional[int] = None
     max_num_batched_tokens: Optional[int] = None
+    engine_args: Optional[Dict[str, Any]] = None
 
 
 @app.on_event("startup")
@@ -897,6 +898,8 @@ async def deploy_model(request: ModelDeploymentRequest):
         distribution_plan = create_distribution_plan(
             metadata, peers_vram, q_bits=qbits_for_plan
         )
+        # 3.5 Add engine args to distribution plan
+        distribution_plan["engine_args"] = request.engine_args
         # 4. Create optimized deployment instructions for each peer
         deployment_instructions = create_deployment_instructions(
             request, distribution_plan, peer_table, SERVER_IP
@@ -928,6 +931,7 @@ async def deploy_model(request: ModelDeploymentRequest):
         send_tasks = []
         peer_ids = []
         for peer_id, instructions in deployment_instructions.items():
+            print(f"🔍 Engine args: {instructions['engine_args']}")
             payload_dict = {
                 "action": "deploy_model",
                 "target_peer_id": peer_id,  # fix this if needed
