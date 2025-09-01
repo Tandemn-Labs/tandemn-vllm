@@ -413,37 +413,51 @@ async def download_file(
 
                     # Run S3 download in thread pool to avoid blocking event loop
                     loop = asyncio.get_running_loop()
-                    
+
                     def download_s3_file():
                         client = boto3.client("s3")
                         client.download_file(bucket, key, str(local_path))
                         return True
-                    
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1
+                    ) as executor:
                         success = await loop.run_in_executor(executor, download_s3_file)
-                    
+
                     if success:
-                        print(f"✅ Downloaded {local_path.name} from s3://{bucket}/{key}")
+                        print(
+                            f"✅ Downloaded {local_path.name} from s3://{bucket}/{key}"
+                        )
                         return True
                     else:
                         return False
-                        
+
                 except ImportError:
                     print(
                         "ℹ️ boto3 not installed; falling back to aws cli for S3 download"
                     )
-                    
+
                     # Run aws cli in thread pool to avoid blocking event loop
                     loop = asyncio.get_running_loop()
-                    
+
                     def run_aws_cli():
-                        cmd = ["aws", "s3", "cp", f"s3://{bucket}/{key}", str(local_path)]
+                        cmd = [
+                            "aws",
+                            "s3",
+                            "cp",
+                            f"s3://{bucket}/{key}",
+                            str(local_path),
+                        ]
                         result = subprocess.run(cmd, capture_output=True, text=True)
                         return result.returncode == 0, result.stderr
-                    
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                        success, stderr = await loop.run_in_executor(executor, run_aws_cli)
-                    
+
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1
+                    ) as executor:
+                        success, stderr = await loop.run_in_executor(
+                            executor, run_aws_cli
+                        )
+
                     if success:
                         print(
                             f"✅ Downloaded {local_path.name} via aws cli from s3://{bucket}/{key}"
@@ -613,6 +627,13 @@ def create_dynamic_vllm_model(
 
     original_make_layers = model_utils.make_layers
     model_utils.make_layers = _selective_make_layers
+    from vllm.config import KVTransferConfig
+
+    ktc = KVTransferConfig(
+        kv_connector="LMCacheConnector",  # v0 connector
+        kv_role="kv_both",  # single process does store+retrieve
+        # For multi-process prefill/decode, use kv_producer/kv_consumer below
+    )
 
     try:
         # STEP 2: Create vLLM model (will use our patched make_layers)
@@ -620,14 +641,25 @@ def create_dynamic_vllm_model(
             model=model_dir,
             tensor_parallel_size=1,
             enforce_eager=True,  # Required for custom layer loading
-            max_model_len=120,  # Small for demo
+            max_model_len=16400,  # Small for demo
             disable_log_stats=True,
             skip_tokenizer_init=False,
             gpu_memory_utilization=0.98,  # Use much less memory
             use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
+            max_num_batched_tokens=16400,
             load_format="dummy",  # ← this is the magic flag
             dtype=(dtype or "float16"),
+            kv_transfer_config=ktc,
+            enable_chunked_prefill=False,
             quantization=quantization,  # vLLM will select kernels/flows accordingly
+            rope_scaling={  # Add RoPE scaling configuration
+                "rope_type": "llama3",
+                "factor": 32.0,
+                "high_freq_factor": 4.0,
+                "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 8192,
+            },
+            rope_theta=500000.0,
         )
 
         # STEP 3: Load weights for assigned layers + essential components (replicating selective_layer_loading_fixed.py)
