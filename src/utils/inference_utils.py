@@ -9,9 +9,9 @@ from typing import Any, Dict, List, Optional
 import httpx  # type: ignore
 import numpy as np
 import torch
-from vllm import LLM  # type: ignore
 
 from src.utils.tensor_protocol_adapter import TensorTransport
+from vllm import LLM  # type: ignore
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
@@ -214,12 +214,24 @@ def register_inference_hooks(
     Create pre and post hooks for the inference pipeline, to transfer hidden states
     """
     # get the model runner worker, model itself and the sampler
-    try:  # ? Not sure if this is a stable way to multiplex between the two, why not check the type?
+    try:
         if hasattr(llm, "llm_engine"):
-            model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
+            driver_worker = llm.llm_engine.model_executor.driver_worker
+            if hasattr(driver_worker, "scorer_worker"):
+                # SpecDecodeWorker case - double nested model_runner
+                model_runner = driver_worker.scorer_worker.model_runner.model_runner
+            else:
+                # Regular worker case
+                model_runner = driver_worker.model_runner
         elif hasattr(llm, "engine"):
             # AsyncLLMEngine (v0) exposes underlying LLMEngine at .engine
-            model_runner = llm.engine.model_executor.driver_worker.model_runner
+            driver_worker = llm.engine.model_executor.driver_worker
+            if hasattr(driver_worker, "scorer_worker"):
+                # SpecDecodeWorker case - double nested model_runner
+                model_runner = driver_worker.scorer_worker.model_runner.model_runner
+            else:
+                # Regular worker case
+                model_runner = driver_worker.model_runner
         else:
             raise AttributeError(
                 "Unsupported engine object passed to register_inference_hooks"

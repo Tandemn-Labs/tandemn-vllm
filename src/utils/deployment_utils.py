@@ -333,6 +333,7 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
             "dtype": getattr(request, "dtype", None),
             "qbits": getattr(request, "qbits", None),
             "tie_word_embeddings": tie_word_embeddings,  # Pass this info to peers
+            "engine_args": distribution_plan["engine_args"],
         }
     return deployment_instructions
 
@@ -582,6 +583,7 @@ def create_dynamic_vllm_model(
     assigned_layers: List[int],
     quantization: Optional[str] = None,
     dtype: Optional[str] = None,
+    engine_args: Optional[Dict[str, Any]] = None,
 ):
     """
     Create vLLM model with only assigned layers loaded by monkey-patching make_layers.
@@ -591,6 +593,7 @@ def create_dynamic_vllm_model(
         assigned_layers: List of layer indices to load
         quantization: Optional vLLM quantization method (e.g., "bitsandbytes", "awq", "gptq")
         dtype: Optional dtype for activations/weights ("float16", "bfloat16", "float32", "auto")
+        engine_args: Engine arguments
     """
 
     # Import vLLM lazily to avoid forcing it on the central server process
@@ -635,32 +638,45 @@ def create_dynamic_vllm_model(
         kv_role="kv_both",  # single process does store+retrieve
         # For multi-process prefill/decode, use kv_producer/kv_consumer below
     )
-
+    speculative_config = {
+        "method": "ngram",
+        "prompt_lookup_max": 5,
+        "prompt_lookup_min": 3,
+        "num_speculative_tokens": 3,
+    }
     try:
-        # STEP 2: Create vLLM model (will use our patched make_layers)
-        llm = LLM(
-            model=model_dir,
-            tensor_parallel_size=1,
-            enforce_eager=True,  # Required for custom layer loading
-            max_model_len=16400,  # Small for demo
-            disable_log_stats=True,
-            skip_tokenizer_init=False,
-            gpu_memory_utilization=0.98,  # Use much less memory
-            use_v2_block_manager=False,  # Force legacy engine to avoid v1 memory pre-allocation
-            max_num_batched_tokens=16400,
-            load_format="dummy",  # ← this is the magic flag
-            dtype=(dtype or "float16"),
-            kv_transfer_config=ktc,
-            enable_chunked_prefill=False,
-            quantization=quantization,  # vLLM will select kernels/flows accordingly
-            rope_scaling={  # Add RoPE scaling configuration
+        args = {
+            "model": model_dir,
+            "tensor_parallel_size": 1,
+            "enforce_eager": True,
+            "disable_log_stats": True,
+            "gpu_memory_utilization": 0.9,
+            "load_format": "dummy",
+            "dtype": dtype or "float16",
+            "kv_transfer_config": ktc,
+            "skip_tokenizer_init": False,
+            "use_v2_block_manager": False,
+            "max_model_len": 16400,
+            "max_num_batched_tokens": 16400,
+            "enable_chunked_prefill": False,
+            "quantization": quantization,  # vLLM will select kernels/flows accordingly
+            "rope_scaling": {  # Add RoPE scaling configuration
                 "rope_type": "llama3",
                 "factor": 32.0,
                 "high_freq_factor": 4.0,
                 "low_freq_factor": 1.0,
                 "original_max_position_embeddings": 8192,
             },
-            rope_theta=500000.0,
+            "rope_theta": 500000.0,
+            "speculative_config": speculative_config,
+        }
+        # STEP 2: Create vLLM model (will use our patched make_layers)
+        if engine_args:
+            args.update(engine_args)
+
+        print(f"🔍 Using these engine args: {args}")
+        llm = LLM(
+            **args,
         )
 
         # STEP 3: Load weights for assigned layers + essential components (replicating selective_layer_loading_fixed.py)
@@ -669,8 +685,15 @@ def create_dynamic_vllm_model(
             shards_root = Path(model_dir).resolve().parent
 
             # Navigate to underlying torch model
-            model_runner = llm.llm_engine.model_executor.driver_worker.model_runner
-            model = model_runner.model
+            driver_worker = llm.llm_engine.model_executor.driver_worker
+            if hasattr(driver_worker, "scorer_worker"):
+                # SpecDecodeWorker case
+                model_runner = driver_worker.scorer_worker.model_runner.model_runner
+                model = model_runner.model
+            else:
+                # Regular worker case
+                model_runner = driver_worker.model_runner
+                model = model_runner.model
 
             # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
             cpu_loading_start_time = time.time()
@@ -1034,6 +1057,7 @@ async def load_model_with_selective_layers(
     use_async_engine: bool = False,
     max_num_seqs: int = 1,
     max_num_batched_tokens: int = 2048,
+    engine_args: Optional[Dict[str, Any]] = None,
 ):
     """
     Load vLLM model with selective layers in a background thread.
@@ -1046,7 +1070,7 @@ async def load_model_with_selective_layers(
         use_async_engine: If True, initialize AsyncLLMEngine (v0) instead of LLM
         max_num_seqs: Scheduler cap to avoid intra-step mixing (ring-buffer behavior)
         max_num_batched_tokens: Upper bound on tokens per batch
-
+        engine_args: Engine arguments
     Returns:
         Union[LLM, AsyncLLMEngine]: Loaded model/engine instance
 
@@ -1079,13 +1103,16 @@ async def load_model_with_selective_layers(
             )
             loaded_model = await loop.run_in_executor(None, create_async_engine_fn)
         else:
-            loaded_model = await loop.run_in_executor(
-                None,
+            create_dynamic_vllm_model_fn = partial(
                 create_dynamic_vllm_model,
                 str(config_dir),
                 assigned_layers,
                 quantization,
                 dtype,
+                engine_args=engine_args,  # add engine args
+            )
+            loaded_model = await loop.run_in_executor(
+                None, create_dynamic_vllm_model_fn
             )
 
         if loaded_model is None:
@@ -1202,6 +1229,7 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
     use_async_engine = bool(instructions.get("use_async_engine", False))
     max_num_seqs = int(instructions.get("max_num_seqs", 1))
     max_num_batched_tokens = int(instructions.get("max_num_batched_tokens", 2048))
+    engine_args = instructions.get("engine_args", {})
 
     print("🚀 Starting model deployment orchestration...")
     print(f"   Model: {model_name}")
@@ -1213,7 +1241,7 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
     print(
         f"   Engine: {'AsyncLLMEngine(v0)' if use_async_engine else 'LLM'} | max_num_seqs={max_num_seqs} | max_num_batched_tokens={max_num_batched_tokens}"
     )
-
+    print(f"🔍 Engine args: {engine_args}")
     # Check deployment attempts
     if not deployment_tracker.should_attempt_deployment(model_name, assigned_layers):
         print(f"❌ Maximum deployment attempts reached for {model_name}, giving up")
@@ -1241,6 +1269,7 @@ async def deploy_model_orchestrator(instructions: Dict[str, Any]) -> tuple[bool,
                 use_async_engine=use_async_engine,
                 max_num_seqs=max_num_seqs,
                 max_num_batched_tokens=max_num_batched_tokens,
+                engine_args=engine_args,  # add engine
             )
         except ValueError as e:
             print(f"❌ Model loading phase failed: {e}")
