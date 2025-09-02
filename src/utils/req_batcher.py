@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, NamedTuple
 
 
 class Request(NamedTuple):
-    id: uuid.UUID
+    id: str
     prompt: str
     model_name: str
     sampling_params: Dict[Any, Any]
@@ -74,7 +74,7 @@ class Batcher:
         try:
             task = asyncio.create_task(
                 self.process_req_fn(
-                    batch_id=uuid.uuid4(), model_name=self.model_name, queue=queue
+                    batch_id=str(uuid.uuid4()), model_name=self.model_name, queue=queue
                 )
             )
             self._inflight.add(task)

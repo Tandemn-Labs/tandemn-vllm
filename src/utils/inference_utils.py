@@ -101,6 +101,9 @@ STEP_EVENTS_SAMPLER: Dict[str, Dict[int, threading.Event]] = defaultdict(dict)
 # Serialize per-peer inference until hooks are made fully request-aware
 INFERENCE_MUTEX = threading.Lock()
 
+# Reference to the async loop, right now it's the main thread's asyncio loop
+asyncio_loop = None
+
 
 def cleanup_request_context(request_id: str):
     """Thread-safe cleanup of request context"""
@@ -114,6 +117,21 @@ def cleanup_request_context(request_id: str):
         if request_id in STEP_EVENTS_SAMPLER:
             del STEP_EVENTS_SAMPLER[request_id]
             print(f"🧹 Cleaned up sampler step events for {request_id}")
+
+
+async def stream_token_to_server(
+    batch_id: str, tokens: List[str], server_url: str = "http://{SERVER_IP}:8000"
+):
+    try:
+        tokens_data = {"batch_id": batch_id, "tokens": tokens}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{server_url}/streaming", json=tokens_data)
+
+            response.raise_for_status()
+
+    except Exception as e:
+        print(f"[ERROR] stream_tokens_to_server - {e}")
 
 
 async def send_final_result_to_server(
@@ -206,7 +224,7 @@ def register_inference_hooks(
     llm: "LLM",
     node: TensorTransport,
     peer_id: str,
-    tokenizer,
+    tokenizer: Optional,
     server_url: str = "http://{SERVER_IP}:8000",
     next_peer_ticket: Optional[str] = None,
     pipeline: Optional[List[str]] = None,
@@ -240,6 +258,8 @@ def register_inference_hooks(
     except Exception as e:
         raise RuntimeError(f"Failed to resolve model_runner from engine: {e}")
 
+    global asyncio_loop
+
     model = model_runner.model
     sampler = model_runner.sampler
 
@@ -251,7 +271,7 @@ def register_inference_hooks(
     # from multiple threads consult and update this state during forward passes.
     context_lock = threading.RLock()
 
-    main_loop = asyncio.get_running_loop()
+    asyncio_loop = asyncio.get_running_loop()
     # print(f"In register hooks - asyncio loop is {id(main_loop)}")
 
     # Discover hidden/vocab sizes from model config or layers where possible
@@ -516,7 +536,7 @@ def register_inference_hooks(
                 step_idx=current_step,
                 next_peer_ticket=next_peer_ticket,
             ),
-            main_loop,
+            asyncio_loop,
         )
         # print("post-hook - after calling coro to send data")
 
@@ -539,7 +559,7 @@ def register_inference_hooks(
                 return output
 
             hook_context = active_contexts[0]
-            request_id = hook_context["batch_id"]
+            batch_id = hook_context["batch_id"]
             current_step = hook_context.get("current_step", 0)
             is_last_peer = hook_context.get("is_last_peer", False)
             pipeline = hook_context["pipeline"]
@@ -556,7 +576,7 @@ def register_inference_hooks(
             sampler_output_bytes = pickle.dumps(output)
             sampler_output_np = np.frombuffer(sampler_output_bytes, dtype=np.uint8)
 
-            print(f"sampler-post-hook: output type - {type(output)}, data - {output}")
+            # print(f"sampler-post-hook: output type - {type(output)}, data - {output}")
 
             # 🚀 OPTIMIZATION: Only send to FIRST peer instead of all peers
             # Find the first peer in the pipeline
@@ -569,13 +589,13 @@ def register_inference_hooks(
                 asyncio.run_coroutine_threadsafe(
                     send_sampler_output(
                         node,
-                        request_id,
+                        batch_id,
                         first_peer_ticket,
                         sampler_output_np,
                         step_idx=current_step,
                         next_peer_ticket=first_peer_ticket,
                     ),
-                    main_loop,
+                    asyncio_loop,
                 )
                 print(
                     f"✅ Optimized: Sent sampler output only to FIRST peer (not {len(pipeline) - 1} peers)"
@@ -586,10 +606,16 @@ def register_inference_hooks(
 
             # Decode tokens from number
             token_numbers = [
-                completion.samples[0].output_token for completion in output.outputs
+                [completion.samples[0].output_token] for completion in output.outputs
             ]
-            tokens_str = tokenizer.decode(token_numbers)
-            print(f"sampler-post-hook - tokens_str {tokens_str}")
+            tokens_str = tokenizer.batch_decode(token_numbers)
+            # print(f"sampler-post-hook - tokens_str {tokens_str}")
+            asyncio.run_coroutine_threadsafe(
+                stream_token_to_server(
+                    batch_id=batch_id, tokens=tokens_str, server_url=server_url
+                ),
+                asyncio_loop,
+            )
 
             # Increment step for last peer too
             with context_lock:
@@ -598,11 +624,11 @@ def register_inference_hooks(
             # Clean up old data to prevent memory growth
             with CONTEXT_LOCK:
                 if current_step > 0:
-                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[request_id].pop(current_step - 1, None)
-                    STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
+                    INFERENCE_CONTEXT[batch_id].pop(str(current_step - 1), None)
+                    STEP_EVENTS[batch_id].pop(current_step - 1, None)
+                    STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 1, None)
 
-            print("sampler-post-hook: last-peer, returned same sampler")
+            # print("sampler-post-hook: last-peer, returned same sampler")
             return output
 
         # If first peer
@@ -613,20 +639,20 @@ def register_inference_hooks(
             )
 
             # Wait for sampler output using threading.Event, note that it's indexed by current_step before increment
-            event = STEP_EVENTS_SAMPLER[request_id].setdefault(
+            event = STEP_EVENTS_SAMPLER[batch_id].setdefault(
                 current_step, threading.Event()
             )
 
             if not event.wait(timeout=1000.0):
-                cleanup_request_context(request_id)
+                cleanup_request_context(batch_id)
                 raise RuntimeError(
-                    f"Timeout waiting for sampler output for {request_id} step {current_step}"
+                    f"Timeout waiting for sampler output for {batch_id} step {current_step}"
                 )
 
             # Data is ready!
             with CONTEXT_LOCK:
                 # print(f"🔍 INFERENCE_CONTEXT: {INFERENCE_CONTEXT[request_id][str(current_step)]}, for step {current_step}")
-                received_output = INFERENCE_CONTEXT[request_id][str(current_step)][
+                received_output = INFERENCE_CONTEXT[batch_id][str(current_step)][
                     "sampler_output"
                 ]
                 print(
@@ -636,9 +662,9 @@ def register_inference_hooks(
             # Clean up consumed data to prevent memory growth
             with CONTEXT_LOCK:
                 if current_step > 0:
-                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[request_id].pop(current_step - 1, None)
-                    STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
+                    INFERENCE_CONTEXT[batch_id].pop(str(current_step - 1), None)
+                    STEP_EVENTS[batch_id].pop(current_step - 1, None)
+                    STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 1, None)
 
             # Increment step after receiving
             with context_lock:
@@ -655,22 +681,22 @@ def register_inference_hooks(
             )
 
             # Create virtual sampler output
-            virtual_output = create_virtual_sampler_output(request_id, current_step)
+            virtual_output = create_virtual_sampler_output(batch_id, current_step)
 
             if virtual_output is None:
                 print("⚠️ Failed to create virtual output, falling back to waiting...")
                 # Fallback to old behavior if virtual creation fails
-                event = STEP_EVENTS_SAMPLER[request_id].setdefault(
+                event = STEP_EVENTS_SAMPLER[batch_id].setdefault(
                     current_step, threading.Event()
                 )
                 if not event.wait(timeout=1000.0):
-                    cleanup_request_context(request_id)
+                    cleanup_request_context(batch_id)
                     raise RuntimeError(
-                        f"Timeout waiting for sampler output for {request_id} step {current_step}"
+                        f"Timeout waiting for sampler output for {batch_id} step {current_step}"
                     )
 
                 with CONTEXT_LOCK:
-                    received_output = INFERENCE_CONTEXT[request_id][str(current_step)][
+                    received_output = INFERENCE_CONTEXT[batch_id][str(current_step)][
                         "sampler_output"
                     ]
 
@@ -683,9 +709,9 @@ def register_inference_hooks(
             # print("sampler-post-hook - Attempting to grab CONTEXT_LOCK")
             with CONTEXT_LOCK:
                 if current_step > 0:
-                    INFERENCE_CONTEXT[request_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[request_id].pop(current_step - 1, None)
-                    STEP_EVENTS_SAMPLER[request_id].pop(current_step - 1, None)
+                    INFERENCE_CONTEXT[batch_id].pop(str(current_step - 1), None)
+                    STEP_EVENTS[batch_id].pop(current_step - 1, None)
+                    STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 1, None)
 
             # Increment step immediately (no waiting!)
             # print("sampler-post-hook - Attempting to grab context_lock")
@@ -791,7 +817,7 @@ def register_inference_hooks(
 
                     # Runs the coro in the event loop belonging in another thread
                     future = asyncio.run_coroutine_threadsafe(
-                        _collect_async_outputs(), main_loop
+                        _collect_async_outputs(), asyncio_loop
                     )
                     final_output = future.result()
                     completions = [final_output] if final_output is not None else []
@@ -823,7 +849,7 @@ def register_inference_hooks(
                                     send_final_result_to_server(
                                         batch_id, final_text, peer_id, server_url
                                     ),
-                                    main_loop,
+                                    asyncio_loop,
                                 )
                             print(f"🎯 Final result sent for {batch_id}")
                     except Exception as e:

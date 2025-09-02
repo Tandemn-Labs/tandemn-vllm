@@ -487,7 +487,13 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         deployment_status = "loading"  # Update status before inference setup
 
         # Get tokenizer https://huggingface.co/docs/transformers/fast_tokenizers
-        tokenizer = AutoTokenizer.from_pretrained(model_name, token=HUGGINGFACE_TOKEN)
+        pipeline = instructions.get("pipeline")
+        if current_peer_ticket == pipeline[-1]:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name, token=HUGGINGFACE_TOKEN
+            )
+        else:
+            tokenizer = None
 
         # Setup inference hooks
         print("✅ Model loaded successfully, registering inference hooks...")
@@ -502,8 +508,8 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             tokenizer=tokenizer,
         )
 
-        print(type(deployed_model))
-        print(deployed_model)
+        # print(type(deployed_model))
+        # print(deployed_model)
 
         # Update global assigned layers
         global assigned_layers_global

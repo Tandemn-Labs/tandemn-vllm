@@ -55,14 +55,13 @@ from src.utils.model_utils import (
 app = FastAPI(title="Iroh Tandemn Server")
 
 # SERVER_IP = "172.16.1.249"
-SERVER_IP = SERVER_HOST  # ?
+SERVER_IP = SERVER_HOST
 
-# Global Variables for Iroh Node and Gossip Management
+active_inferences = {}  # Batch ID -> Dict of metadata
+active_requests = {}  # Request ID -> Dict of metadata
 
-# IROH STARTS HERE
-active_inferences = {}
 central_server_ticket = None
-# IROH ENDS HERE
+
 
 # ? What is the difference between the following 3 peer lists?
 peer_table: Dict[str, str] = {}
@@ -77,6 +76,7 @@ background_tasks = {}  # Dict to track running background tasks
 
 # model_name -> Dict of metadata
 active_deployments = {}
+
 
 # Constants for document keys
 TRIGGER_KEY = "job_trigger"  # Key for job initiation
@@ -110,7 +110,7 @@ class HeartbeatRequest(BaseModel):
 
 # still has to change
 class InferenceResponse(BaseModel):
-    request_id: uuid.UUID
+    request_id: str
     status: str  # "processing", "completed", "failed"
     result: Optional[str] = None
     processing_time: Optional[float] = None
@@ -1137,10 +1137,10 @@ async def infer(request: InferenceRequest):
         )
 
     # 2. Initialize request_id and add it to active_inferences
-    request_id = uuid.uuid4()
+    request_id = str(uuid.uuid4())
 
     req = req_batcher.Request(
-        id=uuid.uuid4(),
+        id=request_id,
         prompt=request.input_text,
         model_name=request.model_name,
         sampling_params={"max_tokens": request.max_tokens},
@@ -1156,16 +1156,21 @@ async def infer(request: InferenceRequest):
     )
 
 
-async def send_batch(batch_id: uuid.UUID, model_name: str, queue: List[Request]):
+async def send_batch(batch_id: str, model_name: str, queue: List[Request]):
     global active_deployments, active_inferences
+
+    req_ids = [req.id for req in queue]
 
     active_inferences[str(batch_id)] = {
         "status": "batch submitted",
         "model_name": model_name,
-        "request_id": [req.id for req in queue],
+        "request_id": req_ids,
         "started_at": time.time(),
         "result": None,
     }
+
+    for req_id in req_ids:
+        active_requests[req_id] = {"batch_id": batch_id, "tokens": []}
 
     deployment_map = active_deployments[model_name]["deployment_map"]
     pipeline = list(deployment_map.keys())
@@ -1181,16 +1186,7 @@ async def send_batch(batch_id: uuid.UUID, model_name: str, queue: List[Request])
         "timestamp": time.time(),
     }
 
-    # Custom encoder, only handles UUID for now # TODO: there is a correct way to do this lol
-    def custom_encode(o):
-        try:
-            # Only UUID
-            if isinstance(o, uuid.UUID):
-                return str(o)
-        except Exception as e:
-            print(f"Error in json dump: {e}")
-
-    instruction_payload = json.dumps(inference_payload, default=custom_encode).encode()
+    instruction_payload = json.dumps(inference_payload).encode()
     instruction_payload = np.frombuffer(instruction_payload, dtype=np.uint8)
 
     trigger_tasks = [
@@ -1212,6 +1208,30 @@ async def send_batch(batch_id: uuid.UUID, model_name: str, queue: List[Request])
     print(
         f"🚀 Batch sent out for {batch_id}, batch size is {len(queue)}, model {model_name}"
     )
+
+
+class StreamingRequest(BaseModel):
+    batch_id: str
+    tokens: List[str]
+
+
+@app.post("/streaming")
+async def streaming(request: StreamingRequest):
+    try:
+        req_ids = active_inferences[request.batch_id]["request_id"]
+
+        if len(request.tokens) != len(req_ids):
+            raise ValueError("Length of received tokens =/= Number of reqs in batch")
+
+        for i in range(len(req_ids)):
+            active_requests[req_ids[i]]["tokens"].append(request.tokens[i])
+
+        # print(f"/streaming - {active_requests}")
+
+    except Exception as e:
+        print(f"Exception in /streaming endpoint: {e}")
+
+    return {"status": "ok"}
 
 
 # IROH ENDS HERE
