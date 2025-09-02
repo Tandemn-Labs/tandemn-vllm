@@ -597,8 +597,9 @@ def create_dynamic_vllm_model(
     """
 
     # Import vLLM lazily to avoid forcing it on the central server process
-    from vllm import LLM
     import time
+
+    from vllm import LLM
 
     # STEP 1: Monkey-patch vLLM's make_layers function (Prime Intellect's key insight)
     def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
@@ -638,12 +639,12 @@ def create_dynamic_vllm_model(
         kv_role="kv_both",  # single process does store+retrieve
         # For multi-process prefill/decode, use kv_producer/kv_consumer below
     )
-    speculative_config = {
-        "method": "ngram",
-        "prompt_lookup_max": 5,
-        "prompt_lookup_min": 3,
-        "num_speculative_tokens": 3,
-    }
+    # speculative_config = {
+    #     "method": "ngram",
+    #     "prompt_lookup_max": 5,
+    #     "prompt_lookup_min": 3,
+    #     "num_speculative_tokens": 3,
+    # }
     try:
         args = {
             "model": model_dir,
@@ -668,7 +669,7 @@ def create_dynamic_vllm_model(
                 "original_max_position_embeddings": 8192,
             },
             "rope_theta": 500000.0,
-            "speculative_config": speculative_config,
+            # "speculative_config": speculative_config,
         }
         # STEP 2: Create vLLM model (will use our patched make_layers)
         if engine_args:
@@ -698,7 +699,7 @@ def create_dynamic_vllm_model(
             # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
             cpu_loading_start_time = time.time()
             all_weights = {}
-            
+
             # Helper: load all tensors from a safetensors file
             def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
                 """Load all tensors from a safetensors file."""
@@ -758,7 +759,10 @@ def create_dynamic_vllm_model(
                     print(f"⚠️ Warning: Layer {layer_idx} not found at {layer_path}")
 
             cpu_loading_duration = time.time() - cpu_loading_start_time
-            total_cpu_size_gb = sum(tensor.numel() * tensor.element_size() for tensor in all_weights.values()) / (1024**3)
+            total_cpu_size_gb = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in all_weights.values()
+            ) / (1024**3)
             print(f"⏱️ CPU loading duration: {cpu_loading_duration:.3f}s")
 
             # STEP 4: Apply the loaded weights to the model (exact replication of selective_layer_loading_fixed.py)
@@ -767,7 +771,6 @@ def create_dynamic_vllm_model(
 
             applied_count = 0
             missing_params = []
-
 
             # Time the GPU transfer
             torch.cuda.synchronize()
@@ -795,9 +798,17 @@ def create_dynamic_vllm_model(
             # Wait for all transfers to complete
             torch.cuda.synchronize()
             gpu_transfer_duration = time.time() - gpu_transfer_start_time
-            gpu_bandwidth = total_cpu_size_gb / gpu_transfer_duration if gpu_transfer_duration > 0 else 0
-            print(f"🔧 GPU transfer completed: {applied_count} parameters in {gpu_transfer_duration:.2f}s")
-            print(f"⚡ GPU transfer: {gpu_transfer_duration:.2f}s, {gpu_bandwidth:.1f} GB/s")
+            gpu_bandwidth = (
+                total_cpu_size_gb / gpu_transfer_duration
+                if gpu_transfer_duration > 0
+                else 0
+            )
+            print(
+                f"🔧 GPU transfer completed: {applied_count} parameters in {gpu_transfer_duration:.2f}s"
+            )
+            print(
+                f"⚡ GPU transfer: {gpu_transfer_duration:.2f}s, {gpu_bandwidth:.1f} GB/s"
+            )
 
             print(
                 f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters"
