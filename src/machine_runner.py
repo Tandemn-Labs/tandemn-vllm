@@ -14,7 +14,7 @@ from lmcache.integration.vllm.utils import ENGINE_NAME
 from transformers import AutoTokenizer
 
 # from lmcache.v1.cache_engine import LMCacheEngineBuilder
-from src.config.settings import SERVER_HOST, SERVER_PORT
+from src.config.settings import HUGGINGFACE_TOKEN, SERVER_HOST, SERVER_PORT
 from src.utils.db_utils import get_active_peers, register_peer
 from src.utils.deployment_utils import (
     deploy_model_orchestrator,
@@ -487,7 +487,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         deployment_status = "loading"  # Update status before inference setup
 
         # Get tokenizer https://huggingface.co/docs/transformers/fast_tokenizers
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, token=HUGGINGFACE_TOKEN)
 
         # Setup inference hooks
         print("✅ Model loaded successfully, registering inference hooks...")
