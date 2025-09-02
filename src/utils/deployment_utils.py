@@ -661,14 +661,15 @@ def create_dynamic_vllm_model(
             "max_num_batched_tokens": 16400,
             "enable_chunked_prefill": False,
             "quantization": quantization,  # vLLM will select kernels/flows accordingly
-            "rope_scaling": {  # Add RoPE scaling configuration
-                "rope_type": "llama3",
-                "factor": 32.0,
-                "high_freq_factor": 4.0,
-                "low_freq_factor": 1.0,
-                "original_max_position_embeddings": 8192,
-            },
-            "rope_theta": 500000.0,
+            # testing if rope is needed or not?
+            # "rope_scaling": {  # Add RoPE scaling configuration
+            #     "rope_type": "llama3",
+            #     "factor": 32.0,
+            #     "high_freq_factor": 4.0,
+            #     "low_freq_factor": 1.0,
+            #     "original_max_position_embeddings": 8192,
+            # },
+            # "rope_theta": 500000.0,
             # "speculative_config": speculative_config,
         }
         # STEP 2: Create vLLM model (will use our patched make_layers)
