@@ -206,6 +206,7 @@ def register_inference_hooks(
     llm: "LLM",
     node: TensorTransport,
     peer_id: str,
+    tokenizer,
     server_url: str = "http://{SERVER_IP}:8000",
     next_peer_ticket: Optional[str] = None,
     pipeline: Optional[List[str]] = None,
@@ -555,6 +556,8 @@ def register_inference_hooks(
             sampler_output_bytes = pickle.dumps(output)
             sampler_output_np = np.frombuffer(sampler_output_bytes, dtype=np.uint8)
 
+            print(f"sampler-post-hook: output type - {type(output)}, data - {output}")
+
             # 🚀 OPTIMIZATION: Only send to FIRST peer instead of all peers
             # Find the first peer in the pipeline
             first_peer_ticket = pipeline[0] if pipeline else None
@@ -580,6 +583,13 @@ def register_inference_hooks(
             else:
                 # print(f"⚠️ No valid first peer found or first peer is self")
                 pass
+
+            # Decode tokens from number
+            token_numbers = [
+                completion.samples[0].output_token for completion in output.outputs
+            ]
+            tokens_str = tokenizer.decode(token_numbers)
+            print(f"sampler-post-hook - tokens_str {tokens_str}")
 
             # Increment step for last peer too
             with context_lock:

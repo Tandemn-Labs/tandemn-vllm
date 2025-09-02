@@ -11,6 +11,7 @@ from colorama import Fore, Style
 from colorama import init as colorama_init
 from lmcache.experimental.cache_engine import LMCacheEngineBuilder
 from lmcache.integration.vllm.utils import ENGINE_NAME
+from transformers import AutoTokenizer
 
 # from lmcache.v1.cache_engine import LMCacheEngineBuilder
 from src.config.settings import SERVER_HOST, SERVER_PORT
@@ -485,6 +486,9 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         deployed_model = loaded_model
         deployment_status = "loading"  # Update status before inference setup
 
+        # Get tokenizer https://huggingface.co/docs/transformers/fast_tokenizers
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
         # Setup inference hooks
         print("✅ Model loaded successfully, registering inference hooks...")
         server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
@@ -495,6 +499,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             server_url=server_url,
             next_peer_ticket=instructions.get("next_peer_ticket"),
             pipeline=instructions.get("pipeline"),
+            tokenizer=tokenizer,
         )
 
         print(type(deployed_model))
