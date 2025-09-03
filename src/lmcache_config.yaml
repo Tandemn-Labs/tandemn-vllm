@@ -1,7 +1,27 @@
-# 256 Tokens per KV Chunk
-chunk_size: 256
-# Enable CPU memory backend
-local_cpu: true # default
-# 5GB of Pinned CPU memory
-max_local_cpu_size: 5.0 # default
-remote_serde: "cachegen"
+# # 256 Tokens per KV Chunk
+# chunk_size: 256
+# # Enable CPU memory backend
+# local_cpu: true # default
+# # 5GB of Pinned CPU memory
+# max_local_cpu_size: 5.0 # default
+# remote_serde: "cachegen"
+
+# === CHUNK OPTIMIZATION ===
+chunk_size: 512  # Increase from 256 for better batching efficiency
+
+# === STORAGE BACKEND OPTIMIZATION ===
+local_device: "cpu"  # CPU is good for your distributed setup
+max_local_cache_size: 15  # Increase from 5GB to 20GB for more cache hits
+
+# === SERIALIZATION OPTIMIZATION ===
+remote_serde: "cachegen"  # Keep cachegen - it's the most efficient
+
+# === PERFORMANCE OPTIMIZATIONS ===
+pipelined_backend: true  # Enable pipelining for higher throughput
+save_decode_cache: true  # Cache decode tokens for better performance
+
+# === KV BLENDING FOR MAXIMUM THROUGHPUT ===
+enable_blending: true           # Enable KV cache blending/fusion
+blend_recompute_ratio: 0.1     # Lower recompute ratio (10% vs 15% default)
+blend_min_tokens: 128          # Lower threshold for blending activation  
+blend_separator: "[BLEND_SEP]" # Default separator for blending
