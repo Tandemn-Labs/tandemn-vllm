@@ -718,11 +718,13 @@ def create_dynamic_vllm_model(
             torch.cuda.synchronize()
             gpu_transfer_start_time = time.time()
 
-            for name, param in model.named_parameters():
-                if name in all_weights:
+            named_params = dict(model.named_parameters())
+            needed_params = [name for name in all_weights.keys() if name in named_params]
+
+            for name in needed_params:
                     with torch.no_grad():
-                        pinned_tensor = all_weights[name].pin_memory()
-                        param.copy_(pinned_tensor.to(param.device, non_blocking=True))
+                        pinned_tensor = all_weights[name] #.pin_memory()
+                        named_params[name].copy_(pinned_tensor.to(named_params[name].device, non_blocking=False))
                         applied_count += 1
                 # else:
                 #     # Check if this parameter belongs to a layer we should have loaded
