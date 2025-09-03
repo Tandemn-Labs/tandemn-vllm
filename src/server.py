@@ -11,7 +11,7 @@ import numpy as np
 from colorama import Fore  # ADD
 from colorama import init as colorama_init
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import src.utils.req_batcher as req_batcher
@@ -1093,6 +1093,13 @@ async def completion(completion: CompletionData):
         print(
             f"✅ Inference {batch_id} completed in {inference_state['processing_time']:.2f}s"
         )
+
+        # Process each request
+        req_ids = inference_state["request_id"]
+        for req_id in req_ids:
+            active_requests[req_id]["complete"] = True
+            active_requests[req_id]["event"].set()
+
     return {"status": "ok"}
 
 
@@ -1170,7 +1177,7 @@ async def send_batch(batch_id: str, model_name: str, queue: List[Request]):
     }
 
     for req_id in req_ids:
-        active_requests[req_id] = {"batch_id": batch_id, "tokens": []}
+        active_requests[req_id].update({"batch_id": batch_id})
 
     deployment_map = active_deployments[model_name]["deployment_map"]
     pipeline = list(deployment_map.keys())
@@ -1217,6 +1224,8 @@ class StreamingRequest(BaseModel):
 
 @app.post("/streaming")
 async def streaming(request: StreamingRequest):
+    global active_inferences, active_requests
+
     try:
         req_ids = active_inferences[request.batch_id]["request_id"]
 
@@ -1225,13 +1234,184 @@ async def streaming(request: StreamingRequest):
 
         for i in range(len(req_ids)):
             active_requests[req_ids[i]]["tokens"].append(request.tokens[i])
+            event = active_requests[req_ids[i]]["event"]
+            event.set()
 
         # print(f"/streaming - {active_requests}")
 
     except Exception as e:
-        print(f"Exception in /streaming endpoint: {e}")
+        print(f"Exception in /streaming endpoint: {type(e).__name__}: {e}")
+        import traceback
+
+        traceback.print_exc()
 
     return {"status": "ok"}
 
 
-# IROH ENDS HERE
+# Helper function to generate a large string prompt from messages object passed in OpenAI API
+def collect_messages(messages: List[Dict]):
+    # Only keeps 'user', 'assistant', 'developer', 'system' messages
+    role_whitelist = ["user", "assistant", "developer", "system"]
+
+    to_return = ""
+    for msg in messages:
+        if msg["role"] in role_whitelist:
+            to_return += msg["content"] + " "
+
+    return to_return
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    # TODO: Ignore the authorization bearer key stuff in the header for now
+
+    global active_requests
+
+    body = await request.json()
+    model = body.get("model")
+    stream = body.get("stream", False)
+    messages = body.get("messages")
+    input_text = collect_messages(messages)
+    print(f"input-text: {input_text}")
+    max_tokens = body.get("max_completion_tokens")
+
+    # 0. Check if model deployed or not
+    if model not in active_deployments:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No deployment found for model {model}",
+        )
+
+    # check if deployment is ready
+    if active_deployments[model]["status"] != "ready":
+        raise HTTPException(
+            status_code=404,
+            detail=f"Deployment for model {model} is not ready",
+        )
+
+    # 1. Get the deployment instructions
+    deployment_map = active_deployments[model]["deployment_map"]
+    if not deployment_map:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No deployment map found for model {model}",
+        )
+
+    request_id = str(uuid.uuid4())
+    event = asyncio.Event()
+    event.clear()
+    active_requests[request_id] = {"tokens": [], "event": event, "complete": False}
+
+    req = req_batcher.Request(
+        id=request_id,
+        prompt=input_text,  # TODO: Change this,
+        model_name=model,
+        sampling_params={"max_tokens": max_tokens},
+    )
+
+    task = asyncio.create_task(active_deployments[model]["batcher"].add(req))
+    await task
+
+    if not stream:
+        pass  # work on stream first
+
+    # TODO: the great GPT gave me these headers, have to verify what they mean
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        # Helps disable proxy buffering on Nginx (see notes below)
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(
+        stream_token_response(request_id, model),
+        media_type="text/event-stream",
+        headers=headers,
+    )
+
+
+# Helper function to pack data into format for SSE
+def sse_pack(obj: dict) -> bytes:
+    # SSE requires "data: <text>\n\n" per message
+    return f"data: {json.dumps(obj, separators=(',', ':'))}\n\n".encode("utf-8")
+
+
+# The async generator to give to the StreamingResponse object
+async def stream_token_response(request_id: str, model_name: str):
+    global active_requests
+
+    try:
+        # Yield one chunk first to give request_id
+        init_chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": time.time(),
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {"content": "first chunk"}}],
+        }
+        yield sse_pack(init_chunk)
+
+        req_metadata = active_requests[request_id]
+        req_metadata["read_index"] = -1
+        event = req_metadata["event"]
+
+        while True:
+            await event.wait()
+            event.clear()  # Resets for next wait
+
+            last_read = req_metadata["read_index"]
+            tokens = req_metadata["tokens"]
+
+            if last_read + 1 >= len(tokens):
+                to_stream = ""
+            else:
+                to_stream = "".join(req_metadata["tokens"][last_read + 1 :])
+
+            req_metadata["read_index"] = len(tokens) - 1
+            chunk = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": time.time(),
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": to_stream}}],
+            }
+
+            # Stream remaining tokens and end SSE
+            if req_metadata["complete"]:
+                yield sse_pack(chunk)
+                yield b"data: [DONE]\n\n"
+                return
+
+            # Normal streaming
+            else:
+                yield sse_pack(chunk)
+
+    except Exception as e:
+        print(f"[ERR] stream_token_response - {type(e).__name__}: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+
+# @app.post("/insert_batch")
+# async def insert_batch(request: Request):
+#     global active_requests, active_inferences
+
+#     body = await request.json()
+
+#     batch_id = body.get("batch_id")
+#     request_id = body.get("request_id")
+#     active_inferences[batch_id] = {
+#         "request_id": [request_id],
+#     }
+
+
+# @app.post("/test_complete")
+# async def test_complete(request: Request):
+#     global active_requests, active_inferences
+
+#     body = await request.json()
+
+#     request_id = body.get("request_id")
+#     req_meta = active_requests[request_id]
+#     req_meta["complete"] = True
+#     req_meta["event"].set()
