@@ -9,8 +9,9 @@ from typing import Any, Dict
 import httpx
 from colorama import Fore, Style
 from colorama import init as colorama_init
-from lmcache.experimental.cache_engine import LMCacheEngineBuilder
-from lmcache.integration.vllm.utils import ENGINE_NAME
+
+# from lmcache.experimental.cache_engine import LMCacheEngineBuilder
+# from lmcache.integration.vllm.utils import ENGINE_NAME
 from transformers import AutoTokenizer
 
 # from lmcache.v1.cache_engine import LMCacheEngineBuilder
@@ -22,6 +23,7 @@ from src.utils.deployment_utils import (
 )
 from src.utils.gpu_utils import format_metrics_for_db, get_system_metrics
 from src.utils.inference_utils import (
+    CONTEXT_LOCK,
     INFERENCE_CONTEXT,
     STEP_EVENTS,
     STEP_EVENTS_SAMPLER,
@@ -215,8 +217,9 @@ async def handle_inference_trigger_message(tensor):
         log_message_received("inference_trigger", trigger, extra_info)
 
         # Initialize INFERENCE_CONTEXT for this request
-        if batch_id not in INFERENCE_CONTEXT:
-            INFERENCE_CONTEXT[batch_id] = {}
+        with CONTEXT_LOCK:
+            if batch_id not in INFERENCE_CONTEXT:
+                INFERENCE_CONTEXT[batch_id] = {}
 
         # Check if inference runner is initialized
         if not start_inference_run:
@@ -311,20 +314,23 @@ async def handle_inference_data_message(name: str, tensor):
             residual = tensor[1]
 
             # Store in INFERENCE_CONTEXT
-            if request_id not in INFERENCE_CONTEXT:
-                INFERENCE_CONTEXT[request_id] = {}
-            if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
-                INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
+            with CONTEXT_LOCK:
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
 
-            INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = hidden_state
-            INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
-            print(
-                f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}"
-            )
+                INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = (
+                    hidden_state
+                )
+                INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
+                print(
+                    f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}"
+                )
 
-            # wake anybody waiting for this step's payload
-            event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
-            event.set()
+                # wake anybody waiting for this step's payload
+                event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
+                event.set()
 
         elif message_type == "sampler_output":
             # Convert tensor to numpy array first, then unpickle
@@ -338,21 +344,22 @@ async def handle_inference_data_message(name: str, tensor):
             # Unpickle the sampler output
             sampler_output = pickle.loads(arr.tobytes())
 
-            if request_id not in INFERENCE_CONTEXT:
-                INFERENCE_CONTEXT[request_id] = {}
-            if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
-                INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
+            with CONTEXT_LOCK:
+                if request_id not in INFERENCE_CONTEXT:
+                    INFERENCE_CONTEXT[request_id] = {}
+                if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
+                    INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
 
-            INFERENCE_CONTEXT[request_id][str(step_idx)]["sampler_output"] = (
-                sampler_output
-            )
-            print(f"✅ Stored sampler_output for {request_id} step {step_idx}")
+                INFERENCE_CONTEXT[request_id][str(step_idx)]["sampler_output"] = (
+                    sampler_output
+                )
+                print(f"✅ Stored sampler_output for {request_id} step {step_idx}")
 
-            # wake anybody waiting for this step's sampler output
-            event = STEP_EVENTS_SAMPLER[request_id].setdefault(
-                step_idx, threading.Event()
-            )
-            event.set()
+                # wake anybody waiting for this step's sampler output
+                event = STEP_EVENTS_SAMPLER[request_id].setdefault(
+                    step_idx, threading.Event()
+                )
+                event.set()
 
     except Exception as e:
         print(f"❌ Error handling inference data '{name}': {e}")
@@ -389,40 +396,40 @@ async def handle_unknown_message(name: str, tensor):
         print(f"❌ Error handling unknown message '{name}': {e}")
 
 
-async def debug_inference_context_monitor():
-    """Separate debug monitor that doesn't compete with message reception"""
-    print("📊 Starting INFERENCE_CONTEXT debug monitor...")
+# async def debug_inference_context_monitor():
+#     """Separate debug monitor that doesn't compete with message reception"""
+#     print("📊 Starting INFERENCE_CONTEXT debug monitor...")
 
-    while True:
-        try:
-            if INFERENCE_CONTEXT:
-                print(f"\n{'=' * 60}")
-                print(f"📊 INFERENCE_CONTEXT @ {time.strftime('%H:%M:%S')}")
-                print(f"{'=' * 60}")
+#     while True:
+#         try:
+#             if INFERENCE_CONTEXT:
+#                 print(f"\n{'=' * 60}")
+#                 print(f"📊 INFERENCE_CONTEXT @ {time.strftime('%H:%M:%S')}")
+#                 print(f"{'=' * 60}")
 
-                for req_id, req_data in INFERENCE_CONTEXT.items():
-                    print(f"\n📋 Request: {req_id}")
-                    for step_idx, step_data in req_data.items():
-                        if isinstance(step_data, dict):
-                            print(f"   Step {step_idx}:")
-                            for key, value in step_data.items():
-                                if hasattr(value, "shape"):
-                                    print(f"     - {key}: tensor {value.shape}")
-                                else:
-                                    print(f"     - {key}: {type(value).__name__}")
-                        else:
-                            print(f"   {step_idx}: {type(step_data).__name__}")
+#                 for req_id, req_data in INFERENCE_CONTEXT.items():
+#                     print(f"\n📋 Request: {req_id}")
+#                     for step_idx, step_data in req_data.items():
+#                         if isinstance(step_data, dict):
+#                             print(f"   Step {step_idx}:")
+#                             for key, value in step_data.items():
+#                                 if hasattr(value, "shape"):
+#                                     print(f"     - {key}: tensor {value.shape}")
+#                                 else:
+#                                     print(f"     - {key}: {type(value).__name__}")
+#                         else:
+#                             print(f"   {step_idx}: {type(step_data).__name__}")
 
-                print(f"{'=' * 60}\n")
+#                 print(f"{'=' * 60}\n")
 
-            await asyncio.sleep(5)  # Check every 5 seconds
+#             await asyncio.sleep(5)  # Check every 5 seconds
 
-        except asyncio.CancelledError:
-            print("debug_inference_context_monitor cancelled, exiting cleanly.")
-            return
-        except Exception as e:
-            print(f"❌ Error in debug monitor: {e}")
-            await asyncio.sleep(5)
+#         except asyncio.CancelledError:
+#             print("debug_inference_context_monitor cancelled, exiting cleanly.")
+#             return
+#         except Exception as e:
+#             print(f"❌ Error in debug monitor: {e}")
+#             await asyncio.sleep(5)
 
 
 # ============================================================================
@@ -682,7 +689,7 @@ async def main():
         # Cancel background tasks
         heartbeat_task.cancel()
         gateway_task.cancel()
-        LMCacheEngineBuilder.destroy(ENGINE_NAME)
+        # LMCacheEngineBuilder.destroy(ENGINE_NAME)
         # debug_monitor_task.cancel()
         try:
             await heartbeat_task
