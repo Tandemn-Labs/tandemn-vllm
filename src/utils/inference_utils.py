@@ -2,16 +2,15 @@ import asyncio
 import pickle
 import threading
 import time
-import uuid
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 import httpx  # type: ignore
 import numpy as np
 import torch
+from vllm import LLM  # type: ignore
 
 from src.utils.tensor_protocol_adapter import TensorTransport
-from vllm import LLM  # type: ignore
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
@@ -88,7 +87,7 @@ INFERENCE_CONTEXT: Dict[str, Dict[str, Any]] = {}
 # - STEP_EVENTS_SAMPLER: signals arrival of the last peer's sampler output
 # Keeping these separate prevents accidental cross-wakeup (payload setting the
 # sampler wait, or vice versa).
-CONTEXT_LOCK = threading.RLock()  # Thread-safe access to INFERENCE_CONTEXT
+CONTEXT_LOCK = threading.Lock()  # Thread-safe access to INFERENCE_CONTEXT
 
 # ------------------------------------------------------------------
 #  Per–request / per-step Events that tell a waiting peer "data ready"
@@ -263,7 +262,7 @@ def register_inference_hooks(
     model = model_runner.model
     sampler = model_runner.sampler
 
-    # Per-batch context storage, maps uuid to dict of metadata
+    # Per-batch context storage, maps batch id to dict of metadata
     batch_metadata = {}
 
     # context_lock protects hook_contexts and all fields inside each context
@@ -325,13 +324,7 @@ def register_inference_hooks(
         """Ultra-minimal pre-hook for maximum performance"""
         # Get request-specific context with minimal overhead
         with context_lock:
-            active_contexts = [
-                ctx for ctx in batch_metadata.values() if ctx.get("active", False)
-            ]
-            if not active_contexts:
-                return args
-
-            hook_context = active_contexts[0]  # ?
+            hook_context = batch_metadata[threading.get_ident()]
             batch_id = hook_context["batch_id"]
             current_step = hook_context["current_step"]
             # print(
@@ -345,7 +338,8 @@ def register_inference_hooks(
                 return args
 
         # Wait for data (unavoidable, but optimized)
-        event = STEP_EVENTS[batch_id].setdefault(current_step, threading.Event())
+        with CONTEXT_LOCK:
+            event = STEP_EVENTS[batch_id].setdefault(current_step, threading.Event())
         if not event.wait(timeout=1000.0):
             cleanup_request_context(batch_id)
             return args
@@ -398,9 +392,10 @@ def register_inference_hooks(
 
             # Clean up old data immediately
             if current_step > 1:
-                INFERENCE_CONTEXT[batch_id].pop(str(current_step - 2), None)
-                STEP_EVENTS[batch_id].pop(current_step - 2, None)
-                STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 2, None)
+                with CONTEXT_LOCK:
+                    INFERENCE_CONTEXT[batch_id].pop(str(current_step - 2), None)
+                    STEP_EVENTS[batch_id].pop(current_step - 2, None)
+                    STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 2, None)
 
             return (positions_reshaped, hidden_reshaped, residual_reshaped)
         else:  # Prompt phase
@@ -434,13 +429,7 @@ def register_inference_hooks(
         """Ultra-minimal post-hook for maximum performance"""
         # Get context with minimal overhead
         with context_lock:
-            active_contexts = [
-                ctx for ctx in batch_metadata.values() if ctx.get("active", False)
-            ]
-            if not active_contexts:
-                return
-
-            hook_context = active_contexts[0]  # ?
+            hook_context = batch_metadata[threading.get_ident()]
 
             # Skip if last peer (no sending needed)
             if hook_context["is_last_peer"]:
@@ -551,14 +540,7 @@ def register_inference_hooks(
 
         # Get request-specific context safely
         with context_lock:
-            active_contexts = [
-                ctx for ctx in batch_metadata.values() if ctx.get("active", False)
-            ]
-            if not active_contexts:
-                print("❌ No active inference context found in sampler_post_hook")
-                return output
-
-            hook_context = active_contexts[0]
+            hook_context = batch_metadata[threading.get_ident()]
             batch_id = hook_context["batch_id"]
             current_step = hook_context.get("current_step", 0)
             is_last_peer = hook_context.get("is_last_peer", False)
@@ -639,9 +621,10 @@ def register_inference_hooks(
             )
 
             # Wait for sampler output using threading.Event, note that it's indexed by current_step before increment
-            event = STEP_EVENTS_SAMPLER[batch_id].setdefault(
-                current_step, threading.Event()
-            )
+            with CONTEXT_LOCK:
+                event = STEP_EVENTS_SAMPLER[batch_id].setdefault(
+                    current_step, threading.Event()
+                )
 
             if not event.wait(timeout=1000.0):
                 cleanup_request_context(batch_id)
@@ -677,33 +660,8 @@ def register_inference_hooks(
         else:
             # INTERMEDIATE peer: Use virtual sampler output (no waiting!)
             print(
-                f"🚀 INTERMEDIATE peer ({pipeline.index(peer_id) if peer_id in pipeline else -1}) using VIRTUAL sampler output - NO WAITING!"
+                f"🚀 INTERMEDIATE peer ({pipeline.index(peer_id) if peer_id in pipeline else -1}) using the same sampler output - NO WAITING!"
             )
-
-            # Create virtual sampler output
-            virtual_output = create_virtual_sampler_output(batch_id, current_step)
-
-            if virtual_output is None:
-                print("⚠️ Failed to create virtual output, falling back to waiting...")
-                # Fallback to old behavior if virtual creation fails
-                event = STEP_EVENTS_SAMPLER[batch_id].setdefault(
-                    current_step, threading.Event()
-                )
-                if not event.wait(timeout=1000.0):
-                    cleanup_request_context(batch_id)
-                    raise RuntimeError(
-                        f"Timeout waiting for sampler output for {batch_id} step {current_step}"
-                    )
-
-                with CONTEXT_LOCK:
-                    received_output = INFERENCE_CONTEXT[batch_id][str(current_step)][
-                        "sampler_output"
-                    ]
-
-                with context_lock:
-                    hook_context["current_step"] = current_step + 1
-
-                return received_output
 
             # Clean up old data to prevent memory growth
             # print("sampler-post-hook - Attempting to grab CONTEXT_LOCK")
@@ -728,8 +686,6 @@ def register_inference_hooks(
         sampling_params: Any,
     ):
         """The main inference runner"""
-        # Generate unique execution ID to avoid collisions
-        execution_id = str(uuid.uuid4())[:8]  # ? Need to find where this is used
 
         # Predefine hook handles for safe, idempotent cleanup
         pre_hook_handle = None
@@ -755,7 +711,7 @@ def register_inference_hooks(
 
                 # Initialize thread-safe context for this request
                 with context_lock:
-                    batch_metadata[execution_id] = {
+                    batch_metadata[threading.get_ident()] = {
                         "batch_id": batch_id,
                         "pipeline": pipeline,
                         "input_text": input_text,
@@ -790,7 +746,7 @@ def register_inference_hooks(
                 )
 
                 # Report sizes once for visibility
-                model_hidden = batch_metadata[execution_id].get("hidden_size")
+                model_hidden = batch_metadata[threading.get_ident()].get("hidden_size")
                 if model_hidden is not None:
                     print(f"ℹ️ Model-reported hidden/residual size: {model_hidden}")
                 vocab_size = get_model_vocab_size()
@@ -839,19 +795,13 @@ def register_inference_hooks(
 
                     try:
                         # Use a unique sent flag per request to avoid collisions
-                        request_sent_key = f"final_sent_{batch_id}"
-                        with context_lock:
-                            if not batch_metadata[execution_id].get(
-                                request_sent_key, False
-                            ):
-                                batch_metadata[execution_id][request_sent_key] = True
-                                asyncio.run_coroutine_threadsafe(
-                                    send_final_result_to_server(
-                                        batch_id, final_text, peer_id, server_url
-                                    ),
-                                    asyncio_loop,
-                                )
-                            print(f"🎯 Final result sent for {batch_id}")
+                        asyncio.run_coroutine_threadsafe(
+                            send_final_result_to_server(
+                                batch_id, final_text, peer_id, server_url
+                            ),
+                            asyncio_loop,
+                        )
+                        print(f"🎯 Final result sent for {batch_id}")
                     except Exception as e:
                         print(f"❌ Failed to schedule send_final_result_to_server: {e}")
 
@@ -862,11 +812,12 @@ def register_inference_hooks(
                 import traceback
 
                 traceback.print_exc()
+
             finally:
                 # Mark context inactive early to avoid further hook activity for this execution
                 with context_lock:
-                    if execution_id in batch_metadata:
-                        batch_metadata[execution_id]["active"] = False
+                    if threading.get_ident() in batch_metadata:
+                        batch_metadata[threading.get_ident()]["active"] = False
 
                 # Always clean up hooks idempotently, even on error/early exit
                 try:
@@ -888,8 +839,8 @@ def register_inference_hooks(
                 finally:
                     # Remove context entry now that hooks are torn down
                     with context_lock:
-                        if execution_id in batch_metadata:
-                            del batch_metadata[execution_id]
+                        if threading.get_ident() in batch_metadata:
+                            del batch_metadata[threading.get_ident()]
 
                 # Always clean up per-request transport/context
                 cleanup_request_context(batch_id)
