@@ -7,18 +7,25 @@ from transformers import PretrainedConfig
 from .base import WeightLoadingAdapter
 from .llama import LlamaWeightLoadingAdapter
 
+# from .mistral import MistralWeightLoadingAdapter
+
 _ADAPTER_REGISTRY: Dict[str, Type[WeightLoadingAdapter]] = {
-    "llama": LlamaWeightLoadingAdapter
+    "llama": LlamaWeightLoadingAdapter,
+    "mistral": LlamaWeightLoadingAdapter,
 }
 
 
-def get_adapter_for_config(config: PretrainedConfig) -> WeightLoadingAdapter:
-    """Return a weight loading adapter instance for a given HF config.
-    Falls back to LLaMA adapter for similar architectures if unknown.
-    """
+def get_adapter_for_config(config: PretrainedConfig):
+    """Get the appropriate weight loading adapter for a model config."""
     model_type = getattr(config, "model_type", "").lower()
-    for key, adapter_cls in _ADAPTER_REGISTRY.items():
-        if model_type.startswith(key):
-            return adapter_cls(config)
-    # Default: try LLaMA-style
-    return LlamaWeightLoadingAdapter(config)
+
+    if "llama" in model_type or "mistral" in model_type:
+        from .llama import LlamaWeightLoadingAdapter
+
+        return LlamaWeightLoadingAdapter
+
+    else:
+        # Default to Llama adapter for unknown models
+        from .llama import LlamaWeightLoadingAdapter
+
+        return LlamaWeightLoadingAdapter
