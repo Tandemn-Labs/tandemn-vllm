@@ -19,6 +19,7 @@ from safetensors import safe_open  # type: ignore
 from src.config.settings import SERVER_PORT
 from src.utils.db_utils import get_active_peers, get_peer_metrics
 from src.utils.model_utils import distribute_layers_across_peers
+from src.utils.weight_loading_adapters.llama import LlamaWeightLoadingAdapter
 
 
 def load_model_metadata(shard_folder: str):
@@ -619,7 +620,7 @@ def create_dynamic_vllm_model(
                 # Create real layer
                 layer = layer_fn(prefix=f"{prefix}.{i}")
                 modules.append(maybe_offload_to_cpu(layer))
-                print(f"  Created REAL layer {i}")
+                print(f"  Created REAL layer {i} ({type(layer).__name__})")
             else:
                 # Create passthrough layer (Prime Intellect's memory optimization)
                 modules.append(PPMissingLayer())
@@ -697,134 +698,144 @@ def create_dynamic_vllm_model(
                 model_runner = driver_worker.model_runner
                 model = model_runner.model
 
-            # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
             cpu_loading_start_time = time.time()
-            all_weights = {}
 
-            # Helper: load all tensors from a safetensors file
-            def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
-                """Load all tensors from a safetensors file."""
-                tensors = {}
-                if path.exists():
-                    with safe_open(str(path), framework="pt", device="cpu") as f:
-                        for key in f.keys():
-                            tensors[key] = f.get_tensor(key)
-                return tensors
+            weight_loading_adapter = LlamaWeightLoadingAdapter(
+                config=model.config,
+                model=model,
+                assigned_layers=assigned_layers,
+                model_dir=shards_root,
+                quantization=quantization,
+            )
+            weight_loading_adapter.loading_loop()
 
-            # Load embedding (always needed for first peer)
-            embed_path = shards_root / "embedding" / "layer.safetensors"
-            if embed_path.exists():
-                embed_weights = load_safetensors_file(embed_path)
-                all_weights.update(embed_weights)
-                print(f"✅ Loaded embedding weights from {embed_path}")
+            # # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
+            # all_weights = {}
 
-            # Load lm_head (always needed for last peer)
-            lm_head_path = shards_root / "lm_head" / "layer.safetensors"
-            if lm_head_path.exists():
-                lm_head_weights = load_safetensors_file(lm_head_path)
-                all_weights.update(lm_head_weights)
-                print(f"✅ Loaded lm_head weights from {lm_head_path}")
-            else:
-                # Handle tied embeddings case - copy embed_tokens weights to lm_head
-                print("ℹ️ No separate lm_head file found - checking for tied embeddings")
-                if "model.embed_tokens.weight" in all_weights:
-                    # Llama models with tied embeddings
-                    all_weights["lm_head.weight"] = all_weights[
-                        "model.embed_tokens.weight"
-                    ]
-                    print(
-                        "✅ Using tied embeddings - copied embed_tokens weights to lm_head"
-                    )
-                if "embed_tokens.weight" in all_weights:
-                    # Alternative naming
-                    all_weights["lm_head.weight"] = all_weights["embed_tokens.weight"]
-                    print(
-                        "✅ Using tied embeddings - copied embed_tokens weights to lm_head"
-                    )
+            # # Helper: load all tensors from a safetensors file
+            # def load_safetensors_file(path: Path) -> Dict[str, torch.Tensor]:
+            #     """Load all tensors from a safetensors file."""
+            #     tensors = {}
+            #     if path.exists():
+            #         with safe_open(str(path), framework="pt", device="cpu") as f:
+            #             for key in f.keys():
+            #                 tensors[key] = f.get_tensor(key)
+            #     return tensors
 
-            # Load model.norm (always needed for last peer)
-            norm_path = shards_root / "norm" / "layer.safetensors"
-            if norm_path.exists():
-                norm_weights = load_safetensors_file(norm_path)
-                all_weights.update(norm_weights)
-                print(f"✅ Loaded model.norm weights from {norm_path}")
+            # # Load embedding (always needed for first peer)
+            # embed_path = shards_root / "embedding" / "layer.safetensors"
+            # if embed_path.exists():
+            #     embed_weights = load_safetensors_file(embed_path)
+            #     all_weights.update(embed_weights)
+            #     print(f"✅ Loaded embedding weights from {embed_path}")
 
-            # Load only specified transformer layers
-            for layer_idx in assigned_layers:
-                layer_path = shards_root / "layers" / f"layer_{layer_idx}.safetensors"
-                if layer_path.exists():
-                    layer_weights = load_safetensors_file(layer_path)
-                    all_weights.update(layer_weights)
-                    print(f"✅ Loaded layer {layer_idx} weights from {layer_path}")
-                else:
-                    print(f"⚠️ Warning: Layer {layer_idx} not found at {layer_path}")
+            # # Load lm_head (always needed for last peer)
+            # lm_head_path = shards_root / "lm_head" / "layer.safetensors"
+            # if lm_head_path.exists():
+            #     lm_head_weights = load_safetensors_file(lm_head_path)
+            #     all_weights.update(lm_head_weights)
+            #     print(f"✅ Loaded lm_head weights from {lm_head_path}")
+            # else:
+            #     # Handle tied embeddings case - copy embed_tokens weights to lm_head
+            #     print("ℹ️ No separate lm_head file found - checking for tied embeddings")
+            #     if "model.embed_tokens.weight" in all_weights:
+            #         # Llama models with tied embeddings
+            #         all_weights["lm_head.weight"] = all_weights[
+            #             "model.embed_tokens.weight"
+            #         ]
+            #         print(
+            #             "✅ Using tied embeddings - copied embed_tokens weights to lm_head"
+            #         )
+            #     if "embed_tokens.weight" in all_weights:
+            #         # Alternative naming
+            #         all_weights["lm_head.weight"] = all_weights["embed_tokens.weight"]
+            #         print(
+            #             "✅ Using tied embeddings - copied embed_tokens weights to lm_head"
+            #         )
+
+            # # Load model.norm (always needed for last peer)
+            # norm_path = shards_root / "norm" / "layer.safetensors"
+            # if norm_path.exists():
+            #     norm_weights = load_safetensors_file(norm_path)
+            #     all_weights.update(norm_weights)
+            #     print(f"✅ Loaded model.norm weights from {norm_path}")
+
+            # # Load only specified transformer layers
+            # for layer_idx in assigned_layers:
+            #     layer_path = shards_root / "layers" / f"layer_{layer_idx}.safetensors"
+            #     if layer_path.exists():
+            #         layer_weights = load_safetensors_file(layer_path)
+            #         all_weights.update(layer_weights)
+            #         print(f"✅ Loaded layer {layer_idx} weights from {layer_path}")
+            #     else:
+            #         print(f"⚠️ Warning: Layer {layer_idx} not found at {layer_path}")
 
             cpu_loading_duration = time.time() - cpu_loading_start_time
-            total_cpu_size_gb = sum(
-                tensor.numel() * tensor.element_size()
-                for tensor in all_weights.values()
-            ) / (1024**3)
+            # total_cpu_size_gb = sum(
+            #     tensor.numel() * tensor.element_size()
+            #     for tensor in all_weights.values()
+            # ) / (1024**3)
             print(f"⏱️ CPU loading duration: {cpu_loading_duration:.3f}s")
 
-            # STEP 4: Apply the loaded weights to the model (exact replication of selective_layer_loading_fixed.py)
-            print("\n🔧 APPLYING LOADED WEIGHTS TO MODEL...")
-            print(f"   Total weights loaded: {len(all_weights)}")
+            # # STEP 4: Apply the loaded weights to the model (exact replication of selective_layer_loading_fixed.py)
+            # print("\n🔧 APPLYING LOADED WEIGHTS TO MODEL...")
+            # print(f"   Total weights loaded: {len(all_weights)}")
 
-            applied_count = 0
-            missing_params = []
+            # applied_count = 0
+            # missing_params = []
 
-            # Time the GPU transfer
-            torch.cuda.synchronize()
-            gpu_transfer_start_time = time.time()
+            # # Time the GPU transfer
+            # torch.cuda.synchronize()
+            # gpu_transfer_start_time = time.time()
 
-            for name, param in model.named_parameters():
-                if name in all_weights:
-                    with torch.no_grad():
-                        pinned_tensor = all_weights[name].pin_memory()
-                        param.copy_(pinned_tensor.to(param.device, non_blocking=True))
-                        applied_count += 1
-                # else:
-                #     # Check if this parameter belongs to a layer we should have loaded
-                #     is_expected_missing = False
+            # for name, param in model.named_parameters():
+            #     if name in all_weights:
+            #         with torch.no_grad():
+            #             pinned_tensor = all_weights[name].pin_memory()
+            #             param.copy_(pinned_tensor.to(param.device, non_blocking=True))
+            #             applied_count += 1
+            # else:
+            #     # Check if this parameter belongs to a layer we should have loaded
+            #     is_expected_missing = False
 
-                #     # Check if it's from an unassigned layer
-                #     for i in range(100):  # Assuming max 100 layers
-                #         if f".layers.{i}." in name and i not in assigned_layers:
-                #             is_expected_missing = True
-                #             break
+            #     # Check if it's from an unassigned layer
+            #     for i in range(100):  # Assuming max 100 layers
+            #         if f".layers.{i}." in name and i not in assigned_layers:
+            #             is_expected_missing = True
+            #             break
 
-                #     if not is_expected_missing:
-                #         missing_params.append(name)
+            #     if not is_expected_missing:
+            #         missing_params.append(name)
 
             # Wait for all transfers to complete
-            torch.cuda.synchronize()
-            gpu_transfer_duration = time.time() - gpu_transfer_start_time
-            gpu_bandwidth = (
-                total_cpu_size_gb / gpu_transfer_duration
-                if gpu_transfer_duration > 0
-                else 0
-            )
-            print(
-                f"🔧 GPU transfer completed: {applied_count} parameters in {gpu_transfer_duration:.2f}s"
-            )
-            print(
-                f"⚡ GPU transfer: {gpu_transfer_duration:.2f}s, {gpu_bandwidth:.1f} GB/s"
-            )
+            # torch.cuda.synchronize()
+            # gpu_transfer_duration = time.time() - gpu_transfer_start_time
+            # gpu_bandwidth = (
+            #     total_cpu_size_gb / gpu_transfer_duration
+            #     if gpu_transfer_duration > 0
+            #     else 0
+            # )
+            # print(
+            #     f"🔧 GPU transfer completed: {applied_count} parameters in {gpu_transfer_duration:.2f}s"
+            # )
+            # print(
+            #     f"⚡ GPU transfer: {gpu_transfer_duration:.2f}s, {gpu_bandwidth:.1f} GB/s"
+            # )
 
-            print(
-                f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters"
-            )
+            # print(
+            #     f"✅ Applied weights to {applied_count}/{len(list(model.named_parameters()))} parameters"
+            # )
 
-            if (
-                missing_params and len(missing_params) < 20
-            ):  # Only show first 20 to avoid spam
-                print(
-                    f"⚠️ Parameters without loaded weights (first 20): {missing_params[:20]}"
-                )
-            elif missing_params:
-                print(
-                    f"⚠️ {len(missing_params)} parameters without loaded weights (expected for unassigned layers)"
-                )
+            # if (
+            #     missing_params and len(missing_params) < 20
+            # ):  # Only show first 20 to avoid spam
+            #     print(
+            #         f"⚠️ Parameters without loaded weights (first 20): {missing_params[:20]}"
+            #     )
+            # elif missing_params:
+            #     print(
+            #         f"⚠️ {len(missing_params)} parameters without loaded weights (expected for unassigned layers)"
+            #     )
 
         except Exception as e:
             print(f"⚠️ Weight loading/injection failed: {e}")
