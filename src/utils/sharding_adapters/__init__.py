@@ -6,8 +6,8 @@ from transformers import PretrainedConfig
 
 from .base import ShardingAdapter
 from .llama import LlamaShardingAdapter
+from .mistral import MistralShardingAdapter
 from .qwen import QwenShardingAdapter
-
 
 # Simple registry for model-family specific sharding adapters
 _ADAPTER_REGISTRY: Dict[str, Type[ShardingAdapter]] = {
@@ -15,6 +15,7 @@ _ADAPTER_REGISTRY: Dict[str, Type[ShardingAdapter]] = {
     "qwen": QwenShardingAdapter,
     "qwen2": QwenShardingAdapter,
     "qwen3": QwenShardingAdapter,
+    "mistral": MistralShardingAdapter,
 }
 
 
