@@ -142,20 +142,38 @@ def shard_model_by_layers_safetensors(
         token=hf_token,
         trust_remote_code=True,
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        cache_dir=cache_dir,
-        token=hf_token,
-        trust_remote_code=True,
-    )
+    print(f"🔧 Config: {config}")
+    if config.model_type == "mistral" or config.model_name.lower() == "devstral":
+        try:
+            from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+
+            tokenizer = MistralTokenizer.from_hf_hub(model_name, token=hf_token)
+            print(f"🔧 Mistral Tokenizer: {tokenizer}")
+        except Exception as e:
+            print(f"🔧 Error loading Mistral Tokenizer: {e}")
+            tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
+            print(f"🔧 Auto Tokenizer: {tokenizer}")
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            cache_dir=cache_dir,
+            token=hf_token,
+            trust_remote_code=True,
+        )
+    print(f"🔧 Tokenizer: {tokenizer}")
 
     adapter = get_adapter_for_config(config)
-
+    print(f"🔧 Adapter: {adapter}")
     # Save config/tokenizer
     config_dir = output_path / "config"
     config.save_pretrained(config_dir)
-    tokenizer.save_pretrained(config_dir)
-
+    if config.model_type == "mistral" or config.model_name.lower() == "devstral":
+        # mistral tokenizer does not have a save_pretrained method
+        print("🔧 Mistral tokenizer does not have a save_pretrained method")
+        pass
+    else:
+        tokenizer.save_pretrained(config_dir)
+    print(f"🔧 Config dir: {config_dir}")
     # Stream-upload config/tokenizer artifacts immediately (if S3)
     if stream_upload:
         uploaded_ct = 0
@@ -173,7 +191,7 @@ def shard_model_by_layers_safetensors(
                 else:
                     print(f"❌ Failed to upload config file to {s3_uri}")
         print(f"✅ Stream-uploaded {uploaded_ct} config/tokenizer files")
-
+    print(f"🔧 Stream-uploaded {uploaded_ct} config/tokenizer files")
     # Read all safetensors once and build an index in memory
     print("📥 Downloading safetensors...")
     paths = download_all_safetensors(model_name, hf_token, cache_dir)
