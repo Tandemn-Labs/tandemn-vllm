@@ -1229,6 +1229,10 @@ async def streaming(request: StreamingRequest):
     try:
         req_ids = active_inferences[request.batch_id]["request_id"]
 
+        # print(
+        #     f"/streaming - request.tokens: {request.tokens}, len(req_ids): {len(req_ids)}"
+        # )
+
         if len(request.tokens) != len(req_ids):
             raise ValueError("Length of received tokens =/= Number of reqs in batch")
 
@@ -1311,7 +1315,7 @@ async def chat_completions(request: Request):
         id=request_id,
         prompt=input_text,  # TODO: Change this,
         model_name=model,
-        sampling_params={"max_tokens": max_tokens},
+        sampling_params={"max_tokens": max_tokens, "n": 1},
     )
 
     task = asyncio.create_task(active_deployments[model]["batcher"].add(req))

@@ -518,9 +518,9 @@ def register_inference_hooks(
             first_peer_ticket = pipeline[0] if pipeline else None
 
             if first_peer_ticket and first_peer_ticket != peer_id:
-                print(
-                    f"📤 Sending sampler output ONLY to FIRST peer: {first_peer_ticket[:8]}..."
-                )
+                # print(
+                #     f"📤 Sending sampler output ONLY to FIRST peer: {first_peer_ticket[:8]}..."
+                # )
                 asyncio.run_coroutine_threadsafe(
                     send_sampler_output(
                         node,
@@ -532,22 +532,45 @@ def register_inference_hooks(
                     ),
                     asyncio_loop,
                 )
-                print(
-                    f"✅ Optimized: Sent sampler output only to FIRST peer (not {len(pipeline) - 1} peers)"
-                )
+                # print(
+                #     f"✅ Optimized: Sent sampler output only to FIRST peer (not {len(pipeline) - 1} peers)"
+                # )
             else:
                 # print(f"⚠️ No valid first peer found or first peer is self")
                 pass
 
+            # Stores parent_seq_id if its first step (current_step = 0)
+            if current_step == 0:
+                parent_seq_id = [
+                    completion.samples[0].parent_seq_id for completion in output.outputs
+                ]
+                hook_context["parent_seq_id"] = parent_seq_id
+
             # Decode tokens from number
-            token_numbers = [
-                [completion.samples[0].output_token] for completion in output.outputs
-            ]
+            parent_seq_id = hook_context["parent_seq_id"]
+            curr_seq = []
+            token_numbers = []
+            for completion in output.outputs:
+                curr_seq.append(completion.samples[0].parent_seq_id)
+                token_numbers.append([completion.samples[0].output_token])
             tokens_str = tokenizer.batch_decode(token_numbers)
+
+            # Fill in empty string for requests that completed
+            i = 0
+            tokens_return = []
+            for id in parent_seq_id:
+                if i < len(curr_seq) and curr_seq[i] == id:
+                    tokens_return.append(tokens_str[i])
+                    i += 1
+                else:
+                    tokens_return.append("")
+            # print(
+            #     f"sampler_post_hook - parent_seq_id: {parent_seq_id}, curr_seq: {curr_seq}, tokens_return: {tokens_return}"
+            # )
             # print(f"sampler-post-hook - tokens_str {tokens_str}")
             asyncio.run_coroutine_threadsafe(
                 stream_token_to_server(
-                    batch_id=batch_id, tokens=tokens_str, server_url=server_url
+                    batch_id=batch_id, tokens=tokens_return, server_url=server_url
                 ),
                 asyncio_loop,
             )
@@ -569,9 +592,9 @@ def register_inference_hooks(
         # If first peer
         elif pipeline.index(peer_id) == 0 if peer_id in pipeline else -1:
             # FIRST peer: Wait for real sampler output from last peer
-            print(
-                f"⏳ FIRST peer waiting for REAL sampler output for step {current_step}"
-            )
+            # print(
+            #     f"⏳ FIRST peer waiting for REAL sampler output for step {current_step}"
+            # )
 
             # Wait for sampler output using threading.Event, note that it's indexed by current_step before increment
             with CONTEXT_LOCK:
@@ -596,9 +619,9 @@ def register_inference_hooks(
                 received_output = INFERENCE_CONTEXT[batch_id][str(current_step)][
                     "sampler_output"
                 ]
-                print(
-                    f"✅ FIRST peer received REAL sampler output for step {current_step}"
-                )
+                # print(
+                #     f"✅ FIRST peer received REAL sampler output for step {current_step}"
+                # )
 
             # Clean up consumed data to prevent memory growth
             with CONTEXT_LOCK:
@@ -611,7 +634,7 @@ def register_inference_hooks(
             with context_lock:
                 hook_context["current_step"] = current_step + 1
 
-            print(f"sampler-post-hook: first-peer, received sampler {received_output}")
+            # print(f"sampler-post-hook: first-peer, received sampler {received_output}")
             return received_output
 
         # Middle peer
@@ -931,7 +954,7 @@ async def send_inference_tensors_fast(
     Accepts torch tensors directly and does lazy conversion only when needed.
     """
     try:
-        print("send_inference_tensors_fast - beginning of fn")
+        # print("send_inference_tensors_fast - beginning of fn")
         if not next_peer_ticket:
             raise ValueError("next_peer_ticket must be provided")
 

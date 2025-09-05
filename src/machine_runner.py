@@ -113,13 +113,9 @@ async def unified_message_gateway():
                 print("⚠️ Received message without tensor payload")
                 continue
 
-            print(
-                f"📨 Gateway received message: '{name}' (tensor shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'})"
-            )
-
-            print(
-                f"📨 Gateway received message: '{name}' (tensor shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'})"
-            )
+            # print(
+            #     f"📨 Gateway received message: '{name}' (tensor shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'})"
+            # )
 
             # Route message based on name/content
             try:
@@ -291,7 +287,7 @@ async def handle_inference_trigger_message(tensor):
 async def handle_inference_data_message(name: str, tensor):
     """Handle inference data messages (combined tensors or sampler outputs)"""
     try:
-        print(f"📊 Processing inference data: {name}")
+        # print(f"📊 Processing inference data: {name}")
 
         # Parse the tensor name using utility function
         metadata = extract_request_metadata(name)
@@ -300,9 +296,9 @@ async def handle_inference_data_message(name: str, tensor):
             return
 
         request_id, step_idx, message_type = metadata
-        print(
-            f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='{message_type}'"
-        )
+        # print(
+        #     f"📋 Parsed: request_id='{request_id}', step={step_idx}, type='{message_type}'"
+        # )
 
         if message_type == "combined":
             # Unstack the combined tensor
@@ -324,9 +320,9 @@ async def handle_inference_data_message(name: str, tensor):
                     hidden_state
                 )
                 INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
-                print(
-                    f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}"
-                )
+                # print(
+                #     f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}"
+                # )
 
                 # wake anybody waiting for this step's payload
                 event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
@@ -353,7 +349,7 @@ async def handle_inference_data_message(name: str, tensor):
                 INFERENCE_CONTEXT[request_id][str(step_idx)]["sampler_output"] = (
                     sampler_output
                 )
-                print(f"✅ Stored sampler_output for {request_id} step {step_idx}")
+                # print(f"✅ Stored sampler_output for {request_id} step {step_idx}")
 
                 # wake anybody waiting for this step's sampler output
                 event = STEP_EVENTS_SAMPLER[request_id].setdefault(
