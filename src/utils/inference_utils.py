@@ -17,76 +17,6 @@ from src.utils.tensor_protocol_adapter import TensorTransport
 # Value: A dictionary with step-indexed hidden states and residuals
 # Structure: {request_id: {step_idx: {"hidden_state": tensor, "residual": tensor}}}
 INFERENCE_CONTEXT: Dict[str, Dict[str, Any]] = {}
-# the above is just a payload that is sent from one peer to another.
-#
-# INFERENCE_CONTEXT (what it is and how it is used):
-# ---------------------------------------------------
-# Purpose:
-# - A per-request scratchpad for cross-peer hand-off of intermediate tensors.
-# - It stores step-scoped payloads that allow a downstream stage (peer) to pick
-#   up exactly the right data at exactly the right time.
-#
-# Shape/keys:
-# - Top-level key: request_id (str)
-# - Second-level key: step index (stored as str for consistency with JSON names)
-# - Leaf dict keys:
-#     * "hidden_state": tensor with shape [seq_len, hidden_dim] (prompt) or [1, hidden_dim] (decode)
-#     * "residual": tensor matching the hidden_state shape
-#     * "sampler_output": pickled SamplerOutput (only present on the first peer when the last peer sends it)
-#
-# Producers (writers):
-# - handle_inference_data_message in machine_runner.py
-#     * When receiving "..._combined" messages, it unpacks and writes
-#       {hidden_state, residual} for a specific (request_id, step).
-#     * When receiving "..._sampler_output" messages, it unpickles and writes
-#       {sampler_output} for the (request_id, step) the first peer is waiting on.
-#
-# Consumers (readers):
-# - pre_hook (non-first peers): waits on STEP_EVENTS[req][step], then reads
-#   {hidden_state, residual} to feed its layers.
-# - sampler_post_hook (first peer): waits on STEP_EVENTS_SAMPLER[req][step], then
-#   reads {sampler_output} to continue the engine’s control flow.
-#
-# Synchronization:
-# - Read/writes are protected by CONTEXT_LOCK.
-# - Arrival is coordinated by two distinct event maps:
-#     * STEP_EVENTS → payload (hidden_state/residual) readiness
-#     * STEP_EVENTS_SAMPLER → sampler_output readiness (from last peer)
-#
-# Lifecycle/cleanup:
-# - Per-step garbage collection: once a step is consumed and we advance, we drop
-#   step-1 data to avoid unbounded growth.
-# - Per-request cleanup: cleanup_request_context(request_id) removes the entire
-#   request subtree and both event maps, called on completion or timeout.
-#
-# ========== LOCKING MODEL (READ ME) ==========
-# We use three distinct synchronization primitives to keep concurrency sane:
-#
-# 1) CONTEXT_LOCK (global, RLock):
-#    - Protects access to INFERENCE_CONTEXT and step-event dicts when we create,
-#      read, or delete per-request/step payloads (hidden/residual/sampler_output)
-#    - Use when: storing tensors, reading tensors for a given step, or cleaning up
-#      per-request maps to avoid races with other threads/hooks.
-#
-# 2) context_lock (local to register_inference_hooks, RLock):
-#    - Protects the hook_contexts dict (per-execution request metadata) and any
-#      updates to fields like current_step, active, next_peer_ticket, etc.
-#    - Hooks may run from different threads; this lock ensures we don't read a
-#      partially-updated context or increment steps concurrently.
-#    - RLock (re-entrant) is used to avoid deadlocks when the same thread needs
-#      to re-enter protected sections during nested calls.
-#
-# 3) INFERENCE_MUTEX (global, Lock):
-#    - Serializes start_inference_run per peer. This avoids multiple concurrent
-#      hook contexts being attached at the same time on a single peer, which
-#      previously led to misrouting and timeouts. This is a temporary safety
-#      measure until hooks are made fully request-aware and can run concurrently.
-#
-# Step events (STEP_EVENTS vs STEP_EVENTS_SAMPLER):
-# - STEP_EVENTS: signals arrival of payload tensors (hidden_state/residual)
-# - STEP_EVENTS_SAMPLER: signals arrival of the last peer's sampler output
-# Keeping these separate prevents accidental cross-wakeup (payload setting the
-# sampler wait, or vice versa).
 CONTEXT_LOCK = threading.Lock()  # Thread-safe access to INFERENCE_CONTEXT
 
 # ------------------------------------------------------------------
@@ -103,6 +33,12 @@ INFERENCE_MUTEX = threading.Lock()
 # Reference to the async loop, right now it's the main thread's asyncio loop
 asyncio_loop = None
 
+# Per-batch context storage, maps batch id to dict of metadata
+batch_metadata = {}
+
+# Data wait timeout i.e. How long hooks should wait for data
+DATA_TIMEOUT = 5
+
 
 def cleanup_request_context(request_id: str):
     """Thread-safe cleanup of request context"""
@@ -116,6 +52,11 @@ def cleanup_request_context(request_id: str):
         if request_id in STEP_EVENTS_SAMPLER:
             del STEP_EVENTS_SAMPLER[request_id]
             print(f"🧹 Cleaned up sampler step events for {request_id}")
+        if threading.get_ident() in batch_metadata:
+            del batch_metadata[threading.get_ident()]
+            print(
+                f"🧹 Cleaned up batch metadata for {request_id}, using key {threading.get_ident()}"
+            )
 
 
 async def stream_token_to_server(
@@ -177,46 +118,46 @@ async def send_final_result_to_server(
         print(f"❌ Error sending completion to server: {e}")
 
 
-def create_virtual_sampler_output(request_id: str, step_idx: int) -> Any:
-    """
-    Create a virtual/mock SamplerOutput that satisfies vLLM's expectations
-    for intermediate peers that don't actually need the real sampler state.
+# def create_virtual_sampler_output(request_id: str, step_idx: int) -> Any:
+#    """
+#     Create a virtual/mock SamplerOutput that satisfies vLLM's expectations
+#     for intermediate peers that don't actually need the real sampler state.
 
-    This is a lightweight placeholder that contains minimal required fields.
-    """
-    try:
-        from vllm.model_executor.layers.sampler import SamplerOutput
-        from vllm.sequence import CompletionSequenceGroupOutput, Logprob, SequenceOutput
+#     This is a lightweight placeholder that contains minimal required fields.
+#     """
+#     try:
+#         from vllm.model_executor.layers.sampler import SamplerOutput
+#         from vllm.sequence import CompletionSequenceGroupOutput, Logprob, SequenceOutput
 
-        # Choose a dummy token id and provide a matching logprob entry
-        output_token_id = 1
+#         # Choose a dummy token id and provide a matching logprob entry
+#         output_token_id = 1
 
-        # minimal mock SequenceOutput
-        mock_sequence_output = SequenceOutput(
-            parent_seq_id=0,
-            output_token=output_token_id,
-            logprobs={output_token_id: Logprob(logprob=0.0)},
-        )
+#         # minimal mock SequenceOutput
+#         mock_sequence_output = SequenceOutput(
+#             parent_seq_id=0,
+#             output_token=output_token_id,
+#             logprobs={output_token_id: Logprob(logprob=0.0)},
+#         )
 
-        # minimal mock CompletionSequenceGroupOutput
-        mock_completion_output = CompletionSequenceGroupOutput(
-            samples=[mock_sequence_output],
-            prompt_logprobs=None,
-        )
+#         # minimal mock CompletionSequenceGroupOutput
+#         mock_completion_output = CompletionSequenceGroupOutput(
+#             samples=[mock_sequence_output],
+#             prompt_logprobs=None,
+#         )
 
-        # virtual SamplerOutput with just the required outputs field
-        virtual_sampler_output = SamplerOutput(
-            outputs=[mock_completion_output],
-        )
+#         # virtual SamplerOutput with just the required outputs field
+#         virtual_sampler_output = SamplerOutput(
+#             outputs=[mock_completion_output],
+#         )
 
-        print(
-            f"🎭 Created virtual SamplerOutput for intermediate peer (request: {request_id}, step: {step_idx})"
-        )
-        return virtual_sampler_output
+#         print(
+#             f"🎭 Created virtual SamplerOutput for intermediate peer (request: {request_id}, step: {step_idx})"
+#         )
+#         return virtual_sampler_output
 
-    except Exception as e:
-        print(f"❌ Failed to create virtual SamplerOutput: {e}")
-        return None
+#     except Exception as e:
+#         print(f"❌ Failed to create virtual SamplerOutput: {e}")
+#         return None
 
 
 def register_inference_hooks(
@@ -261,9 +202,6 @@ def register_inference_hooks(
 
     model = model_runner.model
     sampler = model_runner.sampler
-
-    # Per-batch context storage, maps batch id to dict of metadata
-    batch_metadata = {}
 
     # context_lock protects hook_contexts and all fields inside each context
     # (request_id, current_step, active, is_first/last, routing info). Hooks
@@ -340,9 +278,18 @@ def register_inference_hooks(
         # Wait for data (unavoidable, but optimized)
         with CONTEXT_LOCK:
             event = STEP_EVENTS[batch_id].setdefault(current_step, threading.Event())
-        if not event.wait(timeout=1000.0):
-            cleanup_request_context(batch_id)
-            return args
+        if not event.wait(timeout=DATA_TIMEOUT):
+            peer_id = hook_context["peer_id"]
+            server_url = hook_context["server_url"]
+            handle_failure(
+                batch_id=batch_id,
+                peer_id=peer_id,
+                error="Pre-Hook timed out waiting for tensor data",
+                server_url=server_url,
+            )
+            raise RuntimeError(
+                f"Timeout waiting for pre-hook input for {batch_id} step {current_step}"
+            )
 
         # Direct memory access (minimal locking)
         with CONTEXT_LOCK:
@@ -515,6 +462,11 @@ def register_inference_hooks(
         # print(
         #     f"main_loop given to send_inference_tensors_fast - {id(main_loop)}, {main_loop}"
         # )
+
+        # TODO: Merely for testing
+        # if random.randint(1, 10) < 2:
+        #     return
+
         asyncio.run_coroutine_threadsafe(
             send_inference_tensors_fast(
                 node,
@@ -546,6 +498,7 @@ def register_inference_hooks(
             is_last_peer = hook_context.get("is_last_peer", False)
             pipeline = hook_context["pipeline"]
             peer_id = hook_context["peer_id"]
+            server_url = hook_context["server_url"]
 
             # print(
             #     f"sampler-post-hook: {request_id}, {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
@@ -626,8 +579,13 @@ def register_inference_hooks(
                     current_step, threading.Event()
                 )
 
-            if not event.wait(timeout=1000.0):
-                cleanup_request_context(batch_id)
+            if not event.wait(timeout=DATA_TIMEOUT):
+                handle_failure(
+                    batch_id=batch_id,
+                    peer_id=peer_id,
+                    server_url=server_url,
+                    error="Sampler post hook for first peer timed out waiting for sampler output",
+                )
                 raise RuntimeError(
                     f"Timeout waiting for sampler output for {batch_id} step {current_step}"
                 )
@@ -724,6 +682,7 @@ def register_inference_hooks(
                         "active": True,
                         # pre-seed with model-reported sizes when available
                         "hidden_size": get_model_hidden_size(),
+                        "server_url": server_url,
                     }
 
                 # Get this peer's assigned layers
@@ -851,99 +810,111 @@ def register_inference_hooks(
     return start_inference_run
 
 
-async def send_hidden_state_tensor(
-    tensor_transport: "TensorTransport",
-    request_id: str,
-    next_peer_id: str,
-    data_to_send: "np.ndarray",
-    is_residual: bool = False,
-    step_idx: int = 0,
-    next_peer_ticket: str = "",
-):
-    """
-    Sends the tensor directly to the next peer using TensorTransport.
-    No gossip, no blobs.
-    """
+# Cleans up data structures and sends failure to server
+def handle_failure(batch_id: str, peer_id: str, error: str, server_url: str):
     try:
-        if not next_peer_ticket:
-            raise ValueError(
-                "next_peer_ticket must be provided for tensor transport send."
-            )
+        cleanup_request_context(batch_id)
 
-        # Calculate payload size
-        # payload_size_bytes = data_to_send.nbytes
-        # payload_size_mb = payload_size_bytes / (1024 * 1024)
-
-        tensor_type = "residual" if is_residual else "hidden_state"
-        # print(
-        #     f"📊 {tensor_type.capitalize()} tensor payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
-        # )
-        # print(f"   - Tensor shape: {data_to_send.shape}, dtype: {data_to_send.dtype}")
-
-        # Compose a name for the tensor message
-        tensor_name = f"{request_id}_step{step_idx}_{tensor_type}"
-
-        await tensor_transport.send(
-            next_peer_ticket, name=tensor_name, tensor=data_to_send
-        )
-
-        # print(
-        #     f"📤 Sent {tensor_type} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport"
-        # )
+        data = {"batch_id": batch_id, "peer_id": peer_id, "error": error}
+        with httpx.Client(timeout=5.0) as client:
+            client.post(f"{server_url}/batch_failed", json=data)
     except Exception as e:
-        print(
-            f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}"
-        )
+        print(f"handle_failure - {e}")
 
 
-async def send_inference_tensors(
-    tensor_transport: "TensorTransport",
-    request_id: str,
-    next_peer_id: str,
-    hidden_states: "np.ndarray",
-    residual: "np.ndarray",
-    step_idx: int = 0,
-    next_peer_ticket: str = "",
-):
-    """
-    Sends both hidden states and residual tensors in a single message.
-    Leverages tensor-iroh's built-in serialization.
-    """
-    try:
-        if not next_peer_ticket:
-            raise ValueError(
-                "next_peer_ticket must be provided for tensor transport send."
-            )
+# async def send_hidden_state_tensor(
+#     tensor_transport: "TensorTransport",
+#     request_id: str,
+#     next_peer_id: str,
+#     data_to_send: "np.ndarray",
+#     is_residual: bool = False,
+#     step_idx: int = 0,
+#     next_peer_ticket: str = "",
+# ):
+#     """
+#     Sends the tensor directly to the next peer using TensorTransport.
+#     No gossip, no blobs.
+#     """
+#     try:
+#         if not next_peer_ticket:
+#             raise ValueError(
+#                 "next_peer_ticket must be provided for tensor transport send."
+#             )
 
-        # Stack both tensors together - tensor-iroh handles serialization
-        # Format: [hidden_states, residual] concatenated along a new dimension
-        combined_tensor = np.stack([hidden_states, residual], axis=0)
+#         # Calculate payload size
+#         # payload_size_bytes = data_to_send.nbytes
+#         # payload_size_mb = payload_size_bytes / (1024 * 1024)
 
-        # Calculate payload size
-        # payload_size_bytes = combined_tensor.nbytes
-        # payload_size_mb = payload_size_bytes / (1024 * 1024)
+#         tensor_type = "residual" if is_residual else "hidden_state"
+#         # print(
+#         #     f"📊 {tensor_type.capitalize()} tensor payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
+#         # )
+#         # print(f"   - Tensor shape: {data_to_send.shape}, dtype: {data_to_send.dtype}")
 
-        # print(
-        #     f"📊 Payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
-        # )
-        # print(
-        #     f"   - Hidden states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}"
-        # )
-        # print(f"   - Residual shape: {residual.shape}, dtype: {residual.dtype}")
-        # print(f"   - Combined tensor shape: {combined_tensor.shape}")
+#         # Compose a name for the tensor message
+#         tensor_name = f"{request_id}_step{step_idx}_{tensor_type}"
 
-        # Compose a name for the tensor message
-        tensor_name = f"{request_id}_step{step_idx}_combined"
+#         await tensor_transport.send(
+#             next_peer_ticket, name=tensor_name, tensor=data_to_send
+#         )
 
-        await tensor_transport.send(
-            next_peer_ticket, name=tensor_name, tensor=combined_tensor
-        )
+#         # print(
+#         #     f"📤 Sent {tensor_type} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport"
+#         # )
+#     except Exception as e:
+#         print(
+#             f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}"
+#         )
 
-        print(
-            f"📤 Sent combined tensors for {request_id} step {step_idx} to {next_peer_id} via TensorTransport"
-        )
-    except Exception as e:
-        print(f"❌ Failed to send tensors for {request_id} to {next_peer_id}: {e}")
+
+# async def send_inference_tensors(
+#     tensor_transport: "TensorTransport",
+#     request_id: str,
+#     next_peer_id: str,
+#     hidden_states: "np.ndarray",
+#     residual: "np.ndarray",
+#     step_idx: int = 0,
+#     next_peer_ticket: str = "",
+# ):
+#     """
+#     Sends both hidden states and residual tensors in a single message.
+#     Leverages tensor-iroh's built-in serialization.
+#     """
+#     try:
+#         if not next_peer_ticket:
+#             raise ValueError(
+#                 "next_peer_ticket must be provided for tensor transport send."
+#             )
+
+#         # Stack both tensors together - tensor-iroh handles serialization
+#         # Format: [hidden_states, residual] concatenated along a new dimension
+#         combined_tensor = np.stack([hidden_states, residual], axis=0)
+
+#         # Calculate payload size
+#         # payload_size_bytes = combined_tensor.nbytes
+#         # payload_size_mb = payload_size_bytes / (1024 * 1024)
+
+#         # print(
+#         #     f"📊 Payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
+#         # )
+#         # print(
+#         #     f"   - Hidden states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}"
+#         # )
+#         # print(f"   - Residual shape: {residual.shape}, dtype: {residual.dtype}")
+#         # print(f"   - Combined tensor shape: {combined_tensor.shape}")
+
+#         # Compose a name for the tensor message
+#         tensor_name = f"{request_id}_step{step_idx}_combined"
+
+#         await tensor_transport.send(
+#             next_peer_ticket, name=tensor_name, tensor=combined_tensor
+#         )
+
+#         print(
+#             f"📤 Sent combined tensors for {request_id} step {step_idx} to {next_peer_id} via TensorTransport"
+#         )
+#     except Exception as e:
+#         print(f"❌ Failed to send tensors for {request_id} to {next_peer_id}: {e}")
 
 
 async def send_inference_tensors_fast(

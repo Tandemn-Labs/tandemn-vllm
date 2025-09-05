@@ -1300,7 +1300,12 @@ async def chat_completions(request: Request):
     request_id = str(uuid.uuid4())
     event = asyncio.Event()
     event.clear()
-    active_requests[request_id] = {"tokens": [], "event": event, "complete": False}
+    active_requests[request_id] = {
+        "tokens": [],
+        "event": event,
+        "complete": False,
+        "failed": False,
+    }
 
     req = req_batcher.Request(
         id=request_id,
@@ -1381,6 +1386,11 @@ async def stream_token_response(request_id: str, model_name: str):
                 yield b"data: [DONE]\n\n"
                 return
 
+            elif req_metadata["failed"]:
+                yield sse_pack(chunk)
+                yield b"error"
+                return
+
             # Normal streaming
             else:
                 yield sse_pack(chunk)
@@ -1390,6 +1400,34 @@ async def stream_token_response(request_id: str, model_name: str):
         import traceback
 
         traceback.print_exc()
+
+
+class BatchFailRequest(BaseModel):
+    batch_id: str
+    peer_id: str
+    error: str
+
+
+@app.post("/batch_failed")
+async def batch_failed(request: BatchFailRequest):
+    batch_id = request.batch_id
+
+    try:
+        batch = active_inferences[batch_id]
+        req_ids = batch["request_id"]
+        batch["status"] = "failed"
+
+        print(
+            f"batch_failed - batch_id: {batch_id}, peer_id: {request.peer_id}, error: {request.error}"
+        )
+
+        for req_id in req_ids:
+            active_requests[req_id]["failed"] = True
+            active_requests[req_id]["event"].set()
+    except Exception as e:
+        print(f"/batch_failed - {type(e).__name__}: {e}")
+
+    return
 
 
 # @app.post("/insert_batch")
