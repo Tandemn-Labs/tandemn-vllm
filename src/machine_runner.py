@@ -301,13 +301,31 @@ async def handle_inference_data_message(name: str, tensor):
         # )
 
         if message_type == "combined":
-            # Unstack the combined tensor
-            if tensor.shape[0] != 2:
-                print(f"❌ Invalid combined tensor shape: {tensor.shape}")
-                return
+            # if hasattr(tensor, "numpy"):
+            #     # PyTorch tensor - convert to numpy
+            #     arr = tensor.numpy()
+            # else:
+            #     # Already numpy
+            #     arr = tensor
 
-            hidden_state = tensor[0]
-            residual = tensor[1]
+            # Unpickle the combined tensor
+            combined_tensor = pickle.loads(tensor.numpy().tobytes())
+
+            hidden_state = combined_tensor[0]
+            residual = combined_tensor[1]
+            positions = combined_tensor[2]
+
+            print(
+                f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
+            )
+
+            # # Unstack the combined tensor
+            # if tensor.shape[0] != 2:
+            #     print(f"❌ Invalid combined tensor shape: {tensor.shape}")
+            #     return
+
+            # hidden_state = tensor[0]
+            # residual = tensor[1]
 
             # Store in INFERENCE_CONTEXT
             with CONTEXT_LOCK:
@@ -316,13 +334,12 @@ async def handle_inference_data_message(name: str, tensor):
                 if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
                     INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
 
-                INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = (
-                    hidden_state
-                )
-                INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
-                # print(
-                #     f"✅ Stored both hidden_state and residual for {request_id} step {step_idx}"
-                # )
+            INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = hidden_state
+            INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
+            INFERENCE_CONTEXT[request_id][str(step_idx)]["positions"] = positions
+            print(
+                f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
+            )
 
                 # wake anybody waiting for this step's payload
                 event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
