@@ -324,54 +324,57 @@ def register_inference_hooks(
     def pre_hook(module, args):
         """Ultra-minimal pre-hook for maximum performance"""
         # Get request-specific context with minimal overhead
-        with context_lock:
-            active_contexts = [
-                ctx for ctx in batch_metadata.values() if ctx.get("active", False)
-            ]
-            if not active_contexts:
-                return args
 
-            hook_context = active_contexts[0]  # ?
-            batch_id = hook_context["batch_id"]
-            current_step = hook_context["current_step"]
-            # print(
-            #     f"🔍 Pre-hook called for request {batch_id} step {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
-            # )
-            # loop = asyncio.get_running_loop()
-            # print(f"asyncio loop - {id(loop)}, {loop}")
+        # print(batch_metadata.values()[0])
+        # active_contexts = [
+        #     ctx for ctx in batch_metadata.values() if ctx.get("active", False)
+        # ]
+        # if not active_contexts:
+        #     return args
 
-            # Skip ALL checks if first peer
-            if hook_context["is_first_peer"]:
-                return args
+        hook_context = list(batch_metadata.values())[0]  # ?
+        batch_id = hook_context["batch_id"]
+        current_step = hook_context["current_step"]
+        # print(
+        #     f"🔍 Pre-hook called for request {batch_id} step {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
+        # )
+        # loop = asyncio.get_running_loop()
+        # print(f"asyncio loop - {id(loop)}, {loop}")
+
+        # Skip ALL checks if first peer
+        if hook_context["is_first_peer"]:
+            return args
 
         # Wait for data (unavoidable, but optimized)
-        event = STEP_EVENTS[batch_id].setdefault(current_step, threading.Event())
-        if not event.wait(timeout=1000.0):
-            cleanup_request_context(batch_id)
-            return args
+        with CONTEXT_LOCK:
+            event = STEP_EVENTS[batch_id].setdefault(current_step, threading.Event())
+            if not event.wait(timeout=1000.0):
+                cleanup_request_context(batch_id)
+                return args
 
         # Direct memory access (minimal locking)
         with CONTEXT_LOCK:
             step_data = INFERENCE_CONTEXT[batch_id][str(current_step)]
             hidden_states = step_data["hidden_state"]
             residual = step_data["residual"]
-
-        positions = args[0]
-        device = positions.device
+            positions = step_data["positions"]
+        # this is just to get the device
+        positions_for_device = args[0]
+        device = positions_for_device.device
 
         # Infer payload hidden size and keep it in context for visibility
         payload_hidden_size = int(hidden_states.shape[-1])
-        with context_lock:
-            if hook_context.get("hidden_size") is None:
-                hook_context["hidden_size"] = payload_hidden_size
-                # print(f"🔧 Inferred hidden size from payload: {payload_hidden_size}")
-            elif hook_context["hidden_size"] != payload_hidden_size:
-                pass
-                # print(
-                #     f"⚠️ Hidden size mismatch: model={hook_context['hidden_size']} payload={payload_hidden_size}. Using payload size."
-                # )
+
+        if hook_context.get("hidden_size") is None:
+            hook_context["hidden_size"] = payload_hidden_size
+            # print(f"🔧 Inferred hidden size from payload: {payload_hidden_size}")
+        elif hook_context["hidden_size"] != payload_hidden_size:
+            pass
 
         # Single conditional for step - ultra optimized reshaping
+        hidden_states = torch.tensor(hidden_states)
+        residual = torch.tensor(residual)
+        positions = torch.tensor(positions)
         if current_step:  # Decode phase
             hidden_reshaped = hidden_states.to(device, non_blocking=True)
             positions_reshaped = positions.to(device, non_blocking=True)
@@ -433,36 +436,37 @@ def register_inference_hooks(
     def post_hook(module, args, output):
         """Ultra-minimal post-hook for maximum performance"""
         # Get context with minimal overhead
-        with context_lock:
-            active_contexts = [
-                ctx for ctx in batch_metadata.values() if ctx.get("active", False)
-            ]
-            if not active_contexts:
-                return
 
-            hook_context = active_contexts[0]  # ?
+        # active_contexts = [
+        #     ctx for ctx in batch_metadata.values() if ctx.get("active", False)
+        # ]
+        # if not active_contexts:
+        #     return
 
-            # Skip if last peer (no sending needed)
-            if hook_context["is_last_peer"]:
-                return
+        hook_context = list(batch_metadata.values())[0]  # ?
 
-            request_id = hook_context["batch_id"]
-            current_step = hook_context["current_step"]
+        # Skip if last peer (no sending needed)
+        if hook_context["is_last_peer"]:
+            return
 
-            # print(
-            #     f"post-hook: {request_id}, {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
-            # )
-            # loop = asyncio.get_running_loop()
-            # print(f"asyncio loop - {id(loop)}, {loop}")
+        request_id = hook_context["batch_id"]
+        current_step = hook_context["current_step"]
 
-            # Fast duplicate check
-            context_key = f"sent_step_{current_step}"
-            if hook_context.get(context_key, False):
-                return
-            hook_context[context_key] = True
+        # print(
+        #     f"post-hook: {request_id}, {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
+        # )
+        # loop = asyncio.get_running_loop()
+        # print(f"asyncio loop - {id(loop)}, {loop}")
+
+        # Fast duplicate check
+        context_key = f"sent_step_{current_step}"
+        if hook_context.get(context_key, False):
+            return
+        hook_context[context_key] = True
 
         # print(f"post-hook: output-type - {type(output)}")
         hidden_states, residual = output
+        positions = args[0]
         # print(
         #     f"post-hook: hidden_states type - {type(hidden_states)}, residual type - {type(residual)}"
         # )
@@ -533,6 +537,7 @@ def register_inference_hooks(
                 next_peer_id,
                 hidden_states.clone(),  # Send torch tensor directly
                 residual.clone(),  # Send torch tensor directly
+                positions.clone(),  # Send torch tensor directly
                 step_idx=current_step,
                 next_peer_ticket=next_peer_ticket,
             ),
@@ -550,26 +555,26 @@ def register_inference_hooks(
         """
 
         # Get request-specific context safely
-        with context_lock:
-            active_contexts = [
-                ctx for ctx in batch_metadata.values() if ctx.get("active", False)
-            ]
-            if not active_contexts:
-                print("❌ No active inference context found in sampler_post_hook")
-                return output
 
-            hook_context = active_contexts[0]
-            batch_id = hook_context["batch_id"]
-            current_step = hook_context.get("current_step", 0)
-            is_last_peer = hook_context.get("is_last_peer", False)
-            pipeline = hook_context["pipeline"]
-            peer_id = hook_context["peer_id"]
+        active_contexts = [
+            ctx for ctx in batch_metadata.values() if ctx.get("active", False)
+        ]
+        if not active_contexts:
+            print("❌ No active inference context found in sampler_post_hook")
+            return output
 
-            # print(
-            #     f"sampler-post-hook: {request_id}, {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
-            # )
-            # loop = asyncio.get_running_loop()
-            # print(f"asyncio loop - {id(loop)}, {loop}")
+        hook_context = active_contexts[0]
+        batch_id = hook_context["batch_id"]
+        current_step = hook_context.get("current_step", 0)
+        is_last_peer = hook_context.get("is_last_peer", False)
+        pipeline = hook_context["pipeline"]
+        peer_id = hook_context["peer_id"]
+
+        # print(
+        #     f"sampler-post-hook: {request_id}, {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
+        # )
+        # loop = asyncio.get_running_loop()
+        # print(f"asyncio loop - {id(loop)}, {loop}")
 
         if is_last_peer:
             # Serialize the entire SamplerOutput object
@@ -618,8 +623,8 @@ def register_inference_hooks(
             )
 
             # Increment step for last peer too
-            with context_lock:
-                hook_context["current_step"] = current_step + 1
+
+            hook_context["current_step"] = current_step + 1
 
             # Clean up old data to prevent memory growth
             with CONTEXT_LOCK:
@@ -667,8 +672,8 @@ def register_inference_hooks(
                     STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 1, None)
 
             # Increment step after receiving
-            with context_lock:
-                hook_context["current_step"] = current_step + 1
+
+            hook_context["current_step"] = current_step + 1
 
             print(f"sampler-post-hook: first-peer, received sampler {received_output}")
             return received_output
@@ -700,8 +705,7 @@ def register_inference_hooks(
                         "sampler_output"
                     ]
 
-                with context_lock:
-                    hook_context["current_step"] = current_step + 1
+                hook_context["current_step"] = current_step + 1
 
                 return received_output
 
@@ -715,8 +719,8 @@ def register_inference_hooks(
 
             # Increment step immediately (no waiting!)
             # print("sampler-post-hook - Attempting to grab context_lock")
-            with context_lock:
-                hook_context["current_step"] = current_step + 1
+
+            hook_context["current_step"] = current_step + 1
 
             # print("sampler-post-hook: middle-peer, returned same sampler")
             return output
@@ -754,21 +758,21 @@ def register_inference_hooks(
                     ]  # In this implementation, peer_id and ticket are the same
 
                 # Initialize thread-safe context for this request
-                with context_lock:
-                    batch_metadata[execution_id] = {
-                        "batch_id": batch_id,
-                        "pipeline": pipeline,
-                        "input_text": input_text,
-                        "is_first_peer": is_first,
-                        "is_last_peer": is_last,
-                        "peer_id": peer_id,
-                        "next_peer_id": next_peer_id,
-                        "next_peer_ticket": next_peer_ticket,
-                        "current_step": 0,
-                        "active": True,
-                        # pre-seed with model-reported sizes when available
-                        "hidden_size": get_model_hidden_size(),
-                    }
+
+                batch_metadata[execution_id] = {
+                    "batch_id": batch_id,
+                    "pipeline": pipeline,
+                    "input_text": input_text,
+                    "is_first_peer": is_first,
+                    "is_last_peer": is_last,
+                    "peer_id": peer_id,
+                    "next_peer_id": next_peer_id,
+                    "next_peer_ticket": next_peer_ticket,
+                    "current_step": 0,
+                    "active": True,
+                    # pre-seed with model-reported sizes when available
+                    "hidden_size": get_model_hidden_size(),
+                }
 
                 # Get this peer's assigned layers
                 real_layers = [
@@ -840,18 +844,18 @@ def register_inference_hooks(
                     try:
                         # Use a unique sent flag per request to avoid collisions
                         request_sent_key = f"final_sent_{batch_id}"
-                        with context_lock:
-                            if not batch_metadata[execution_id].get(
-                                request_sent_key, False
-                            ):
-                                batch_metadata[execution_id][request_sent_key] = True
-                                asyncio.run_coroutine_threadsafe(
-                                    send_final_result_to_server(
-                                        batch_id, final_text, peer_id, server_url
-                                    ),
-                                    asyncio_loop,
-                                )
-                            print(f"🎯 Final result sent for {batch_id}")
+
+                        if not batch_metadata[execution_id].get(
+                            request_sent_key, False
+                        ):
+                            batch_metadata[execution_id][request_sent_key] = True
+                            asyncio.run_coroutine_threadsafe(
+                                send_final_result_to_server(
+                                    batch_id, final_text, peer_id, server_url
+                                ),
+                                asyncio_loop,
+                            )
+                        print(f"🎯 Final result sent for {batch_id}")
                     except Exception as e:
                         print(f"❌ Failed to schedule send_final_result_to_server: {e}")
 
@@ -864,9 +868,9 @@ def register_inference_hooks(
                 traceback.print_exc()
             finally:
                 # Mark context inactive early to avoid further hook activity for this execution
-                with context_lock:
-                    if execution_id in batch_metadata:
-                        batch_metadata[execution_id]["active"] = False
+
+                if execution_id in batch_metadata:
+                    batch_metadata[execution_id]["active"] = False
 
                 # Always clean up hooks idempotently, even on error/early exit
                 try:
@@ -887,9 +891,9 @@ def register_inference_hooks(
                             pass
                 finally:
                     # Remove context entry now that hooks are torn down
-                    with context_lock:
-                        if execution_id in batch_metadata:
-                            del batch_metadata[execution_id]
+
+                    if execution_id in batch_metadata:
+                        del batch_metadata[execution_id]
 
                 # Always clean up per-request transport/context
                 cleanup_request_context(batch_id)
@@ -900,49 +904,49 @@ def register_inference_hooks(
     return start_inference_run
 
 
-async def send_hidden_state_tensor(
-    tensor_transport: "TensorTransport",
-    request_id: str,
-    next_peer_id: str,
-    data_to_send: "np.ndarray",
-    is_residual: bool = False,
-    step_idx: int = 0,
-    next_peer_ticket: str = "",
-):
-    """
-    Sends the tensor directly to the next peer using TensorTransport.
-    No gossip, no blobs.
-    """
-    try:
-        if not next_peer_ticket:
-            raise ValueError(
-                "next_peer_ticket must be provided for tensor transport send."
-            )
+# async def send_hidden_state_tensor(
+#     tensor_transport: "TensorTransport",
+#     request_id: str,
+#     next_peer_id: str,
+#     data_to_send: "np.ndarray",
+#     is_residual: bool = False,
+#     step_idx: int = 0,
+#     next_peer_ticket: str = "",
+# ):
+#     """
+#     Sends the tensor directly to the next peer using TensorTransport.
+#     No gossip, no blobs.
+#     """
+#     try:
+#         if not next_peer_ticket:
+#             raise ValueError(
+#                 "next_peer_ticket must be provided for tensor transport send."
+#             )
 
-        # Calculate payload size
-        # payload_size_bytes = data_to_send.nbytes
-        # payload_size_mb = payload_size_bytes / (1024 * 1024)
+#         # Calculate payload size
+#         # payload_size_bytes = data_to_send.nbytes
+#         # payload_size_mb = payload_size_bytes / (1024 * 1024)
 
-        tensor_type = "residual" if is_residual else "hidden_state"
-        # print(
-        #     f"📊 {tensor_type.capitalize()} tensor payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
-        # )
-        # print(f"   - Tensor shape: {data_to_send.shape}, dtype: {data_to_send.dtype}")
+#         tensor_type = "residual" if is_residual else "hidden_state"
+#         # print(
+#         #     f"📊 {tensor_type.capitalize()} tensor payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
+#         # )
+#         # print(f"   - Tensor shape: {data_to_send.shape}, dtype: {data_to_send.dtype}")
 
-        # Compose a name for the tensor message
-        tensor_name = f"{request_id}_step{step_idx}_{tensor_type}"
+#         # Compose a name for the tensor message
+#         tensor_name = f"{request_id}_step{step_idx}_{tensor_type}"
 
-        await tensor_transport.send(
-            next_peer_ticket, name=tensor_name, tensor=data_to_send
-        )
+#         await tensor_transport.send(
+#             next_peer_ticket, name=tensor_name, tensor=data_to_send
+#         )
 
-        # print(
-        #     f"📤 Sent {tensor_type} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport"
-        # )
-    except Exception as e:
-        print(
-            f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}"
-        )
+#         # print(
+#         #     f"📤 Sent {tensor_type} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport"
+#         # )
+#     except Exception as e:
+#         print(
+#             f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}"
+#         )
 
 
 async def send_inference_tensors(
@@ -1001,6 +1005,7 @@ async def send_inference_tensors_fast(
     next_peer_id: str,
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
+    positions: torch.Tensor,
     step_idx: int = 0,
     next_peer_ticket: str = "",
 ):
@@ -1026,9 +1031,11 @@ async def send_inference_tensors_fast(
         if hidden_states.is_cuda:
             hidden_np = hidden_states.detach().cpu().numpy()
             residual_np = residual.detach().cpu().numpy()
+            positions_np = positions.detach().cpu().numpy()
         else:
             hidden_np = hidden_states.detach().numpy()
             residual_np = residual.detach().numpy()
+            positions_np = positions.detach().numpy()
 
         # Stack efficiently
         # combined_tensor = np.concatenate([hidden_np.reshape(1, *hidden_np.shape), residual_np.reshape(1, *residual_np.shape)], axis=0)
@@ -1045,7 +1052,12 @@ async def send_inference_tensors_fast(
         # print(f"send_ITF - hidden_np shape - {hidden_np.shape}")
         # print(f"send_ITF - residual shape - {residual_np.shape}")
 
-        combined_tensor = np.stack([hidden_np, residual_np], axis=0)
+        # combined_tensor = np.stack([hidden_np, residual_np], axis=0)
+        # combined_tensor = np.array([hidden_np, residual_np, positions_np])
+        combined_tensor = [hidden_np, residual_np, positions_np]
+        combined_tensor = pickle.dumps(combined_tensor)
+        combined_tensor = np.frombuffer(combined_tensor, dtype=np.uint8)
+
         # Calculate payload size
         # payload_size_bytes = combined_tensor.nbytes
         # payload_size_mb = payload_size_bytes / (1024 * 1024)
