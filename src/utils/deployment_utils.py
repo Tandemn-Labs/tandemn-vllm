@@ -19,7 +19,9 @@ from safetensors import safe_open  # type: ignore
 from src.config.settings import SERVER_PORT
 from src.utils.db_utils import get_active_peers, get_peer_metrics
 from src.utils.model_utils import distribute_layers_across_peers
-from src.utils.weight_loading_adapters.llama import LlamaWeightLoadingAdapter
+
+# from src.utils.weight_loading_adapters.llama import LlamaWeightLoadingAdapter
+from src.utils.weight_loading_adapters import get_adapter_for_config
 
 
 def load_model_metadata(shard_folder: str):
@@ -700,13 +702,16 @@ def create_dynamic_vllm_model(
 
             cpu_loading_start_time = time.time()
 
-            weight_loading_adapter = LlamaWeightLoadingAdapter(
+            adapter_instance = get_adapter_for_config(config=model.config)
+
+            weight_loading_adapter = adapter_instance(
                 config=model.config,
                 model=model,
                 assigned_layers=assigned_layers,
                 model_dir=shards_root,
                 quantization=quantization,
             )
+
             weight_loading_adapter.loading_loop()
 
             # # Collect all weights we need to load (matching selective_layer_loading_fixed.py logic)
