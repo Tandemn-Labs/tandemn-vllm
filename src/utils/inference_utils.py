@@ -613,7 +613,15 @@ def register_inference_hooks(
             token_numbers = [
                 [completion.samples[0].output_token] for completion in output.outputs
             ]
-            tokens_str = tokenizer.batch_decode(token_numbers)
+            # tokens_str = tokenizer.batch_decode(token_numbers)
+            if hasattr(tokenizer, "batch_decode"):
+                tokens_str = tokenizer.batch_decode(token_numbers)
+            else:
+                # Assume MistralTokenizer - decode individually
+                tokens_str = [
+                    tokenizer.decode(token_list) if token_list else ""
+                    for token_list in token_numbers
+                ]
             # print(f"sampler-post-hook - tokens_str {tokens_str}")
             asyncio.run_coroutine_threadsafe(
                 stream_token_to_server(
