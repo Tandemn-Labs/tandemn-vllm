@@ -505,7 +505,12 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         pipeline = instructions.get("pipeline")
         if current_peer_ticket == pipeline[-1]:
             if "mistral" in model_name.lower() or "devstral" in model_name.lower():
-                tokenizer = deployed_model.tokenizer
+                from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+
+                local_model_dir = f"deployed_models/{model_name.replace('/', '')}"
+                tokenizer = MistralTokenizer.from_file(
+                    f"{local_model_dir}/config/tekken.json"
+                )
             else:
                 tokenizer = AutoTokenizer.from_pretrained(
                     model_name, token=HUGGINGFACE_TOKEN
