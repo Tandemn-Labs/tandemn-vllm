@@ -556,7 +556,14 @@ def register_inference_hooks(
             for completion in output.outputs:
                 curr_seq.append(completion.samples[0].parent_seq_id)
                 token_numbers.append([completion.samples[0].output_token])
-            tokens_str = tokenizer.batch_decode(token_numbers)
+            if hasattr(tokenizer, "batch_decode"):
+                tokens_str = tokenizer.batch_decode(token_numbers)
+            else:
+                # Assume MistralTokenizer - decode individually
+                tokens_str = [
+                    tokenizer.decode(token_list) if token_list else ""
+                    for token_list in token_numbers
+                ]
 
             # Fill in empty string for requests that completed
             i = 0

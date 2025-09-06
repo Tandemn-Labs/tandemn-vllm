@@ -7,7 +7,6 @@ Refactored to support multiple model families via sharding adapters in
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -170,6 +169,13 @@ def shard_model_by_layers_safetensors(
     if config.model_type == "mistral" or config.model_name.lower() == "devstral":
         # mistral tokenizer does not have a save_pretrained method
         print("🔧 Mistral tokenizer does not have a save_pretrained method")
+        try:
+            tekken_path = hf_hub_download(model_name, "tekken.json", token=hf_token)
+            import shutil
+
+            shutil.copy(tekken_path, config_dir / "tekken.json")
+        except Exception as e:
+            print(f"🔧 Error downloading tekken.json: {e}")
         pass
     else:
         tokenizer.save_pretrained(config_dir)
