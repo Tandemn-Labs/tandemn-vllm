@@ -249,6 +249,7 @@ def create_deployment_instructions(request, distribution_plan, peer_table, SERVE
             "config/added_tokens.json",
             "config/vocab.json",  # BPE vocab
             "config/merges.txt",  # BPE merges
+            "config/tekken.json",
         ]
 
         if is_first_peer:
@@ -675,6 +676,15 @@ def create_dynamic_vllm_model(
             # "rope_theta": 500000.0,
             # "speculative_config": speculative_config,
         }
+        # STEP 2 : Detect if the model is a mistral model
+        # Add Mistral-specific args if it's a Mistral model
+        # if "mistral" in str(model_dir).lower() or "devstral" in str(model_dir).lower():
+        #     args.update(
+        #         {
+        #             "tokenizer_mode": "mistral",
+        #             # "config_format": "mistral",
+        #         }
+        #     )
         # STEP 2: Create vLLM model (will use our patched make_layers)
         if engine_args:
             args.update(engine_args)
