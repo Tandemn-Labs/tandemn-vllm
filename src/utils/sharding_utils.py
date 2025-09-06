@@ -142,7 +142,7 @@ def shard_model_by_layers_safetensors(
         trust_remote_code=True,
     )
     print(f"🔧 Config: {config}")
-    if config.model_type == "mistral" or config.model_name.lower() == "devstral":
+    if config.model_type == "mistral" or "devstral" in model_name.lower():
         try:
             from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 
@@ -166,7 +166,7 @@ def shard_model_by_layers_safetensors(
     # Save config/tokenizer
     config_dir = output_path / "config"
     config.save_pretrained(config_dir)
-    if config.model_type == "mistral" or config.model_name.lower() == "devstral":
+    if config.model_type == "mistral" or "devstral" in model_name.lower():
         # mistral tokenizer does not have a save_pretrained method
         print("🔧 Mistral tokenizer does not have a save_pretrained method")
         try:
