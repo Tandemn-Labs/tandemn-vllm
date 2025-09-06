@@ -504,9 +504,12 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         # Get tokenizer https://huggingface.co/docs/transformers/fast_tokenizers
         pipeline = instructions.get("pipeline")
         if current_peer_ticket == pipeline[-1]:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name, token=HUGGINGFACE_TOKEN
-            )
+            if "mistral" in model_name.lower() or "devstral" in model_name.lower():
+                tokenizer = deployed_model.tokenizer
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_name, token=HUGGINGFACE_TOKEN
+                )
         else:
             tokenizer = None
 
