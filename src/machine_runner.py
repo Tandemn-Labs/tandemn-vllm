@@ -507,7 +507,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             if "mistral" in model_name.lower() or "devstral" in model_name.lower():
                 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 
-                local_model_dir = f"deployed_models/{model_name.replace('/', '')}"
+                local_model_dir = f"deployed_models/{model_name}"
                 tokenizer = MistralTokenizer.from_file(
                     f"{local_model_dir}/config/tekken.json"
                 )
