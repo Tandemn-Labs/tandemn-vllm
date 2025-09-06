@@ -334,12 +334,14 @@ async def handle_inference_data_message(name: str, tensor):
                 if str(step_idx) not in INFERENCE_CONTEXT[request_id]:
                     INFERENCE_CONTEXT[request_id][str(step_idx)] = {}
 
-            INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = hidden_state
-            INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
-            INFERENCE_CONTEXT[request_id][str(step_idx)]["positions"] = positions
-            print(
-                f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
-            )
+                INFERENCE_CONTEXT[request_id][str(step_idx)]["hidden_state"] = (
+                    hidden_state
+                )
+                INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
+                INFERENCE_CONTEXT[request_id][str(step_idx)]["positions"] = positions
+                print(
+                    f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
+                )
 
                 # wake anybody waiting for this step's payload
                 event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())
