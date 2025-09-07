@@ -1275,19 +1275,70 @@ def collect_messages(messages: List[Dict]):
     return to_return
 
 
+class ChatCompletionRequest(BaseModel):
+    """Schema for accepting chat completion requests from the user"""
+
+    model: str
+    stream: bool
+    # start of vLLM Sampling Parameters
+    messages: List[Dict[str, Any]]
+    max_completion_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    min_tokens: Optional[int] = None
+    seed: Optional[int] = None
+    frequency_penalty: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    n: Optional[int] = 1
+    eos_token_id: Optional[List[int]] = None
+
+
+def build_sampling_params(request: ChatCompletionRequest):
+    """Build the sampling parameters for the chat completion request"""
+    sampling_params = {}
+    if request.max_completion_tokens:
+        sampling_params["max_tokens"] = request.max_completion_tokens
+    if request.temperature:
+        sampling_params["temperature"] = request.temperature
+    if request.top_p:
+        sampling_params["top_p"] = request.top_p
+    if request.top_k:
+        sampling_params["top_k"] = request.top_k
+    if request.min_p:
+        sampling_params["min_p"] = request.min_p
+    if request.seed:
+        sampling_params["seed"] = request.seed
+    if request.frequency_penalty:
+        sampling_params["frequency_penalty"] = request.frequency_penalty
+    if request.repetition_penalty:
+        sampling_params["repetition_penalty"] = request.repetition_penalty
+    if request.presence_penalty:
+        sampling_params["presence_penalty"] = request.presence_penalty
+    if request.eos_token_id:
+        sampling_params["eos_token_id"] = request.eos_token_id
+    # hardcode n =1
+    sampling_params["n"] = 1
+    return sampling_params
+
+
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(request: ChatCompletionRequest):
     # TODO: Ignore the authorization bearer key stuff in the header for now
 
     global active_requests
 
-    body = await request.json()
-    model = body.get("model")
-    stream = body.get("stream", False)
-    messages = body.get("messages")
+    # body = await request.json()
+    model = request.model
+    stream = request.stream
+    messages = request.messages
+    # max_tokens = request.max_completion_tokens
+
     input_text = collect_messages(messages)
+    sampling_params = build_sampling_params(request)
     print(f"input-text: {input_text}")
-    max_tokens = body.get("max_completion_tokens")
 
     # 0. Check if model deployed or not
     if model not in active_deployments:
@@ -1325,7 +1376,7 @@ async def chat_completions(request: Request):
         id=request_id,
         prompt=input_text,  # TODO: Change this,
         model_name=model,
-        sampling_params={"max_tokens": max_tokens, "n": 1},
+        sampling_params=sampling_params,
     )
 
     task = asyncio.create_task(active_deployments[model]["batcher"].add(req))
