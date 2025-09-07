@@ -807,6 +807,23 @@ def register_inference_hooks(
                 print(
                     f"start_inference_run [except] block - has_unfinished_requests: {llm.llm_engine.has_unfinished_requests()}"
                 )
+
+                # Abort all pending requests in the LLM engine
+                all_request_ids = []
+
+                for scheduler in llm.llm_engine.scheduler:
+                    # Get request IDs from all three queues
+                    for seq_group in scheduler.waiting:
+                        all_request_ids.append(seq_group.request_id)
+                    for seq_group in scheduler.running:
+                        all_request_ids.append(seq_group.request_id)
+                    for seq_group in scheduler.swapped:
+                        all_request_ids.append(seq_group.request_id)
+
+                # Abort all collected request IDs at once
+                if all_request_ids:
+                    llm.llm_engine.abort_request(all_request_ids)
+
                 import traceback
 
                 traceback.print_exc()
