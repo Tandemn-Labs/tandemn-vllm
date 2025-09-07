@@ -8,9 +8,9 @@ from typing import Any, Dict, List, Optional
 import httpx  # type: ignore
 import numpy as np
 import torch
+from vllm import LLM  # type: ignore
 
 from src.utils.tensor_protocol_adapter import TensorTransport
-from vllm import LLM  # type: ignore
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
@@ -801,6 +801,12 @@ def register_inference_hooks(
 
             except Exception as e:
                 print(f"❌ Error in inference run for {batch_id}: {e}")
+                llm.reset_prefix_cache()
+                llm.llm_engine.reset_prefix_cache()
+                llm.llm_engine.reset_mm_cache()
+                print(
+                    f"start_inference_run [except] block - has_unfinished_requests: {llm.llm_engine.has_unfinished_requests()}"
+                )
                 import traceback
 
                 traceback.print_exc()
