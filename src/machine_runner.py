@@ -9,9 +9,8 @@ from typing import Any, Dict
 import httpx
 from colorama import Fore, Style
 from colorama import init as colorama_init
-
-# from lmcache.experimental.cache_engine import LMCacheEngineBuilder
-# from lmcache.integration.vllm.utils import ENGINE_NAME
+from lmcache.experimental.cache_engine import LMCacheEngineBuilder
+from lmcache.integration.vllm.utils import ENGINE_NAME
 from transformers import AutoTokenizer
 
 # from lmcache.v1.cache_engine import LMCacheEngineBuilder
@@ -712,7 +711,7 @@ async def main():
         # Cancel background tasks
         heartbeat_task.cancel()
         gateway_task.cancel()
-        # LMCacheEngineBuilder.destroy(ENGINE_NAME)
+        LMCacheEngineBuilder.destroy(ENGINE_NAME)
         # debug_monitor_task.cancel()
         try:
             await heartbeat_task

@@ -503,6 +503,8 @@ def register_inference_hooks(
             peer_id = hook_context["peer_id"]
             server_url = hook_context["server_url"]
 
+        to_return = None
+
         # print(
         #     f"sampler-post-hook: {request_id}, {current_step} thread {threading.current_thread().name}, {threading.current_thread().ident}"
         # )
@@ -516,31 +518,21 @@ def register_inference_hooks(
 
             # print(f"sampler-post-hook: output type - {type(output)}, data - {output}")
 
-            # 🚀 OPTIMIZATION: Only send to FIRST peer instead of all peers
-            # Find the first peer in the pipeline
-            first_peer_ticket = pipeline[0] if pipeline else None
+            # Send to all other peers
+            peer_tickets = pipeline[:-1] if len(pipeline) > 1 else []
 
-            if first_peer_ticket and first_peer_ticket != peer_id:
-                # print(
-                #     f"📤 Sending sampler output ONLY to FIRST peer: {first_peer_ticket[:8]}..."
-                # )
+            for peer in peer_tickets:
                 asyncio.run_coroutine_threadsafe(
                     send_sampler_output(
                         node,
                         batch_id,
-                        first_peer_ticket,
+                        peer,
                         sampler_output_np,
                         step_idx=current_step,
-                        next_peer_ticket=first_peer_ticket,
+                        next_peer_ticket=peer,
                     ),
                     asyncio_loop,
                 )
-                # print(
-                #     f"✅ Optimized: Sent sampler output only to FIRST peer (not {len(pipeline) - 1} peers)"
-                # )
-            else:
-                # print(f"⚠️ No valid first peer found or first peer is self")
-                pass
 
             # Stores parent_seq_id if its first step (current_step = 0)
             if current_step == 0:
@@ -585,27 +577,11 @@ def register_inference_hooks(
                 asyncio_loop,
             )
 
-            # Increment step for last peer too
-
-            hook_context["current_step"] = current_step + 1
-
-            # Clean up old data to prevent memory growth
-            with CONTEXT_LOCK:
-                if current_step > 0:
-                    INFERENCE_CONTEXT[batch_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[batch_id].pop(current_step - 1, None)
-                    STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 1, None)
-
             # print("sampler-post-hook: last-peer, returned same sampler")
-            return output
+            to_return = output
 
-        # If first peer
-        elif pipeline.index(peer_id) == 0 if peer_id in pipeline else -1:
-            # FIRST peer: Wait for real sampler output from last peer
-            # print(
-            #     f"⏳ FIRST peer waiting for REAL sampler output for step {current_step}"
-            # )
-
+        # If not last peer
+        else:
             # Wait for sampler output using threading.Event, note that it's indexed by current_step before increment
             with CONTEXT_LOCK:
                 event = STEP_EVENTS_SAMPLER[batch_id].setdefault(
@@ -633,42 +609,19 @@ def register_inference_hooks(
                 #     f"✅ FIRST peer received REAL sampler output for step {current_step}"
                 # )
 
-            # Clean up consumed data to prevent memory growth
-            with CONTEXT_LOCK:
-                if current_step > 0:
-                    INFERENCE_CONTEXT[batch_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[batch_id].pop(current_step - 1, None)
-                    STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 1, None)
-
-            # Increment step after receiving
-
-            hook_context["current_step"] = current_step + 1
-
             # print(f"sampler-post-hook: first-peer, received sampler {received_output}")
-            return received_output
+            to_return = received_output
 
-        # Middle peer
-        else:
-            # INTERMEDIATE peer: Use virtual sampler output (no waiting!)
-            print(
-                f"🚀 INTERMEDIATE peer ({pipeline.index(peer_id) if peer_id in pipeline else -1}) using the same sampler output - NO WAITING!"
-            )
+        # Clean up old data to prevent memory growth
+        # print("sampler-post-hook - Attempting to grab CONTEXT_LOCK")
+        hook_context["current_step"] = current_step + 1
+        with CONTEXT_LOCK:
+            if current_step > 0:
+                INFERENCE_CONTEXT[batch_id].pop(str(current_step - 1), None)
+                STEP_EVENTS[batch_id].pop(current_step - 1, None)
+                STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 1, None)
 
-            # Clean up old data to prevent memory growth
-            # print("sampler-post-hook - Attempting to grab CONTEXT_LOCK")
-            with CONTEXT_LOCK:
-                if current_step > 0:
-                    INFERENCE_CONTEXT[batch_id].pop(str(current_step - 1), None)
-                    STEP_EVENTS[batch_id].pop(current_step - 1, None)
-                    STEP_EVENTS_SAMPLER[batch_id].pop(current_step - 1, None)
-
-            # Increment step immediately (no waiting!)
-            # print("sampler-post-hook - Attempting to grab context_lock")
-
-            hook_context["current_step"] = current_step + 1
-
-            # print("sampler-post-hook: middle-peer, returned same sampler")
-            return output
+        return to_return
 
     def start_inference_run(
         batch_id: str,
@@ -823,6 +776,10 @@ def register_inference_hooks(
                 # Abort all collected request IDs at once
                 if all_request_ids:
                     llm.llm_engine.abort_request(all_request_ids)
+
+                print(
+                    f"start_inference_run [except] block - has_unfinished_requests: {llm.llm_engine.has_unfinished_requests()}"
+                )
 
                 import traceback
 
@@ -1058,7 +1015,7 @@ async def send_inference_tensors_fast(
 
 async def send_sampler_output(
     tensor_transport: "TensorTransport",
-    request_id: str,
+    batch_id: str,
     next_peer_id: str,
     sampler_output_bytes: "np.ndarray",
     step_idx: int = 0,
@@ -1085,7 +1042,7 @@ async def send_sampler_output(
         # )
 
         # Compose a name for the tensor message
-        tensor_name = f"{request_id}_step{step_idx}_sampler_output"
+        tensor_name = f"{batch_id}_step{step_idx}_sampler_output"
 
         await tensor_transport.send(
             next_peer_ticket, name=tensor_name, tensor=sampler_output_bytes
@@ -1095,6 +1052,4 @@ async def send_sampler_output(
         #     f"📤 Sent sampler_output for {request_id} step {step_idx} to {next_peer_id[:8]}..."
         # )
     except Exception as e:
-        print(
-            f"❌ Failed to send sampler output for {request_id} to {next_peer_id}: {e}"
-        )
+        print(f"❌ Failed to send sampler output for {batch_id} to {next_peer_id}: {e}")
