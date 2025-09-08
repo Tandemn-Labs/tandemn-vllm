@@ -6,6 +6,7 @@ from transformers import PretrainedConfig
 
 from .base import WeightLoadingAdapter
 from .llama import LlamaWeightLoadingAdapter
+from .mixtral_moe import MixtralMoEWeightLoadingAdapter
 from .qwen import QwenWeightLoadingAdapter
 
 # from .mistral import MistralWeightLoadingAdapter
@@ -15,6 +16,7 @@ _ADAPTER_REGISTRY: Dict[str, Type[WeightLoadingAdapter]] = {
     "mistral": LlamaWeightLoadingAdapter,
     "qwen3": QwenWeightLoadingAdapter,  # Add Qwen3 support
     "qwen2": QwenWeightLoadingAdapter,  # Also support Qwen2
+    "mixtral": MixtralMoEWeightLoadingAdapter,
 }
 
 
@@ -26,6 +28,10 @@ def get_adapter_for_config(config: PretrainedConfig):
         from .qwen import QwenWeightLoadingAdapter
 
         return QwenWeightLoadingAdapter
+    elif "mixtral" in model_type:
+        from .mixtral_moe import MixtralMoEWeightLoadingAdapter
+
+        return MixtralMoEWeightLoadingAdapter
     elif "llama" in model_type or "mistral" in model_type:
         from .llama import LlamaWeightLoadingAdapter
 
