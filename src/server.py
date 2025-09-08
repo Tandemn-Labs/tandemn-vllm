@@ -1294,6 +1294,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     n: Optional[int] = 1
     eos_token_id: Optional[List[int]] = None
+    stop: Optional[List[str]] = None
 
 
 def build_sampling_params(request: ChatCompletionRequest):
@@ -1318,7 +1319,11 @@ def build_sampling_params(request: ChatCompletionRequest):
     if request.presence_penalty:
         sampling_params["presence_penalty"] = request.presence_penalty
     if request.eos_token_id:
-        sampling_params["eos_token_id"] = request.eos_token_id
+        sampling_params["stop_token_ids"] = (
+            request.eos_token_id
+        )  # vllm does not support eos_token_id so we use stop_token_ids
+    if request.stop:
+        sampling_params["stop"] = request.stop
     # hardcode n =1
     sampling_params["n"] = 1
     return sampling_params
