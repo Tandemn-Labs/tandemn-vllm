@@ -7,6 +7,7 @@ from transformers import PretrainedConfig
 from .base import ShardingAdapter
 from .llama import LlamaShardingAdapter
 from .mistral import MistralShardingAdapter
+from .mixtral_moe import MixtralMoEShardingAdapter
 from .phi4 import Phi4ShardingAdapter
 from .qwen import QwenShardingAdapter
 
@@ -17,6 +18,7 @@ _ADAPTER_REGISTRY: Dict[str, Type[ShardingAdapter]] = {
     "qwen2": QwenShardingAdapter,
     "qwen3": QwenShardingAdapter,
     "mistral": MistralShardingAdapter,
+    "mixtral": MixtralMoEShardingAdapter,
     "phi3": Phi4ShardingAdapter,  # Phi-4 uses phi3 model_type
     "phi4": Phi4ShardingAdapter,  # Also register as phi4 for future models
 }
