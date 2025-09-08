@@ -314,9 +314,9 @@ async def handle_inference_data_message(name: str, tensor):
             residual = combined_tensor[1]
             positions = combined_tensor[2]
 
-            print(
-                f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
-            )
+            # print(
+            #     f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
+            # )
 
             # # Unstack the combined tensor
             # if tensor.shape[0] != 2:
@@ -338,9 +338,9 @@ async def handle_inference_data_message(name: str, tensor):
                 )
                 INFERENCE_CONTEXT[request_id][str(step_idx)]["residual"] = residual
                 INFERENCE_CONTEXT[request_id][str(step_idx)]["positions"] = positions
-                print(
-                    f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
-                )
+                # print(
+                #     f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
+                # )
 
                 # wake anybody waiting for this step's payload
                 event = STEP_EVENTS[request_id].setdefault(step_idx, threading.Event())

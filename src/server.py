@@ -1035,9 +1035,6 @@ async def deployment_complete(data: DeploymentCompleteData):
     print(
         f"🔍 [DEBUG] Deployment complete received for model {data.model_name} from peer {data.peer_id}"
     )
-    print(
-        f"🔍 [DEBUG] Deployment complete received for model {data.model_name} from peer {data.peer_id}"
-    )
     if data.model_name not in active_deployments:
         raise HTTPException(404, f"No deployment found for model {data.model_name}")
 
@@ -1095,7 +1092,7 @@ async def completion(completion: CompletionData):
         )
 
         # Process each request
-        req_ids = inference_state["request_id"]
+        req_ids = inference_state["inflight"]
         for req_id in req_ids:
             active_requests[req_id]["complete"] = True
             active_requests[req_id]["event"].set()
@@ -1172,6 +1169,7 @@ async def send_batch(batch_id: str, model_name: str, queue: List[Request]):
         "status": "batch submitted",
         "model_name": model_name,
         "request_id": req_ids,
+        "inflight": req_ids,
         "started_at": time.time(),
         "result": None,
     }
@@ -1219,7 +1217,7 @@ async def send_batch(batch_id: str, model_name: str, queue: List[Request]):
 
 class StreamingRequest(BaseModel):
     batch_id: str
-    tokens: List[str]
+    tokens: List[str | None]
 
 
 @app.post("/streaming")
@@ -1227,21 +1225,33 @@ async def streaming(request: StreamingRequest):
     global active_inferences, active_requests
 
     try:
-        req_ids = active_inferences[request.batch_id]["request_id"]
+        req_ids = active_inferences[request.batch_id]["inflight"]
 
         # print(
         #     f"/streaming - request.tokens: {request.tokens}, len(req_ids): {len(req_ids)}"
         # )
 
         if len(request.tokens) != len(req_ids):
-            raise ValueError("Length of received tokens =/= Number of reqs in batch")
+            raise ValueError(
+                "Length of received tokens =/= Number of reqs inflight in batch"
+            )
 
+        # Update token lists or delete inflight if requests is done
+        to_remove = []
         for i in range(len(req_ids)):
-            active_requests[req_ids[i]]["tokens"].append(request.tokens[i])
-            event = active_requests[req_ids[i]]["event"]
-            event.set()
+            token = request.tokens[i]
+            if token is not None:
+                active_requests[req_ids[i]]["tokens"].append(token)
+            else:
+                active_requests[req_ids[i]]["complete"] = True
+                to_remove.append(i)
+            active_requests[req_ids[i]]["event"].set()
 
-        # print(f"/streaming - {active_requests}")
+        # Remove requests that are done
+        for i in reversed(to_remove):
+            del req_ids[i]
+
+        # print(f"/streaming - {req_ids}")
 
     except Exception as e:
         print(f"Exception in /streaming endpoint: {type(e).__name__}: {e}")
@@ -1355,7 +1365,7 @@ async def stream_token_response(request_id: str, model_name: str):
             "object": "chat.completion.chunk",
             "created": time.time(),
             "model": model_name,
-            "choices": [{"index": 0, "delta": {"content": "first chunk"}}],
+            "choices": [{"index": 0, "delta": {"content": ""}}],
         }
         yield sse_pack(init_chunk)
 

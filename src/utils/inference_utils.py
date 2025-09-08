@@ -553,23 +553,31 @@ def register_inference_hooks(
             else:
                 # Assume MistralTokenizer - decode individually
                 tokens_str = [
-                    tokenizer.decode(token_list) if token_list else ""
-                    for token_list in token_numbers
+                    tokenizer.decode(token_list) for token_list in token_numbers
                 ]
 
             # Fill in empty string for requests that completed
-            i = 0
             tokens_return = []
-            for id in parent_seq_id:
-                if i < len(curr_seq) and curr_seq[i] == id:
-                    tokens_return.append(tokens_str[i])
-                    i += 1
+            curr_i = 0
+            to_remove = []  # indexes
+            for i in range(len(parent_seq_id)):
+                # Current id still inferencing
+                if curr_i < len(curr_seq) and curr_seq[curr_i] == parent_seq_id[i]:
+                    tokens_return.append(tokens_str[curr_i])
+                    curr_i += 1
+                # Current id already stopped inferencing
                 else:
-                    tokens_return.append("")
-            # print(
-            #     f"sampler_post_hook - parent_seq_id: {parent_seq_id}, curr_seq: {curr_seq}, tokens_return: {tokens_return}"
-            # )
-            # print(f"sampler-post-hook - tokens_str {tokens_str}")
+                    to_remove.append(i)
+                    tokens_return.append(None)
+
+            # Now remove the sequences that are complete
+            for i in reversed(to_remove):
+                del parent_seq_id[i]
+
+            print(
+                f"sampler_post_hook - parent_seq_id: {parent_seq_id}, curr_seq: {curr_seq}, tokens_return: {tokens_return}"
+            )
+            print(f"sampler-post-hook - tokens_str {tokens_str}")
             asyncio.run_coroutine_threadsafe(
                 stream_token_to_server(
                     batch_id=batch_id, tokens=tokens_return, server_url=server_url
