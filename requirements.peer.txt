@@ -33,3 +33,4 @@ infinistore==0.2.35
 redis==6.4.0
 pybind11
 nvtx==0.2.13
+mistral-common>=1.7.0
