@@ -1,17 +1,20 @@
 import asyncio
+import json
 import os
 import pickle
 import socket
 import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import httpx
+import numpy as np
 from colorama import Fore, Style
 from colorama import init as colorama_init
 from lmcache.experimental.cache_engine import LMCacheEngineBuilder
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from transformers import AutoTokenizer
+from vllm import SamplingParams
 
 import src.utils.req_batcher as req_batcher
 
@@ -34,6 +37,7 @@ from src.utils.message_processing import (
     extract_request_metadata,
     log_message_received,
     parse_deployment_message,
+    parse_dispatch_message,
     parse_inference_trigger_message,
     parse_json_from_tensor,
     parse_request_message,
@@ -53,6 +57,7 @@ print(
 # Global TensorTransport instance (lazy-started in main) #######################
 tensor_transport: TensorTransport | None = None
 deployed_model = None  # this is the global variable for the deployed model
+# ?
 peer_ticket_map: dict[
     str, str
 ] = {}  # peer_id  → ticket string (filled in heartbeat) #? Check if hostnames are being set even
@@ -77,6 +82,11 @@ PEER_COLOR = COLORS[
 # Batcher for this peer only if first peer
 batcher = None
 MAX_TIME_PER_BATCH = 1  # Max time we want to wait to fill up batches (in seconds)
+pipeline = None
+
+
+request_metadata = {}  # Maps request-id to dictionary of metadata
+batch_metadata = {}  # Maps batch_id to metadata
 
 # ============================================================================
 # UNIFIED MESSAGE GATEWAY - SINGLE POINT FOR ALL TENSOR TRANSPORT MESSAGES
@@ -95,7 +105,8 @@ async def unified_message_gateway():
     while True:
         try:
             # Single point of message reception
-            msg = await tensor_transport.recv()
+            task = asyncio.create_task(tensor_transport.recv())
+            msg = await task
             if msg is None:
                 await asyncio.sleep(0)
                 continue
@@ -143,6 +154,10 @@ async def unified_message_gateway():
                 elif name.lower() == "request":
                     await handle_request_message(tensor)
 
+                # 6. Receive batch information
+                elif name.lower() == "dispatch":
+                    handle_dispatch_message(tensor)
+
                 # 4. UNKNOWN MESSAGE TYPE
                 else:
                     print(
@@ -166,6 +181,7 @@ async def unified_message_gateway():
 
 async def handle_deployment_message(tensor):
     """Handle deployment instruction messages"""
+
     try:
         # Parse deployment message using utility function
         instruction = parse_deployment_message(tensor)
@@ -253,10 +269,11 @@ async def handle_inference_trigger_message(tensor):
             _ = trigger.get("assigned_layers", {})
 
             print("�� Starting inference run in background thread...")
-            print(
-                f"Thread - {threading.current_thread().name}, {threading.current_thread().ident}"
-            )
-            print(f"asyncio loop - {id(loop)}, {loop}")
+
+            # print(
+            #     f"THREAD - {threading.current_thread().name}, {threading.current_thread().ident}"
+            # )
+            # print(f"LOOP - {id(loop)}, {loop}")
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,
@@ -386,25 +403,71 @@ async def handle_request_message(tensor):
     try:
         req = parse_request_message(tensor)
 
-        # Initialize batcher
-        if batcher is None:
-            batcher = req_batcher.Batcher(
-                model_name=req["model"],
-                max_req=req["max_batch_size"],
-                max_time=MAX_TIME_PER_BATCH,
-                process_req_fn=None,  # TODO: CHANGE THIS!!!
-            )
+        request_metadata[req["request_id"]] = {
+            "prompt": req["prompt"],
+            "sampling_params": req["sampling_params"],
+        }
+        print(f"handle_request_message - req: {req}")
 
-        # Add request to batcher
-        await asyncio.create_task(
-            batcher.add(
-                req_batcher.Request(
-                    id=req["request_id"],
-                    prompt=req["prompt"],
+        index = pipeline.index(current_peer_ticket)
+
+        # If first peer, queue and batch incoming requests
+        # If not first, store requests, but not in charge of batching
+        if index == 0:
+            # Initialize batcher
+            if batcher is None:
+                print("handle_request_message() index == 0, batcher is None")
+                print(
+                    f"THREAD - {threading.current_thread().name}, {threading.current_thread().ident}"
+                )
+                loop = asyncio.get_running_loop()
+                print(f"asyncio loop - {id(loop)}, {loop}")
+                batcher = req_batcher.Batcher(
                     model_name=req["model"],
-                    sampling_params=req["sampling_params"],
+                    max_req=req["max_batch_size"],
+                    max_time=MAX_TIME_PER_BATCH,
+                    process_req_fn=dispatch_batch,
+                )
+
+            # Add request to batcher
+            await asyncio.create_task(
+                batcher.add(
+                    req_batcher.Request(
+                        id=req["request_id"],
+                        prompt=req["prompt"],
+                        model_name=req["model"],
+                        sampling_params=req["sampling_params"],
+                    )
                 )
             )
+
+    except Exception:
+        raise
+
+
+def handle_dispatch_message(tensor):
+    global request_metadata, batch_metadata, batcher
+
+    try:
+        msg = parse_dispatch_message(tensor)
+        batch_id = msg["batch_id"]
+        request_ids = msg["request_id"]
+        print(f"handle_dispatch_message - batch: {batch_id}, reqs: {request_ids}")
+
+        batch_metadata[batch_id] = {"request_id": request_ids}
+
+        loop = asyncio.get_running_loop()
+        _ = loop.run_in_executor(
+            None,
+            start_inference_run,
+            batch_id,
+            pipeline,
+            [request_metadata[req]["prompt"] for req in request_ids],
+            [
+                SamplingParams(**request_metadata[req]["sampling_params"])
+                for req in request_ids
+            ],
+            batcher,
         )
 
     except Exception:
@@ -415,7 +478,7 @@ async def handle_unknown_message(name: str, tensor):
     """Handle unknown message types by attempting to parse as JSON"""
     try:
         # Parse message using utility function
-        parsed = parse_json_from_tensor(tensor, "unknown")
+        parsed = parse_json_from_tensor(tensor)
         if not parsed:
             print(f"❌ Could not parse unknown message '{name}'")
             return
@@ -425,6 +488,48 @@ async def handle_unknown_message(name: str, tensor):
 
     except Exception as e:
         print(f"❌ Error handling unknown message '{name}': {e}")
+
+
+# Create batch in a separate thread
+# Inform downstream peers of new batch
+async def dispatch_batch(
+    batch_id: str, model_name: str, queue: List[req_batcher.Request]
+):
+    global start_inference_run, pipeline, batch_metadata, tensor_transport, batcher
+
+    try:
+        request_ids = [req.id for req in queue]
+        batch_metadata[batch_id] = {"request_id": request_ids}
+
+        payload = {"batch_id": batch_id, "request_id": request_ids}
+        payload = json.dumps(payload).encode()
+        payload = np.frombuffer(payload, dtype=np.uint8)
+
+        # TODO: send start to everyone in pipeline
+        tasks = []
+        for peer_ticket in pipeline[1:]:
+            tasks.append(
+                asyncio.create_task(
+                    tensor_transport.send(peer_ticket, "dispatch", payload)
+                )
+            )
+
+        loop = asyncio.get_running_loop()
+        _ = loop.run_in_executor(
+            None,
+            start_inference_run,
+            batch_id,
+            pipeline,
+            [req.prompt for req in queue],
+            [SamplingParams(**req.sampling_params) for req in queue],
+            batcher,
+        )
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        print(results)
+
+    except:
+        raise
 
 
 # ============================================================================
@@ -439,7 +544,12 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
     This is now a simplified orchestrator that uses the specialized functions
     from deployment_utils.py for actual implementation.
     """
-    global deployed_model, deployment_status, start_inference_run, tensor_transport
+    global \
+        deployed_model, \
+        deployment_status, \
+        start_inference_run, \
+        tensor_transport, \
+        pipeline
 
     model_name = instructions.get("model_name", "unknown")
 
