@@ -12,7 +12,7 @@ from .base import WeightLoadingAdapter
 
 
 class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
-    """Weight loading adapter for Mixtral MoE models with AWQ support."""
+    """Weight loading adapter for Mixtral MoE models with vLLM internal format."""
 
     def __init__(
         self,
@@ -36,6 +36,7 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
         print(
             f"🏗️ Mixtral MoE Weight Loader: {self.num_local_experts} experts, {self.num_experts_per_tok} per token"
         )
+        print("🏗️ Loading weights in vLLM internal format (w13_weight, w2_weight)")
 
     def _is_awq(self, config: PretrainedConfig) -> bool:
         """Check if model uses AWQ quantization."""
@@ -50,27 +51,21 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
             with safe_open(str(path), framework="pt", device="cpu") as f:
                 for key in f.keys():
                     self.all_weights[key] = f.get_tensor(key)
-                    # Log MoE-specific weights as they're loaded
+                    # Log vLLM internal MoE weights as they're loaded
                     if "block_sparse_moe" in key:
                         if "gate.weight" in key:
                             print(
                                 f"✅ Loaded MoE gate: {key} (shape: {self.all_weights[key].shape})"
                             )
-                        elif "experts." in key and "gate_up_proj" in key:
-                            expert_idx = self._extract_expert_idx(key)
-                            print(f"✅ Loaded expert {expert_idx} gate_up_proj: {key}")
+                        elif "experts.w13" in key:
+                            print(
+                                f"✅ Loaded fused gate+up: {key} (shape: {self.all_weights[key].shape})"
+                            )
+                        elif "experts.w2" in key:
+                            print(
+                                f"✅ Loaded down proj: {key} (shape: {self.all_weights[key].shape})"
+                            )
         return self.all_weights
-
-    def _extract_expert_idx(self, key: str) -> int:
-        """Extract expert index from a weight key."""
-        try:
-            parts = key.split(".")
-            for i, part in enumerate(parts):
-                if part == "experts" and i + 1 < len(parts):
-                    return int(parts[i + 1])
-        except (ValueError, IndexError):
-            pass
-        return -1
 
     def load_embedding(self, embedding_path):
         """Load embedding weights into the model."""
@@ -134,7 +129,7 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
         return self.all_weights
 
     def load_layer_weights(self, layer_idx, layer_path):
-        """Load layer weights with MoE-specific verification."""
+        """Load layer weights with vLLM internal format verification."""
         if layer_path.exists():
             weights_before = len(self.all_weights)
             self.all_weights.update(self.load_safetensors_file(layer_path))
@@ -149,7 +144,7 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
         return self.all_weights
 
     def _verify_moe_layer_weights(self, layer_idx: int):
-        """Verify that MoE layer weights are properly loaded."""
+        """Verify that MoE layer weights match vLLM internal format."""
         layer_prefix = f"model.layers.{layer_idx}"
 
         # Check attention weights
@@ -168,31 +163,25 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
                     f"   Layer {layer_idx}: Found fused QKV projections ({len(qkv_keys)} tensors)"
                 )
 
-        # Check MoE weights
+        # Check MoE weights - looking for vLLM internal format
         moe_prefix = f"{layer_prefix}.block_sparse_moe"
         moe_keys = [k for k in self.all_weights.keys() if k.startswith(moe_prefix)]
 
         if moe_keys:
             print(f"   Layer {layer_idx}: {len(moe_keys)} MoE weights")
 
-            # Count experts
-            expert_count = 0
-            for expert_idx in range(self.num_local_experts):
-                expert_prefix = f"{moe_prefix}.experts.{expert_idx}"
-                expert_keys = [k for k in moe_keys if k.startswith(expert_prefix)]
-                if expert_keys:
-                    expert_count += 1
+            # Check for vLLM internal format
+            w13_keys = [k for k in moe_keys if "experts.w13" in k]
+            w2_keys = [k for k in moe_keys if "experts.w2" in k]
 
-                    # Check for fused gate_up_proj
-                    gate_up_keys = [k for k in expert_keys if "gate_up_proj" in k]
-                    if gate_up_keys:
-                        print(
-                            f"   Expert {expert_idx}: Found fused gate_up_proj ({len(gate_up_keys)} tensors)"
-                        )
-
-            print(
-                f"   Layer {layer_idx}: Found {expert_count}/{self.num_local_experts} experts"
-            )
+            if w13_keys:
+                print(
+                    f"   Layer {layer_idx}: Found w13 (gate+up) weights ({len(w13_keys)} tensors)"
+                )
+            if w2_keys:
+                print(
+                    f"   Layer {layer_idx}: Found w2 (down) weights ({len(w2_keys)} tensors)"
+                )
 
             # Check MoE gate
             gate_key = f"{moe_prefix}.gate.weight"

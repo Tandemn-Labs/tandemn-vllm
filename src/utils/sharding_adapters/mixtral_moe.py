@@ -17,11 +17,9 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
     - AWQ INT4 quantization
     - Standard multi-head attention (not MLA)
 
-    Mixtral Architecture Overview:
-    - 8 experts per layer (num_local_experts: 8)
-    - 2 experts activated per token (num_experts_per_tok: 2)
-    - Uses block_sparse_moe.experts.{0-7}.w{1,2,3} structure
-    - w1=gate_proj, w2=down_proj, w3=up_proj
+    CRITICAL: vLLM's FusedMoE layer expects these exact internal names:
+    - experts.w13_weight (fused gate+up projection)
+    - experts.w2_weight (down projection)
     """
 
     def __init__(self, config: PretrainedConfig) -> None:
@@ -32,7 +30,7 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
         self.is_awq = self._is_awq(config)
         if self.is_awq:
             print(
-                "🔧 Mixtral MoE: AWQ quantization detected - using AWQ-specific fusion (dim=1)"
+                "🔧 Mixtral MoE: AWQ quantization detected - creating vLLM internal parameter names"
             )
 
         # MoE configuration
@@ -44,6 +42,7 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
         print(
             f"   • MoE: {self.num_local_experts} experts, {self.num_experts_per_tok} per token"
         )
+        print("   • Weight format: vLLM internal (w13_weight, w2_weight)")
 
     def _is_awq(self, config: PretrainedConfig) -> bool:
         """Check if model uses AWQ quantization."""
@@ -80,7 +79,7 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
     ) -> LayerShard:
         """
         Shard a single Mixtral MoE transformer layer.
-        Handles both attention and MoE components.
+        Creates vLLM internal parameter structure.
         """
         p = f"model.layers.{layer_idx}"
         out: Dict[str, torch.Tensor] = {}
@@ -105,11 +104,10 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
         hf_weights: Dict[str, torch.Tensor],
         out: Dict[str, torch.Tensor],
     ) -> None:
-        """Shard standard multi-head attention weights (same as Mistral)."""
+        """Shard attention weights with QKV fusion for vLLM."""
 
         if self.is_awq:
-            # AWQ quantized attention
-            # Fuse Q, K, V projections
+            # AWQ quantized attention - fuse QKV
             q_qw = f"{prefix}.self_attn.q_proj.qweight"
             k_qw = f"{prefix}.self_attn.k_proj.qweight"
             v_qw = f"{prefix}.self_attn.v_proj.qweight"
@@ -145,7 +143,7 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
                     hf_weights[v_sc],
                 )
 
-            # Output projection
+            # Output projection (no fusion)
             o_qw = f"{prefix}.self_attn.o_proj.qweight"
             o_qz = f"{prefix}.self_attn.o_proj.qzeros"
             o_sc = f"{prefix}.self_attn.o_proj.scales"
@@ -158,8 +156,7 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
                 out[o_sc] = hf_weights[o_sc].detach().cpu()
 
         else:
-            # Float attention weights
-            # Fuse Q, K, V projections
+            # Float attention weights - fuse QKV
             q_key = f"{prefix}.self_attn.q_proj.weight"
             k_key = f"{prefix}.self_attn.k_proj.weight"
             v_key = f"{prefix}.self_attn.v_proj.weight"
@@ -171,7 +168,7 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
                     hf_weights[v_key],
                 )
 
-            # Output projection
+            # Output projection (no fusion)
             o_key = f"{prefix}.self_attn.o_proj.weight"
             if o_key in hf_weights:
                 out[o_key] = hf_weights[o_key].detach().cpu()
@@ -182,13 +179,7 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
         hf_weights: Dict[str, torch.Tensor],
         out: Dict[str, torch.Tensor],
     ) -> None:
-        """Shard Mixtral MoE weights with block_sparse_moe structure."""
-
-        # === MoE EXPERTS ===
-        expert_count = 0
-        for expert_idx in range(self.num_local_experts):
-            if self._shard_single_expert(prefix, expert_idx, hf_weights, out):
-                expert_count += 1
+        """Shard Mixtral MoE weights into vLLM FusedMoE format."""
 
         # === MoE GATE ===
         gate_key = f"{prefix}.block_sparse_moe.gate.weight"
@@ -196,79 +187,116 @@ class MixtralMoEShardingAdapter(ShardingAdapter):
             out[gate_key] = hf_weights[gate_key].detach().cpu()
             print(f"✅ Sharded MoE gate: {hf_weights[gate_key].shape}")
 
-        print(f"   • Sharded {expert_count}/{self.num_local_experts} experts")
+        # === MoE EXPERTS - Create vLLM internal format ===
+        self._create_fused_expert_weights(prefix, hf_weights, out)
 
-    def _shard_single_expert(
+    def _create_fused_expert_weights(
         self,
         prefix: str,
-        expert_idx: int,
         hf_weights: Dict[str, torch.Tensor],
         out: Dict[str, torch.Tensor],
-    ) -> bool:
-        """
-        Shard a single Mixtral MoE expert.
-        Maps: w1=gate_proj, w2=down_proj, w3=up_proj
-        """
-        expert_prefix = f"{prefix}.block_sparse_moe.experts.{expert_idx}"
-        found_expert = False
+    ) -> None:
+        """Create vLLM FusedMoE internal weight structure."""
 
         if self.is_awq:
-            # AWQ quantized expert weights
-            quant_suffixes = [".qweight", ".qzeros", ".scales"]
-
-            for suffix in quant_suffixes:
-                # Mixtral naming: w1=gate_proj, w2=down_proj, w3=up_proj
-                w1_key = f"{expert_prefix}.w1{suffix}"  # gate_proj
-                w2_key = f"{expert_prefix}.w2{suffix}"  # down_proj
-                w3_key = f"{expert_prefix}.w3{suffix}"  # up_proj
-
-                # Convert to vLLM expert naming and fuse gate_up_proj
-                if w1_key in hf_weights and w3_key in hf_weights:
-                    # Fuse w1 (gate) + w3 (up) -> gate_up_proj
-                    vllm_expert_prefix = (
-                        f"{prefix}.block_sparse_moe.experts.{expert_idx}"
-                    )
-                    out[f"{vllm_expert_prefix}.gate_up_proj{suffix}"] = self._cat_cols(
-                        hf_weights[w1_key],  # w1 = gate_proj
-                        hf_weights[w3_key],  # w3 = up_proj
-                    )
-                    found_expert = True
-
-                if w2_key in hf_weights:
-                    # w2 -> down_proj (no fusion needed)
-                    vllm_expert_prefix = (
-                        f"{prefix}.block_sparse_moe.experts.{expert_idx}"
-                    )
-                    out[f"{vllm_expert_prefix}.down_proj{suffix}"] = (
-                        hf_weights[w2_key].detach().cpu()
-                    )
-                    found_expert = True
-
+            # AWQ: Collect all expert weights by type
+            self._create_awq_fused_weights(prefix, hf_weights, out)
         else:
-            # Float expert weights
-            w1_key = f"{expert_prefix}.w1.weight"  # gate_proj
-            w2_key = f"{expert_prefix}.w2.weight"  # down_proj
-            w3_key = f"{expert_prefix}.w3.weight"  # up_proj
+            # Float: Collect all expert weights by type
+            self._create_float_fused_weights(prefix, hf_weights, out)
 
-            # Convert to vLLM expert naming and fuse gate_up_proj
-            if w1_key in hf_weights and w3_key in hf_weights:
-                # Fuse w1 (gate) + w3 (up) -> gate_up_proj
-                vllm_expert_prefix = f"{prefix}.block_sparse_moe.experts.{expert_idx}"
-                out[f"{vllm_expert_prefix}.gate_up_proj.weight"] = self._cat_rows(
-                    hf_weights[w1_key],  # w1 = gate_proj
-                    hf_weights[w3_key],  # w3 = up_proj
-                )
-                found_expert = True
+    def _create_awq_fused_weights(
+        self,
+        prefix: str,
+        hf_weights: Dict[str, torch.Tensor],
+        out: Dict[str, torch.Tensor],
+    ) -> None:
+        """Create AWQ quantized fused expert weights."""
 
+        quant_suffixes = [".qweight", ".qzeros", ".scales"]
+
+        for suffix in quant_suffixes:
+            # Collect w1 (gate) and w3 (up) from all experts → w13_weight
+            w1_tensors = []
+            w3_tensors = []
+            w2_tensors = []
+
+            for expert_idx in range(self.num_local_experts):
+                expert_prefix = f"{prefix}.block_sparse_moe.experts.{expert_idx}"
+
+                w1_key = f"{expert_prefix}.w1{suffix}"
+                w2_key = f"{expert_prefix}.w2{suffix}"
+                w3_key = f"{expert_prefix}.w3{suffix}"
+
+                if w1_key in hf_weights:
+                    w1_tensors.append(hf_weights[w1_key])
+                if w2_key in hf_weights:
+                    w2_tensors.append(hf_weights[w2_key])
+                if w3_key in hf_weights:
+                    w3_tensors.append(hf_weights[w3_key])
+
+            # Create fused weights if we have data
+            if w1_tensors and w3_tensors:
+                # Stack experts along dim 0, then concat w1+w3 along dim 1
+                w1_stacked = torch.stack(w1_tensors, dim=0)  # [num_experts, ...]
+                w3_stacked = torch.stack(w3_tensors, dim=0)  # [num_experts, ...]
+                w13_fused = self._cat_cols(w1_stacked, w3_stacked)  # Concat gate+up
+
+                out[f"{prefix}.block_sparse_moe.experts.w13{suffix}"] = w13_fused
+                print(f"✅ Created w13{suffix}: {w13_fused.shape}")
+
+            if w2_tensors:
+                # Stack experts along dim 0
+                w2_stacked = torch.stack(w2_tensors, dim=0)  # [num_experts, ...]
+
+                out[f"{prefix}.block_sparse_moe.experts.w2{suffix}"] = w2_stacked
+                print(f"✅ Created w2{suffix}: {w2_stacked.shape}")
+
+    def _create_float_fused_weights(
+        self,
+        prefix: str,
+        hf_weights: Dict[str, torch.Tensor],
+        out: Dict[str, torch.Tensor],
+    ) -> None:
+        """Create float fused expert weights."""
+
+        # Collect w1 (gate) and w3 (up) from all experts → w13_weight
+        w1_tensors = []
+        w3_tensors = []
+        w2_tensors = []
+
+        for expert_idx in range(self.num_local_experts):
+            expert_prefix = f"{prefix}.block_sparse_moe.experts.{expert_idx}"
+
+            w1_key = f"{expert_prefix}.w1.weight"
+            w2_key = f"{expert_prefix}.w2.weight"
+            w3_key = f"{expert_prefix}.w3.weight"
+
+            if w1_key in hf_weights:
+                w1_tensors.append(hf_weights[w1_key])
             if w2_key in hf_weights:
-                # w2 -> down_proj (no fusion needed)
-                vllm_expert_prefix = f"{prefix}.block_sparse_moe.experts.{expert_idx}"
-                out[f"{vllm_expert_prefix}.down_proj.weight"] = (
-                    hf_weights[w2_key].detach().cpu()
-                )
-                found_expert = True
+                w2_tensors.append(hf_weights[w2_key])
+            if w3_key in hf_weights:
+                w3_tensors.append(hf_weights[w3_key])
 
-        return found_expert
+        # Create fused weights if we have data
+        if w1_tensors and w3_tensors:
+            # Stack experts along dim 0, then concat w1+w3 along dim 0 (rows)
+            w1_stacked = torch.stack(w1_tensors, dim=0)  # [num_experts, ...]
+            w3_stacked = torch.stack(w3_tensors, dim=0)  # [num_experts, ...]
+            w13_fused = self._cat_rows(
+                w1_stacked, w3_stacked
+            )  # Concat gate+up along feature dim
+
+            out[f"{prefix}.block_sparse_moe.experts.w13_weight"] = w13_fused
+            print(f"✅ Created w13_weight: {w13_fused.shape}")
+
+        if w2_tensors:
+            # Stack experts along dim 0
+            w2_stacked = torch.stack(w2_tensors, dim=0)  # [num_experts, ...]
+
+            out[f"{prefix}.block_sparse_moe.experts.w2_weight"] = w2_stacked
+            print(f"✅ Created w2_weight: {w2_stacked.shape}")
 
     def _shard_layer_norms(
         self,
