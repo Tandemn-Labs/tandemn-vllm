@@ -1263,14 +1263,25 @@ async def streaming(request: StreamingRequest):
 # Helper function to generate a large string prompt from messages object passed in OpenAI API
 def collect_messages(messages: List[Dict]):
     # Only keeps 'user', 'assistant', 'developer', 'system' messages
-    role_whitelist = ["user", "assistant", "developer", "system"]
+    # role_whitelist = ["user", "assistant", "developer", "system"]
 
-    to_return = ""
-    for msg in messages:
-        if msg["role"] in role_whitelist:
-            to_return += msg["content"] + " "
+    # to_return = ""
+    # for msg in messages:
+    # if msg["role"] in role_whitelist:
+    # to_return += msg["content"] + " "
+    normalized = []
+    for m in messages:
+        role = m.get("role", "").strip().lower()
+        content = m.get("content", "")
 
-    return to_return
+        if role == "developer":
+            role = "system"
+        if role in ("system", "assistant", "user", "tool"):
+            normalized.append({"role": role, "content": content})
+        else:
+            print(f"❌ Skipping message with role: {role}")
+    return normalized
+    # return to_return
 
 
 class ChatCompletionRequest(BaseModel):

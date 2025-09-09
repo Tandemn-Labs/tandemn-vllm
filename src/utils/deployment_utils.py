@@ -633,10 +633,10 @@ def create_dynamic_vllm_model(
 
     # Apply the monkey patch
     import vllm.model_executor.models.utils as model_utils
+    from vllm.config import KVTransferConfig
 
     original_make_layers = model_utils.make_layers
     model_utils.make_layers = _selective_make_layers
-    from vllm.config import KVTransferConfig
 
     ktc = KVTransferConfig(
         kv_connector="LMCacheConnector",  # v0 connector
@@ -653,6 +653,8 @@ def create_dynamic_vllm_model(
         args = {
             "model": model_dir,
             "tensor_parallel_size": 1,
+            "tokenizer": model_dir,
+            "trust_remote_code": True,
             "enforce_eager": True,
             "disable_log_stats": True,
             "gpu_memory_utilization": 0.9,
@@ -885,16 +887,15 @@ def create_async_vllm_engine_with_selective_layers(
     """
 
     # Import vLLM lazily to avoid forcing it on the central server process
-    from vllm.config import KVTransferConfig
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.engine.async_llm_engine import AsyncLLMEngine  # v0 async engine
     from vllm.usage.usage_lib import UsageContext
 
-    ktc = KVTransferConfig(
-        kv_connector="LMCacheConnector",  # v0 connector
-        kv_role="kv_both",  # single process does store+retrieve
-        # For multi-process prefill/decode, use kv_producer/kv_consumer below
-    )
+    # ktc = KVTransferConfig(
+    #     kv_connector="LMCacheConnector",  # v0 connector
+    #     kv_role="kv_both",  # single process does store+retrieve
+    #     # For multi-process prefill/decode, use kv_producer/kv_consumer below
+    # )
 
     # STEP 1: Monkey-patch make_layers so only assigned layers are real.
     def _selective_make_layers(num_hidden_layers: int, layer_fn, prefix: str):
@@ -943,6 +944,7 @@ def create_async_vllm_engine_with_selective_layers(
         # )
         engine_args = AsyncEngineArgs(
             model=model_dir,
+            tokenizer=model_dir,
             tensor_parallel_size=1,
             enforce_eager=True,
             load_format="dummy",
@@ -955,7 +957,7 @@ def create_async_vllm_engine_with_selective_layers(
             quantization=quantization,
             dtype=dtype or "float16",  # activations
             block_size=16,
-            kv_transfer_config=ktc,
+            # kv_transfer_config=ktc,
             enable_chunked_prefill=False,  # recommended for v0 + LMCache
             rope_scaling={  # Add RoPE scaling configuration
                 "rope_type": "llama3",
