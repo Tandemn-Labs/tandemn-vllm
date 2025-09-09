@@ -1,5 +1,4 @@
 import asyncio
-import threading
 import time
 import uuid
 from collections.abc import Coroutine
@@ -38,23 +37,18 @@ class Batcher:
     async def add(self, req: Request) -> None:
         async with self._attr_lock:
             self._queue.append((req, time.monotonic()))
+            print(f"batcher add() - len(queue): {len(self._queue())}")
             if len(self._queue) == 1:
                 self._start_time = time.monotonic()
 
-            print(f"batcher add() - len(queue): {len(self._queue)}")
-
             # If no inference going on
             if not self.busy:
-                print("batcher add() - not busy")
-                print(f"batcher add() - timer {self._timer_task}")
                 # First in queue, start timer
                 if len(self._queue) == 1:
-                    print("batcher add() - not busy - started timer")
                     self._timer_task = asyncio.create_task(self._timer_coro())
 
                 # Queue is now filled
                 elif len(self._queue) >= self.max_req:
-                    print("batcher add() - not busy - full send")
                     self.flush_req()
 
                 # Otherwise, just wait for timer or more requests
@@ -65,36 +59,23 @@ class Batcher:
     # Have to be super careful! This function is called from a different thread
     async def busy_clear(self):
         async with self._attr_lock:
-            print(
-                f"batcher busy_clear() - len: {len(self._queue)}, queue: {self._queue}"
-            )
-            print(
-                f"THREAD - {threading.current_thread().name}, {threading.current_thread().ident}"
-            )
-            print(f"LOOP - {id(self._loop)}, {self._loop}")
             self.busy = False
             # Send out batch if queue can fill out batch
             if len(self._queue) >= self.max_req:
-                print("batcher busy_clear() - full send")
                 self.flush_req()
             # If there is queue but not full, check if time is up (will instantly flush if time is up)
             elif len(self._queue):
-                print("batcher busy_clear() - no full, timer")
                 self._timer_task = asyncio.create_task(self._timer_coro())
-                print("batcher busy_clear() - post _timer_coro() creation")
-                print(asyncio.all_tasks())
             # If no queue, do nothing other than set busy flag to False
 
     # Wait till we hit timeout
     async def _timer_coro(self) -> None:
         try:
             diff = time.monotonic() - self._start_time
-            print(f"batcher _timer_coro() - diff: {diff}")
             if diff < self.max_time:
                 await asyncio.sleep(self.max_time - diff)
 
             async with self._attr_lock:
-                print("batcher _timer_coro() - Timer hit, flushing")
                 self.flush_req()
 
         except asyncio.CancelledError:
@@ -104,7 +85,6 @@ class Batcher:
 
     # This function is only called when lock is held
     def flush_req(self) -> None:
-        print(f"batcher flush_req() - timer task {self._timer_task}")
         if self._timer_task:
             self._timer_task.cancel()
             self._timer_task = None

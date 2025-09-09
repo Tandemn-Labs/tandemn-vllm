@@ -505,7 +505,7 @@ async def dispatch_batch(
         payload = json.dumps(payload).encode()
         payload = np.frombuffer(payload, dtype=np.uint8)
 
-        # TODO: send start to everyone in pipeline
+        # Send batch info to all peers in pipeline
         tasks = []
         for peer_ticket in pipeline[1:]:
             tasks.append(
@@ -513,6 +513,13 @@ async def dispatch_batch(
                     tensor_transport.send(peer_ticket, "dispatch", payload)
                 )
             )
+
+        # Send batch info to server
+        server_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
+        server_task = asyncio.create_task(
+            send_batch_info(batch_id, request_ids, server_url)
+        )
+        tasks.append(server_task)
 
         loop = asyncio.get_running_loop()
         _ = loop.run_in_executor(
@@ -530,6 +537,20 @@ async def dispatch_batch(
 
     except:
         raise
+
+
+async def send_batch_info(
+    batch_id: str, request_id: List[str], server_url: str = "http://{SERVER_IP}:8000"
+):
+    try:
+        payload = {"batch_id": batch_id, "request_id": request_id}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{server_url}/batch_info", json=payload)
+            response.raise_for_status()
+
+    except Exception as e:
+        print(f"[ERROR] send_batch_info - {e}")
 
 
 # ============================================================================

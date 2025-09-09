@@ -1054,9 +1054,7 @@ async def deployment_complete(data: DeploymentCompleteData):
         print(
             f"✅ Deployment for {data.model_name} is now READY, Max req / batch is {max_req}"
         )
-        active_deployments[data.model_name]["batcher"] = req_batcher.Batcher(
-            data.model_name, max_req, MAX_TIME_PER_BATCH, send_batch
-        )
+        active_deployments[data.model_name]["max_req_per_batch"] = max_req
 
     elif any(s == "failed" for s in status_map.values()):
         active_deployments[data.model_name]["status"] = "failed"
@@ -1335,7 +1333,6 @@ async def chat_completions(request: ChatCompletionRequest):
 
     global active_requests
 
-    # body = await request.json()
     model = request.model
     stream = request.stream
     messages = request.messages
@@ -1343,7 +1340,6 @@ async def chat_completions(request: ChatCompletionRequest):
 
     input_text = collect_messages(messages)
     sampling_params = build_sampling_params(request)
-    print(f"input-text: {input_text}")
 
     # 0. Check if model deployed or not
     if model not in active_deployments:
@@ -1377,15 +1373,23 @@ async def chat_completions(request: ChatCompletionRequest):
         "failed": False,
     }
 
-    req = req_batcher.Request(
-        id=request_id,
-        prompt=input_text,  # TODO: Change this,
-        model_name=model,
-        sampling_params=sampling_params,
-    )
+    max_batch = active_deployments[model]["max_req_per_batch"]
+    deployment_map = active_deployments[model]["deployment_map"]
+    pipeline = list(deployment_map.keys())
 
-    task = asyncio.create_task(active_deployments[model]["batcher"].add(req))
-    await task
+    payload = {
+        "request_id": request_id,
+        "prompt": input_text,
+        "model": model,
+        "sampling_params": sampling_params,
+        "max_batch_size": max_batch,
+    }
+    payload = json.dumps(payload).encode()
+    payload = np.frombuffer(payload, dtype=np.uint8)
+
+    # Don't wait for completion
+    for peer in pipeline:
+        asyncio.create_task(tensor_transport.send(peer, "request", payload))
 
     if not stream:
         pass  # work on stream first
@@ -1500,6 +1504,22 @@ async def batch_failed(request: BatchFailRequest):
     return
 
 
+class BatchInfoRequest(BaseModel):
+    batch_id: str
+    request_id: List[str]
+
+
+@app.post("/batch_info")
+async def batch_info(request: BatchInfoRequest):
+    active_inferences[request.batch_id] = {
+        "status": "inflight",
+        "request_id": request.request_id,
+        "inflight": request.request_id,
+        "started_at": time.time(),
+        "result": None,
+    }
+
+
 @app.post("/client_batch_test")
 async def client_batch_test(request: Request):
     body = await request.json()
@@ -1512,7 +1532,7 @@ async def client_batch_test(request: Request):
         "request_id": str(uuid.uuid4()),
         "prompt": prompt,
         "model": model_name,
-        "sampling_params": {"max_tokens": 100},
+        "sampling_params": {"max_tokens": 1000},
         "max_batch_size": 100,
     }
     payload = json.dumps(payload).encode()
