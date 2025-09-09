@@ -6,7 +6,6 @@ Eliminates code duplication across message handlers and centralizes error handli
 """
 
 import json
-import traceback
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -66,16 +65,12 @@ def parse_json_from_tensor(tensor) -> Dict[str, Any]:
         tensor_bytes = convert_tensor_to_bytes(tensor)
         json_str = tensor_bytes.decode("utf-8")
         return json.loads(json_str)
-
-    except MessageProcessingError:
-        # Re-raise tensor conversion errors
-        raise
     except UnicodeDecodeError as e:
         raise MessageProcessingError(f"Failed to decode tensor bytes as UTF-8: {e}")
     except json.JSONDecodeError as e:
         raise MessageProcessingError(f"Failed to parse JSON from tensor: {e}")
-    except Exception as e:
-        raise MessageProcessingError(f"Unexpected error parsing tensor JSON: {e}")
+    except Exception as _:
+        raise
 
 
 def extract_request_metadata(name: str) -> Optional[Tuple[str, int, str]]:
@@ -129,26 +124,6 @@ def extract_request_metadata(name: str) -> Optional[Tuple[str, int, str]]:
         return None
 
 
-def validate_message_format(msg: Dict[str, Any]) -> bool:
-    """
-    Validate basic message format.
-
-    Args:
-        msg: Message dictionary to validate
-
-    Returns:
-        bool: True if message has valid format
-    """
-    if not isinstance(msg, dict):
-        return False
-
-    # All messages should have an action field
-    if "action" not in msg:
-        return False
-
-    return True
-
-
 def validate_deployment_message(msg: Dict[str, Any]) -> bool:
     """
     Validate deployment message format.
@@ -159,11 +134,6 @@ def validate_deployment_message(msg: Dict[str, Any]) -> bool:
     Returns:
         bool: True if valid deployment message
     """
-    if not validate_message_format(msg):
-        return False
-
-    if msg.get("action") != "deploy_model":
-        return False
 
     instructions = msg.get("instructions", {})
     required_fields = ["model_name", "assigned_layers", "required_files"]
@@ -181,39 +151,20 @@ def validate_inference_trigger_message(msg: Dict[str, Any]) -> bool:
     Returns:
         bool: True if valid inference trigger message
     """
-    if not validate_message_format(msg):
-        return False
-
-    if msg.get("action") != "start_inference":
-        return False
 
     required_fields = ["batch_id", "pipeline"]
     return all(field in msg for field in required_fields)
 
 
-def safe_parse_message(
-    tensor, message_type: str = "unknown"
-) -> Optional[Dict[str, Any]]:
-    """
-    Safely parse a tensor message with comprehensive error handling.
-
-    Args:
-        tensor: Input tensor
-        message_type: Type of message for logging context
-
-    Returns:
-        Dict[str, Any] | None: Parsed message or None if parsing failed
-    """
-    try:
-        return parse_json_from_tensor(tensor)
-
-    except MessageProcessingError as e:
-        print(f"❌ Error parsing {message_type} message: {e}")
-        return None
-    except Exception as e:
-        print(f"❌ Unexpected error parsing {message_type} message: {e}")
-        traceback.print_exc()
-        return None
+def validate_request_message(msg: Dict[str, Any]) -> bool:
+    required_fields = [
+        "request_id",
+        "prompt",
+        "model",
+        "sampling_params",
+        "max_batch_size",
+    ]
+    return all(field in msg for field in required_fields)
 
 
 def log_message_received(message_type: str, msg: Dict[str, Any], extra_info: str = ""):
@@ -238,7 +189,7 @@ def log_message_received(message_type: str, msg: Dict[str, Any], extra_info: str
 # Convenience functions for common parsing patterns
 def parse_deployment_message(tensor) -> Optional[Dict[str, Any]]:
     """Parse and validate deployment message"""
-    msg = safe_parse_message(tensor, "deployment")
+    msg = parse_json_from_tensor(tensor)
     if msg and validate_deployment_message(msg):
         return msg
     return None
@@ -246,7 +197,15 @@ def parse_deployment_message(tensor) -> Optional[Dict[str, Any]]:
 
 def parse_inference_trigger_message(tensor) -> Optional[Dict[str, Any]]:
     """Parse and validate inference trigger message"""
-    msg = safe_parse_message(tensor, "inference_trigger")
+    msg = parse_json_from_tensor(tensor)
     if msg and validate_inference_trigger_message(msg):
+        return msg
+    return None
+
+
+def parse_request_message(tensor) -> Optional[Dict[str, Any]]:
+    """Parse and validate incoming request message"""
+    msg = parse_json_from_tensor(tensor)
+    if msg and validate_request_message(msg):
         return msg
     return None

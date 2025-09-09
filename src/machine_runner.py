@@ -13,6 +13,8 @@ from lmcache.experimental.cache_engine import LMCacheEngineBuilder
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from transformers import AutoTokenizer
 
+import src.utils.req_batcher as req_batcher
+
 # from lmcache.v1.cache_engine import LMCacheEngineBuilder
 from src.config.settings import HUGGINGFACE_TOKEN, SERVER_HOST, SERVER_PORT
 from src.utils.db_utils import get_active_peers, register_peer
@@ -33,7 +35,8 @@ from src.utils.message_processing import (
     log_message_received,
     parse_deployment_message,
     parse_inference_trigger_message,
-    safe_parse_message,
+    parse_json_from_tensor,
+    parse_request_message,
 )
 
 ## Tensor_Iroh Starts here ###########################
@@ -49,22 +52,12 @@ print(
 
 # Global TensorTransport instance (lazy-started in main) #######################
 tensor_transport: TensorTransport | None = None
-peer_ticket_map: dict[
-    str, str
-] = {}  # peer_id  → ticket string (filled in heartbeat) #? Check if hostnames are being set even
-current_peer_ticket = None  # this is the global variable for the current peer ticket
 deployed_model = None  # this is the global variable for the deployed model
 peer_ticket_map: dict[
     str, str
 ] = {}  # peer_id  → ticket string (filled in heartbeat) #? Check if hostnames are being set even
 current_peer_ticket = None  # this is the global variable for the current peer ticket
-deployed_model = None  # this is the global variable for the deployed model
 deployment_status = "idle"  # idle, downloading, loading, ready, failed
-start_inference_run = None  # this is the global variable for the inference run
-assigned_layers_global = []  # this is the global variable for the assigned layers
-central_server_ticket = (
-    None  # this is the global variable for the central server ticket
-)
 start_inference_run = None  # this is the global variable for the inference run
 assigned_layers_global = []  # this is the global variable for the assigned layers
 central_server_ticket = (
@@ -81,6 +74,9 @@ PEER_COLOR = COLORS[
     int(socket.gethostname().__hash__()) % len(COLORS)
 ]  # deterministic per host
 
+# Batcher for this peer only if first peer
+batcher = None
+MAX_TIME_PER_BATCH = 1  # Max time we want to wait to fill up batches (in seconds)
 
 # ============================================================================
 # UNIFIED MESSAGE GATEWAY - SINGLE POINT FOR ALL TENSOR TRANSPORT MESSAGES
@@ -119,7 +115,9 @@ async def unified_message_gateway():
             # Route message based on name/content
             try:
                 # 1. DEPLOYMENT INSTRUCTIONS (highest priority)
-                if name.lower() in ["deploy", "deployment"] or "deploy" in name.lower():
+                if (
+                    name.lower() in ["deploy", "deployment"] or "deploy" in name.lower()
+                ):  # ?
                     await handle_deployment_message(tensor)
 
                 # 2. INFERENCE TRIGGERS
@@ -127,10 +125,6 @@ async def unified_message_gateway():
                     name.lower() in ["inference", "inference_trigger"]
                     or "inference" in name.lower()
                 ):
-                    # elif (
-                    #     name.lower() in ["inference", "inference_trigger"]
-                    #     or "inference" in name.lower()
-                    # ):
                     await handle_inference_trigger_message(tensor)
 
                 # 3. INFERENCE DATA (hidden states, residuals, sampler outputs)
@@ -144,6 +138,10 @@ async def unified_message_gateway():
                     ]
                 ):
                     await handle_inference_data_message(name, tensor)
+
+                # 5. Receive request
+                elif name.lower() == "request":
+                    await handle_request_message(tensor)
 
                 # 4. UNKNOWN MESSAGE TYPE
                 else:
@@ -382,68 +380,51 @@ async def handle_inference_data_message(name: str, tensor):
         traceback.print_exc()
 
 
+async def handle_request_message(tensor):
+    global batcher
+
+    try:
+        req = parse_request_message(tensor)
+
+        # Initialize batcher
+        if batcher is None:
+            batcher = req_batcher.Batcher(
+                model_name=req["model"],
+                max_req=req["max_batch_size"],
+                max_time=MAX_TIME_PER_BATCH,
+                process_req_fn=None,  # TODO: CHANGE THIS!!!
+            )
+
+        # Add request to batcher
+        await asyncio.create_task(
+            batcher.add(
+                req_batcher.Request(
+                    id=req["request_id"],
+                    prompt=req["prompt"],
+                    model_name=req["model"],
+                    sampling_params=req["sampling_params"],
+                )
+            )
+        )
+
+    except Exception:
+        raise
+
+
 async def handle_unknown_message(name: str, tensor):
     """Handle unknown message types by attempting to parse as JSON"""
     try:
         # Parse message using utility function
-        parsed = safe_parse_message(tensor, "unknown")
+        parsed = parse_json_from_tensor(tensor, "unknown")
         if not parsed:
             print(f"❌ Could not parse unknown message '{name}'")
             return
 
         print(f"📋 Unknown message '{name}' parsed as JSON:")
-        print(f"   Action: {parsed.get('action', 'unknown')}")
         print(f"   Keys: {list(parsed.keys())}")
-
-        # Try to route based on action
-        action = parsed.get("action")
-        if action == "deploy_model":
-            print("🔄 Routing unknown message to deployment handler")
-            await handle_deployment_message(tensor)
-        elif action == "start_inference":
-            print("🔄 Routing unknown message to inference trigger handler")
-            await handle_inference_trigger_message(tensor)
-        else:
-            print(f"⚠️ Cannot route unknown action: {action}")
 
     except Exception as e:
         print(f"❌ Error handling unknown message '{name}': {e}")
-
-
-# async def debug_inference_context_monitor():
-#     """Separate debug monitor that doesn't compete with message reception"""
-#     print("📊 Starting INFERENCE_CONTEXT debug monitor...")
-
-#     while True:
-#         try:
-#             if INFERENCE_CONTEXT:
-#                 print(f"\n{'=' * 60}")
-#                 print(f"📊 INFERENCE_CONTEXT @ {time.strftime('%H:%M:%S')}")
-#                 print(f"{'=' * 60}")
-
-#                 for req_id, req_data in INFERENCE_CONTEXT.items():
-#                     print(f"\n📋 Request: {req_id}")
-#                     for step_idx, step_data in req_data.items():
-#                         if isinstance(step_data, dict):
-#                             print(f"   Step {step_idx}:")
-#                             for key, value in step_data.items():
-#                                 if hasattr(value, "shape"):
-#                                     print(f"     - {key}: tensor {value.shape}")
-#                                 else:
-#                                     print(f"     - {key}: {type(value).__name__}")
-#                         else:
-#                             print(f"   {step_idx}: {type(step_data).__name__}")
-
-#                 print(f"{'=' * 60}\n")
-
-#             await asyncio.sleep(5)  # Check every 5 seconds
-
-#         except asyncio.CancelledError:
-#             print("debug_inference_context_monitor cancelled, exiting cleanly.")
-#             return
-#         except Exception as e:
-#             print(f"❌ Error in debug monitor: {e}")
-#             await asyncio.sleep(5)
 
 
 # ============================================================================
