@@ -933,7 +933,6 @@ async def deploy_model(request: ModelDeploymentRequest):
         for peer_id, instructions in deployment_instructions.items():
             print(f"🔍 Engine args: {instructions['engine_args']}")
             payload_dict = {
-                "action": "deploy_model",
                 "target_peer_id": peer_id,  # fix this if needed
                 "instructions": instructions,
             }
@@ -1181,7 +1180,6 @@ async def send_batch(batch_id: str, model_name: str, queue: List[Request]):
     pipeline = list(deployment_map.keys())
 
     inference_payload = {
-        "action": "start_inference",  # ? Is this action spurious since it's sent to the infer endpoint
         "batch_id": batch_id,
         "model_name": model_name,
         "input_text": [req.prompt for req in queue],
