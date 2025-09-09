@@ -205,6 +205,40 @@ async def handle_deployment_message(tensor):
         traceback.print_exc()
 
 
+def apply_chat_template_on_peer(messages, deployed_model) -> str:
+    """Apply the chat template on the peer"""
+    global tokenizer
+    try:
+        formatted_prompts = []
+        for i in messages:
+            formatted = tokenizer.apply_chat_template(
+                i, tokenize=False, add_generation_prompt=True
+            )
+            formatted_prompts.append(formatted)
+        print("✅ Applied chat template on peer for")
+        print(formatted_prompts)
+        return formatted_prompts
+    except Exception:
+        print(
+            "❌ Deployed model does not have an tokenizer, and is not detected, Default Behavior"
+        )
+        # Fallback: concatenate messages without templating
+        formatted_prompts = []
+        for message_list in messages:
+            combined_text = ""
+            for msg in message_list:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                combined_text += f"{role}: {content}\n"
+            formatted_prompts.append(combined_text.strip())
+        print(
+            f"✅ Applied fallback concatenation for {len(formatted_prompts)} message(s)"
+        )
+        return formatted_prompts
+
+    ## we will focus on async vllm later
+
+
 async def handle_inference_trigger_message(tensor):
     """Handle inference trigger messages"""
     global start_inference_run, current_peer_ticket
@@ -263,6 +297,9 @@ async def handle_inference_trigger_message(tensor):
 
             # Extract parameters
             input_text_list = trigger.get("input_text", "")
+            input_text_list = apply_chat_template_on_peer(
+                input_text_list, deployed_model
+            )
             sampling_params = [
                 SamplingParams(**item) for item in trigger.get("sampling_params")
             ]
@@ -570,7 +607,8 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         deployment_status, \
         start_inference_run, \
         tensor_transport, \
-        pipeline
+        pipeline, \
+        tokenizer
 
     model_name = instructions.get("model_name", "unknown")
 
@@ -620,21 +658,21 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         deployment_status = "loading"  # Update status before inference setup
 
         # Get tokenizer https://huggingface.co/docs/transformers/fast_tokenizers
-        pipeline = instructions.get("pipeline")
-        if current_peer_ticket == pipeline[-1]:
-            if "mistral" in model_name.lower() or "devstral" in model_name.lower():
-                from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+        # pipeline = instructions.get("pipeline")
+        # if current_peer_ticket == pipeline[-1]:
+        if "mistral" in model_name.lower() or "devstral" in model_name.lower():
+            from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 
-                local_model_dir = f"deployed_models/{model_name}"
-                tokenizer = MistralTokenizer.from_file(
-                    f"{local_model_dir}/config/tekken.json"
-                )
-            else:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model_name, token=HUGGINGFACE_TOKEN
-                )
+            local_model_dir = f"deployed_models/{model_name}"
+            tokenizer = MistralTokenizer.from_file(
+                f"{local_model_dir}/config/tekken.json"
+            )
         else:
-            tokenizer = None
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name, token=HUGGINGFACE_TOKEN, trust_remote_code=True
+            )
+        # else:
+        #     tokenizer = None
 
         # Setup inference hooks
         print("✅ Model loaded successfully, registering inference hooks...")
@@ -716,11 +754,11 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
     """Send heartbeat to central server over HTTP and exit if server stops responding."""
     global central_server_ticket
     consecutive_failures = 0
-    max_failures = 10  # 10 seconds tolerance
+    max_failures = 30  # 10 seconds tolerance
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
     server_added = False
 
-    async with httpx.AsyncClient(timeout=2.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
             try:
                 # Offload potentially blocking metrics collection
