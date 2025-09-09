@@ -12,7 +12,7 @@ from .base import WeightLoadingAdapter
 
 
 class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
-    """Weight loading adapter for Mixtral MoE models with vLLM internal format."""
+    """Weight loading adapter for Mixtral MoE models - pass-through to vLLM."""
 
     def __init__(
         self,
@@ -36,7 +36,7 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
         print(
             f"🏗️ Mixtral MoE Weight Loader: {self.num_local_experts} experts, {self.num_experts_per_tok} per token"
         )
-        print("🏗️ Loading weights in vLLM internal format (w13_weight, w2_weight)")
+        print("🏗️ Using vLLM's built-in weight mapping (no custom conversion)")
 
     def _is_awq(self, config: PretrainedConfig) -> bool:
         """Check if model uses AWQ quantization."""
@@ -51,21 +51,34 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
             with safe_open(str(path), framework="pt", device="cpu") as f:
                 for key in f.keys():
                     self.all_weights[key] = f.get_tensor(key)
-                    # Log vLLM internal MoE weights as they're loaded
+                    # Log MoE-specific weights as they're loaded
                     if "block_sparse_moe" in key:
                         if "gate.weight" in key:
                             print(
                                 f"✅ Loaded MoE gate: {key} (shape: {self.all_weights[key].shape})"
                             )
-                        elif "experts.w13" in key:
-                            print(
-                                f"✅ Loaded fused gate+up: {key} (shape: {self.all_weights[key].shape})"
+                        elif ".w1." in key or ".w2." in key or ".w3." in key:
+                            expert_idx = self._extract_expert_idx(key)
+                            weight_type = (
+                                "w1"
+                                if ".w1." in key
+                                else "w2"
+                                if ".w2." in key
+                                else "w3"
                             )
-                        elif "experts.w2" in key:
-                            print(
-                                f"✅ Loaded down proj: {key} (shape: {self.all_weights[key].shape})"
-                            )
+                            print(f"✅ Loaded expert {expert_idx} {weight_type}: {key}")
         return self.all_weights
+
+    def _extract_expert_idx(self, key: str) -> int:
+        """Extract expert index from a weight key."""
+        try:
+            parts = key.split(".")
+            for i, part in enumerate(parts):
+                if part == "experts" and i + 1 < len(parts):
+                    return int(parts[i + 1])
+        except (ValueError, IndexError):
+            pass
+        return -1
 
     def load_embedding(self, embedding_path):
         """Load embedding weights into the model."""
@@ -84,19 +97,6 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
         if lm_head_path.exists():
             self.all_weights.update(self.load_safetensors_file(lm_head_path))
             print(f"✅ Loaded Mixtral MoE lm_head weights from {lm_head_path}")
-
-            # Check AWQ lm_head weights
-            if self.is_awq:
-                awq_keys = [
-                    k
-                    for k in self.all_weights.keys()
-                    if k.startswith("lm_head.")
-                    and any(
-                        suffix in k for suffix in [".qweight", ".qzeros", ".scales"]
-                    )
-                ]
-                if awq_keys:
-                    print(f"   Found AWQ lm_head weights: {len(awq_keys)} tensors")
 
             # Check standard lm_head weight
             if "lm_head.weight" in self.all_weights:
@@ -129,7 +129,7 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
         return self.all_weights
 
     def load_layer_weights(self, layer_idx, layer_path):
-        """Load layer weights with vLLM internal format verification."""
+        """Load layer weights - let vLLM handle expert mapping."""
         if layer_path.exists():
             weights_before = len(self.all_weights)
             self.all_weights.update(self.load_safetensors_file(layer_path))
@@ -144,7 +144,7 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
         return self.all_weights
 
     def _verify_moe_layer_weights(self, layer_idx: int):
-        """Verify that MoE layer weights match vLLM internal format."""
+        """Verify that MoE layer weights are in original HF format."""
         layer_prefix = f"model.layers.{layer_idx}"
 
         # Check attention weights
@@ -163,25 +163,33 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
                     f"   Layer {layer_idx}: Found fused QKV projections ({len(qkv_keys)} tensors)"
                 )
 
-        # Check MoE weights - looking for vLLM internal format
+        # Check MoE weights - looking for original HF format
         moe_prefix = f"{layer_prefix}.block_sparse_moe"
         moe_keys = [k for k in self.all_weights.keys() if k.startswith(moe_prefix)]
 
         if moe_keys:
             print(f"   Layer {layer_idx}: {len(moe_keys)} MoE weights")
 
-            # Check for vLLM internal format
-            w13_keys = [k for k in moe_keys if "experts.w13" in k]
-            w2_keys = [k for k in moe_keys if "experts.w2" in k]
+            # Count experts in original HF format
+            expert_count = 0
+            for expert_idx in range(self.num_local_experts):
+                expert_prefix = f"{moe_prefix}.experts.{expert_idx}"
+                w1_keys = [
+                    k for k in moe_keys if k.startswith(expert_prefix) and ".w1." in k
+                ]
+                w2_keys = [
+                    k for k in moe_keys if k.startswith(expert_prefix) and ".w2." in k
+                ]
+                w3_keys = [
+                    k for k in moe_keys if k.startswith(expert_prefix) and ".w3." in k
+                ]
 
-            if w13_keys:
-                print(
-                    f"   Layer {layer_idx}: Found w13 (gate+up) weights ({len(w13_keys)} tensors)"
-                )
-            if w2_keys:
-                print(
-                    f"   Layer {layer_idx}: Found w2 (down) weights ({len(w2_keys)} tensors)"
-                )
+                if w1_keys and w2_keys and w3_keys:
+                    expert_count += 1
+
+            print(
+                f"   Layer {layer_idx}: Found {expert_count}/{self.num_local_experts} experts (HF format)"
+            )
 
             # Check MoE gate
             gate_key = f"{moe_prefix}.gate.weight"
@@ -216,8 +224,9 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
         print(
             f"✅ Loaded {len(self.all_weights)} total weight tensors from {self.model_dir}"
         )
+        print("🔧 Letting vLLM's AutoWeightsLoader handle expert weight mapping...")
 
-        # Apply weights to model parameters
+        # Apply weights to model parameters - let vLLM do the conversion
         applied_count = 0
         missing_in_model = []
         missing_in_weights = []
@@ -249,14 +258,25 @@ class MixtralMoEWeightLoadingAdapter(WeightLoadingAdapter):
         print(f"   Total weights loaded: {len(self.all_weights)}")
         print(f"   Model parameters: {len(model_param_names)}")
 
+        # Show mismatches (these should be minimal with correct approach)
         if missing_in_weights:
-            print(
-                f"⚠️ Model parameters not found in weights ({len(missing_in_weights)}):"
-            )
-            for name in sorted(missing_in_weights)[:5]:  # Show first 5
-                print(f"   - {name}")
-            if len(missing_in_weights) > 5:
-                print(f"   ... and {len(missing_in_weights) - 5} more")
+            # Filter out unassigned layer parameters from the count
+            actual_missing = []
+            for name in missing_in_weights:
+                is_unassigned_layer = False
+                for i in range(100):  # Check if from unassigned layer
+                    if f".layers.{i}." in name and i not in self.assigned_layers:
+                        is_unassigned_layer = True
+                        break
+                if not is_unassigned_layer:
+                    actual_missing.append(name)
+
+            if actual_missing:
+                print(f"⚠️ Actual missing parameters ({len(actual_missing)}):")
+                for name in sorted(actual_missing)[:5]:
+                    print(f"   - {name}")
+                if len(actual_missing) > 5:
+                    print(f"   ... and {len(actual_missing) - 5} more")
 
         if missing_in_model:
             print(f"⚠️ Loaded weights not used by model ({len(missing_in_model)}):")
