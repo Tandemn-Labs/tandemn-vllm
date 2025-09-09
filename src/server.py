@@ -496,7 +496,9 @@ async def calculate_peer_layers(
     try:
         # Download model configuration
         config = await download_config(
-            request.model_id, request.hf_token, request.filename
+            request.model_id,
+            request.hf_token,
+            request.filename,  # ? no filename
         )
 
         # Calculate layer capacity for this peer
@@ -1159,7 +1161,7 @@ async def infer(request: InferenceRequest):
     )
 
 
-async def send_batch(batch_id: str, model_name: str, queue: List[Request]):
+async def send_batch(batch_id: str, model_name: str, queue: List[req_batcher.Request]):
     global active_deployments, active_inferences
 
     req_ids = [req.id for req in queue]
@@ -1498,26 +1500,23 @@ async def batch_failed(request: BatchFailRequest):
     return
 
 
-# @app.post("/insert_batch")
-# async def insert_batch(request: Request):
-#     global active_requests, active_inferences
+@app.post("/client_batch_test")
+async def client_batch_test(request: Request):
+    body = await request.json()
+    model_name = body.get("model")
+    prompt = body.get("prompt")
+    deployment_map = active_deployments[model_name]["deployment_map"]
+    pipeline = list(deployment_map.keys())
 
-#     body = await request.json()
+    payload = {
+        "request_id": str(uuid.uuid4()),
+        "prompt": prompt,
+        "model": model_name,
+        "sampling_params": {"max_tokens": 100},
+        "max_batch_size": 100,
+    }
+    payload = json.dumps(payload).encode()
+    payload = np.frombuffer(payload, dtype=np.uint8)
 
-#     batch_id = body.get("batch_id")
-#     request_id = body.get("request_id")
-#     active_inferences[batch_id] = {
-#         "request_id": [request_id],
-#     }
-
-
-# @app.post("/test_complete")
-# async def test_complete(request: Request):
-#     global active_requests, active_inferences
-
-#     body = await request.json()
-
-#     request_id = body.get("request_id")
-#     req_meta = active_requests[request_id]
-#     req_meta["complete"] = True
-#     req_meta["event"].set()
+    for peer in pipeline:
+        await asyncio.create_task(tensor_transport.send(peer, "request", payload))

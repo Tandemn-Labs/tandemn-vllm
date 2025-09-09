@@ -167,6 +167,11 @@ def validate_request_message(msg: Dict[str, Any]) -> bool:
     return all(field in msg for field in required_fields)
 
 
+def validate_dispatch_message(msg: Dict[str, Any]) -> bool:
+    required_fields = ["batch_id", "request_id"]
+    return all(field in msg for field in required_fields)
+
+
 def log_message_received(message_type: str, msg: Dict[str, Any], extra_info: str = ""):
     """
     Standardized logging for received messages.
@@ -207,5 +212,13 @@ def parse_request_message(tensor) -> Optional[Dict[str, Any]]:
     """Parse and validate incoming request message"""
     msg = parse_json_from_tensor(tensor)
     if msg and validate_request_message(msg):
+        return msg
+    return None
+
+
+def parse_dispatch_message(tensor) -> Optional[Dict[str, Any]]:
+    """Parse and validate incoming batch dispatch message"""
+    msg = parse_json_from_tensor(tensor)
+    if msg and validate_dispatch_message(msg):
         return msg
     return None

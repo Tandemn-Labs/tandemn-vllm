@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from vllm import LLM  # type: ignore
 
+from src.utils import req_batcher
 from src.utils.tensor_protocol_adapter import TensorTransport
 
 # This global dictionary holds the actual tensor data, not futures
@@ -574,10 +575,10 @@ def register_inference_hooks(
             for i in reversed(to_remove):
                 del parent_seq_id[i]
 
-            print(
-                f"sampler_post_hook - parent_seq_id: {parent_seq_id}, curr_seq: {curr_seq}, tokens_return: {tokens_return}"
-            )
-            print(f"sampler-post-hook - tokens_str {tokens_str}")
+            # print(
+            #     f"sampler_post_hook - parent_seq_id: {parent_seq_id}, curr_seq: {curr_seq}, tokens_return: {tokens_return}"
+            # )
+            # print(f"sampler-post-hook - tokens_str {tokens_str}")
             asyncio.run_coroutine_threadsafe(
                 stream_token_to_server(
                     batch_id=batch_id, tokens=tokens_return, server_url=server_url
@@ -636,8 +637,15 @@ def register_inference_hooks(
         pipeline: List[str],
         input_text: List[str],
         sampling_params: Any,
+        batcher: req_batcher.Batcher,
     ):
         """The main inference runner"""
+
+        print(f"start_inference_run - {batch_id}")
+        print(
+            f"THREAD - {threading.current_thread().name}, {threading.current_thread().ident}"
+        )
+        print(f"LOOP - {id(asyncio_loop)}, {asyncio_loop}")
 
         # Predefine hook handles for safe, idempotent cleanup
         pre_hook_handle = None
@@ -825,6 +833,10 @@ def register_inference_hooks(
                 # Always clean up per-request transport/context
                 cleanup_request_context(batch_id)
 
+                # Tell main thread to schedule next batch
+                if peer_id == pipeline[0]:
+                    asyncio.run_coroutine_threadsafe(batcher.busy_clear(), asyncio_loop)
+
         return
 
     # return the start_inference_run function
@@ -841,101 +853,6 @@ def handle_failure(batch_id: str, peer_id: str, error: str, server_url: str):
             client.post(f"{server_url}/batch_failed", json=data)
     except Exception as e:
         print(f"handle_failure - {e}")
-
-
-# async def send_hidden_state_tensor(
-#     tensor_transport: "TensorTransport",
-#     request_id: str,
-#     next_peer_id: str,
-#     data_to_send: "np.ndarray",
-#     is_residual: bool = False,
-#     step_idx: int = 0,
-#     next_peer_ticket: str = "",
-# ):
-#     """
-#     Sends the tensor directly to the next peer using TensorTransport.
-#     No gossip, no blobs.
-#     """
-#     try:
-#         if not next_peer_ticket:
-#             raise ValueError(
-#                 "next_peer_ticket must be provided for tensor transport send."
-#             )
-
-#         # Calculate payload size
-#         # payload_size_bytes = data_to_send.nbytes
-#         # payload_size_mb = payload_size_bytes / (1024 * 1024)
-
-#         tensor_type = "residual" if is_residual else "hidden_state"
-#         # print(
-#         #     f"📊 {tensor_type.capitalize()} tensor payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
-#         # )
-#         # print(f"   - Tensor shape: {data_to_send.shape}, dtype: {data_to_send.dtype}")
-
-#         # Compose a name for the tensor message
-#         tensor_name = f"{request_id}_step{step_idx}_{tensor_type}"
-
-#         await tensor_transport.send(
-#             next_peer_ticket, name=tensor_name, tensor=data_to_send
-#         )
-
-#         # print(
-#         #     f"📤 Sent {tensor_type} tensor for {request_id} to {next_peer_id} ({next_peer_ticket}) via TensorTransport"
-#         # )
-#     except Exception as e:
-#         print(
-#             f"❌ [DEBUG] Failed to send hidden state tensor for {request_id} to {next_peer_id} ({next_peer_ticket}): {e}"
-#         )
-
-
-# async def send_inference_tensors(
-#     tensor_transport: "TensorTransport",
-#     request_id: str,
-#     next_peer_id: str,
-#     hidden_states: "np.ndarray",
-#     residual: "np.ndarray",
-#     step_idx: int = 0,
-#     next_peer_ticket: str = "",
-# ):
-#     """
-#     Sends both hidden states and residual tensors in a single message.
-#     Leverages tensor-iroh's built-in serialization.
-#     """
-#     try:
-#         if not next_peer_ticket:
-#             raise ValueError(
-#                 "next_peer_ticket must be provided for tensor transport send."
-#             )
-
-#         # Stack both tensors together - tensor-iroh handles serialization
-#         # Format: [hidden_states, residual] concatenated along a new dimension
-#         combined_tensor = np.stack([hidden_states, residual], axis=0)
-
-#         # Calculate payload size
-#         # payload_size_bytes = combined_tensor.nbytes
-#         # payload_size_mb = payload_size_bytes / (1024 * 1024)
-
-#         # print(
-#         #     f"📊 Payload size for {request_id} step {step_idx}: {payload_size_mb:.2f} MB ({payload_size_bytes:,} bytes)"
-#         # )
-#         # print(
-#         #     f"   - Hidden states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}"
-#         # )
-#         # print(f"   - Residual shape: {residual.shape}, dtype: {residual.dtype}")
-#         # print(f"   - Combined tensor shape: {combined_tensor.shape}")
-
-#         # Compose a name for the tensor message
-#         tensor_name = f"{request_id}_step{step_idx}_combined"
-
-#         await tensor_transport.send(
-#             next_peer_ticket, name=tensor_name, tensor=combined_tensor
-#         )
-
-#         print(
-#             f"📤 Sent combined tensors for {request_id} step {step_idx} to {next_peer_id} via TensorTransport"
-#         )
-#     except Exception as e:
-#         print(f"❌ Failed to send tensors for {request_id} to {next_peer_id}: {e}")
 
 
 async def send_inference_tensors_fast(
