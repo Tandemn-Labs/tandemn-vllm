@@ -492,6 +492,9 @@ def handle_dispatch_message(tensor):
         print(f"handle_dispatch_message - batch: {batch_id}, reqs: {request_ids}")
 
         batch_metadata[batch_id] = {"request_id": request_ids}
+        # Apply chat template to convert messages to prompt strings
+        prompts = [request_metadata[req]["prompt"] for req in request_ids]
+        formatted_prompts = apply_chat_template_on_peer(prompts, deployed_model)
 
         loop = asyncio.get_running_loop()
         _ = loop.run_in_executor(
@@ -499,7 +502,7 @@ def handle_dispatch_message(tensor):
             start_inference_run,
             batch_id,
             pipeline,
-            [request_metadata[req]["prompt"] for req in request_ids],
+            formatted_prompts,
             [
                 SamplingParams(**request_metadata[req]["sampling_params"])
                 for req in request_ids
@@ -558,13 +561,17 @@ async def dispatch_batch(
         )
         tasks.append(server_task)
 
+        # Apply chat template to convert messages to prompt strings
+        prompts = [req.prompt for req in queue]
+        formatted_prompts = apply_chat_template_on_peer(prompts, deployed_model)
+
         loop = asyncio.get_running_loop()
         _ = loop.run_in_executor(
             None,
             start_inference_run,
             batch_id,
             pipeline,
-            [req.prompt for req in queue],
+            formatted_prompts,
             [SamplingParams(**req.sampling_params) for req in queue],
             batcher,
         )

@@ -1280,6 +1280,7 @@ def collect_messages(messages: List[Dict]):
             normalized.append({"role": role, "content": content})
         else:
             print(f"❌ Skipping message with role: {role}")
+    print("Normalized Input looks like this -> ", normalized)
     return normalized
     # return to_return
 
