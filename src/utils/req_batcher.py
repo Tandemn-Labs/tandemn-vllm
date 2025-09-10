@@ -37,7 +37,7 @@ class Batcher:
     async def add(self, req: Request) -> None:
         async with self._attr_lock:
             self._queue.append((req, time.monotonic()))
-            print(f"batcher add() - len(queue): {len(self._queue())}")
+            print(f"batcher add() - len(queue): {len(self._queue)}")
             if len(self._queue) == 1:
                 self._start_time = time.monotonic()
 
