@@ -658,7 +658,7 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
         deployment_status = "loading"  # Update status before inference setup
 
         # Get tokenizer https://huggingface.co/docs/transformers/fast_tokenizers
-        # pipeline = instructions.get("pipeline")
+        pipeline = instructions.get("pipeline")
         # if current_peer_ticket == pipeline[-1]:
         if "mistral" in model_name.lower() or "devstral" in model_name.lower():
             from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
