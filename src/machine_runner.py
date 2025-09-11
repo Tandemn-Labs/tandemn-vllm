@@ -14,7 +14,6 @@ from colorama import init as colorama_init
 from lmcache.experimental.cache_engine import LMCacheEngineBuilder
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from transformers import AutoTokenizer
-from vllm import SamplingParams
 
 import src.utils.req_batcher as req_batcher
 
@@ -45,6 +44,7 @@ from src.utils.message_processing import (
 
 ## Tensor_Iroh Starts here ###########################
 from src.utils.tensor_protocol_adapter import TensorTransport
+from vllm import SamplingParams
 
 ######################################################
 # FORCE vLLM v0 mode (required for selective layer loading)
@@ -205,35 +205,85 @@ async def handle_deployment_message(tensor):
         traceback.print_exc()
 
 
+# def apply_chat_template_on_peer(messages, deployed_model) -> str:
+#     """Apply the chat template on the peer"""
+#     global tokenizer
+#     try:
+#         formatted_prompts = []
+#         for i in messages:
+#             formatted = tokenizer.apply_chat_template(
+#                 i, tokenize=False, add_generation_prompt=True
+#             )
+#             formatted_prompts.append(formatted)
+#         print("✅ Applied chat template on peer for")
+#         print(formatted_prompts)
+#         return formatted_prompts
+#     except Exception:
+#         print(
+#             "❌ Deployed model does not have an tokenizer, and is not detected, Default Behavior"
+#         )
+#         # Fallback: concatenate messages without templating
+#         formatted_prompts = []
+#         for message_list in messages:
+#             combined_text = ""
+#             for msg in message_list:
+#                 role = msg.get("role", "")
+#                 content = msg.get("content", "")
+#                 combined_text += f"{role}: {content}\n"
+#             formatted_prompts.append(combined_text.strip())
+#         print(
+#             f"✅ Applied fallback concatenation for {len(formatted_prompts)} message(s)"
+#         )
+#         return formatted_prompts
+
+
 def apply_chat_template_on_peer(messages, deployed_model) -> str:
-    """Apply the chat template on the peer"""
     global tokenizer
-    try:
+    if hasattr(tokenizer, "encode_chat_completion"):
+        from mistral_common.protocol.instruct.messages import (
+            AssistantMessage,
+            SystemMessage,
+            UserMessage,
+        )
+        from mistral_common.protocol.instruct.request import ChatCompletionRequest
+
+        formatted_prompts = []
+        for message_list in messages:
+            for msg in messages:
+                role = msg.get("role", "").lower()
+                content = msg.get("content", "")
+                if role == "system":
+                    formatted_prompts.append(SystemMessage(content=content))
+                elif role == "user":
+                    formatted_prompts.append(UserMessage(content=content))
+                elif role == "assistant":
+                    formatted_prompts.append(AssistantMessage(content=content))
+            # encode using mistral tokenizer
+            request = ChatCompletionRequest(messages=formatted_prompts)
+            tokenized = tokenizer.encode_chat_completion(request)
+            decoded = tokenizer.decode(tokenized.tokens)
+            formatted_prompts.append(decoded)
+            print("✅ Applied chat template on peer using Mistral tokenizer")
+            print(formatted_prompts)
+        return formatted_prompts
+    elif hasattr(tokenizer, "apply_chat_template"):
         formatted_prompts = []
         for i in messages:
             formatted = tokenizer.apply_chat_template(
                 i, tokenize=False, add_generation_prompt=True
             )
             formatted_prompts.append(formatted)
-        print("✅ Applied chat template on peer for")
+        print("✅ Applied chat template on peer using Hugging Face tokenizer")
         print(formatted_prompts)
         return formatted_prompts
-    except Exception:
+    else:
         print(
-            "❌ Deployed model does not have an tokenizer, and is not detected, Default Behavior"
+            "❌ Tokenizer does not have encode_chat_completion or apply_chat_template method"
         )
-        # Fallback: concatenate messages without templating
         formatted_prompts = []
         for message_list in messages:
-            combined_text = ""
-            for msg in message_list:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                combined_text += f"{role}: {content}\n"
+            combined_text = " ".join([msg.get("content", "") for msg in message_list])
             formatted_prompts.append(combined_text.strip())
-        print(
-            f"✅ Applied fallback concatenation for {len(formatted_prompts)} message(s)"
-        )
         return formatted_prompts
 
     ## we will focus on async vllm later
