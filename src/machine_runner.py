@@ -247,6 +247,8 @@ def apply_chat_template_on_peer(messages, deployed_model) -> str:
         )
         from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
+        from vllm.inputs import TokensPrompt
+
         formatted_prompts = []
 
         for message_list in messages:
@@ -269,20 +271,21 @@ def apply_chat_template_on_peer(messages, deployed_model) -> str:
 
             # Encode to get tokens with proper chat template applied
             tokenized = tokenizer.encode_chat_completion(request)
-
+            tokens = tokenized.tokens
             # Decode tokens back to formatted text
             # Remove EOS token if present before decoding
-            tokens = tokenized.tokens
+            # tokens = tokenized.tokens
             if tokens and tokens[-1] == tokenizer.eos_token_id:
                 tokens = tokens[:-1]  # Remove EOS token
 
-            # Decode to get the formatted prompt text
-            formatted_text = tokenizer.decode(tokens)
-            formatted_prompts.append(formatted_text)
+        #     # Decode to get the formatted prompt text
+        #     formatted_text = tokenizer.decode(tokens)
+        #     formatted_prompts.append(formatted_text)
 
-        print("✅ Applied Mistral chat template")
-        print(f"Formatted {len(formatted_prompts)} prompt(s)")
-        return formatted_prompts
+        # print("✅ Applied Mistral chat template")
+        # print(f"Formatted {len(formatted_prompts)} prompt(s)")
+        # return formatted_prompts
+        return [TokensPrompt({"prompt_token_ids": tokens})]
     elif hasattr(tokenizer, "apply_chat_template"):
         formatted_prompts = []
         for i in messages:
