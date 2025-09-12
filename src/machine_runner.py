@@ -248,23 +248,40 @@ def apply_chat_template_on_peer(messages, deployed_model) -> str:
         from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
         formatted_prompts = []
+
         for message_list in messages:
-            for msg in messages:
+            # Convert OpenAI-style messages to Mistral format
+            mistral_messages = []
+            for msg in message_list:
                 role = msg.get("role", "").lower()
                 content = msg.get("content", "")
+
                 if role == "system":
-                    formatted_prompts.append(SystemMessage(content=content))
+                    mistral_messages.append(SystemMessage(content=content))
                 elif role == "user":
-                    formatted_prompts.append(UserMessage(content=content))
+                    mistral_messages.append(UserMessage(content=content))
                 elif role == "assistant":
-                    formatted_prompts.append(AssistantMessage(content=content))
-            # encode using mistral tokenizer
-            request = ChatCompletionRequest(messages=formatted_prompts)
+                    mistral_messages.append(AssistantMessage(content=content))
+                # Note: 'tool' role would need ToolMessage if you support it
+
+            # Create ChatCompletionRequest with the messages
+            request = ChatCompletionRequest(messages=mistral_messages)
+
+            # Encode to get tokens with proper chat template applied
             tokenized = tokenizer.encode_chat_completion(request)
-            decoded = tokenizer.decode(tokenized.tokens)
-            formatted_prompts.append(decoded)
-            print("✅ Applied chat template on peer using Mistral tokenizer")
-            print(formatted_prompts)
+
+            # Decode tokens back to formatted text
+            # Remove EOS token if present before decoding
+            tokens = tokenized.tokens
+            if tokens and tokens[-1] == tokenizer.eos_id:
+                tokens = tokens[:-1]  # Remove EOS token
+
+            # Decode to get the formatted prompt text
+            formatted_text = tokenizer.decode(tokens)
+            formatted_prompts.append(formatted_text)
+
+        print("✅ Applied Mistral chat template")
+        print(f"Formatted {len(formatted_prompts)} prompt(s)")
         return formatted_prompts
     elif hasattr(tokenizer, "apply_chat_template"):
         formatted_prompts = []
