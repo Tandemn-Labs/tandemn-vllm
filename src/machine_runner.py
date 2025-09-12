@@ -275,8 +275,8 @@ def apply_chat_template_on_peer(messages, deployed_model) -> str:
             # Decode tokens back to formatted text
             # Remove EOS token if present before decoding
             # tokens = tokenized.tokens
-            if tokens and tokens[-1] == tokenizer.eos_token_id:
-                tokens = tokens[:-1]  # Remove EOS token
+            # if tokens and tokens[-1] == tokenizer.eos_token_id:
+            #     tokens = tokens[:-1]  # Remove EOS token
 
         #     # Decode to get the formatted prompt text
         #     formatted_text = tokenizer.decode(tokens)
