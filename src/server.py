@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -62,6 +63,8 @@ active_requests = {}  # Request ID -> Dict of metadata
 
 central_server_ticket = None
 
+logger = logging.getLogger(__name__)
+
 
 # ? What is the difference between the following 3 peer lists?
 peer_table: Dict[str, str] = {}
@@ -88,6 +91,10 @@ peer_color_map = {}
 
 # Maximum time we want to wait to fill up batches (in seconds)
 MAX_TIME_PER_BATCH = 1
+
+
+def setup_logging():
+    logging.basicConfig(filename="server.log", level=logging.INFO)
 
 
 def _get_peer_color(peer_id: str):
@@ -177,6 +184,9 @@ async def startup():
         f"🪪 TensorTransport for the central server started – ticket:\n{central_server_ticket}\n"
     )
     #################################################################################################
+
+    setup_logging()
+    logger.info(f"ticket: {central_server_ticket}")
 
     # Start the background task for cleaning up inactive peers
     asyncio.create_task(periodic_peer_cleanup())
@@ -1093,6 +1103,9 @@ async def completion(completion: CompletionData):
         # Process each request
         req_ids = inference_state["inflight"]
         for req_id in req_ids:
+            logger.info(
+                f"request-id: {req_id}, token: {len(active_requests[req_id]['tokens'])}"
+            )
             active_requests[req_id]["complete"] = True
             active_requests[req_id]["event"].set()
 
