@@ -11,8 +11,9 @@ import httpx
 import numpy as np
 from colorama import Fore, Style
 from colorama import init as colorama_init
-from lmcache.experimental.cache_engine import LMCacheEngineBuilder
-from lmcache.integration.vllm.utils import ENGINE_NAME
+
+# from lmcache.experimental.cache_engine import LMCacheEngineBuilder
+# from lmcache.integration.vllm.utils import ENGINE_NAME
 from transformers import AutoTokenizer
 
 import src.utils.req_batcher as req_batcher
@@ -75,10 +76,6 @@ COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
 PEER_COLOR = COLORS[
     int(socket.gethostname().__hash__()) % len(COLORS)
 ]  # deterministic per host
-PEER_COLOR = COLORS[
-    int(socket.gethostname().__hash__()) % len(COLORS)
-]  # deterministic per host
-
 # Batcher for this peer only if first peer
 batcher = None
 MAX_TIME_PER_BATCH = 1  # Max time we want to wait to fill up batches (in seconds)
@@ -246,7 +243,6 @@ def apply_chat_template_on_peer(messages, deployed_model) -> str:
             UserMessage,
         )
         from mistral_common.protocol.instruct.request import ChatCompletionRequest
-
         from vllm.inputs import TokensPrompt
 
         formatted_prompts = []
@@ -377,10 +373,6 @@ async def handle_inference_trigger_message(tensor):
 
             print("�� Starting inference run in background thread...")
 
-            # print(
-            #     f"THREAD - {threading.current_thread().name}, {threading.current_thread().ident}"
-            # )
-            # print(f"LOOP - {id(loop)}, {loop}")
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,
@@ -422,31 +414,12 @@ async def handle_inference_data_message(name: str, tensor):
         # )
 
         if message_type == "combined":
-            # if hasattr(tensor, "numpy"):
-            #     # PyTorch tensor - convert to numpy
-            #     arr = tensor.numpy()
-            # else:
-            #     # Already numpy
-            #     arr = tensor
-
             # Unpickle the combined tensor
             combined_tensor = pickle.loads(tensor.numpy().tobytes())
 
             hidden_state = combined_tensor[0]
             residual = combined_tensor[1]
             positions = combined_tensor[2]
-
-            # print(
-            #     f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
-            # )
-
-            # # Unstack the combined tensor
-            # if tensor.shape[0] != 2:
-            #     print(f"❌ Invalid combined tensor shape: {tensor.shape}")
-            #     return
-
-            # hidden_state = tensor[0]
-            # residual = tensor[1]
 
             # Store in INFERENCE_CONTEXT
             with CONTEXT_LOCK:
@@ -829,9 +802,9 @@ def get_model_status() -> Dict[str, Any]:
 
 async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0):
     """Send heartbeat to central server over HTTP and exit if server stops responding."""
-    global central_server_ticket
+    global central_server_ticket, batcher
     consecutive_failures = 0
-    max_failures = 30  # 10 seconds tolerance
+    max_failures = 30  # 30 seconds tolerance
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
     server_added = False
 
@@ -841,7 +814,15 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
                 # Offload potentially blocking metrics collection
                 metrics = await asyncio.to_thread(get_system_metrics)
                 metrics_dict = format_metrics_for_db(metrics)
-                _ = metrics_dict["total_free_vram_gb"]
+                # _ = metrics_dict["total_free_vram_gb"]
+                if batcher is not None:
+                    print("Batcher is not None")
+                    batch_size = batcher.get_queue_size()
+                    metrics_dict["batch_size"] = batch_size
+                    print("Batch size: ", batch_size)
+                else:
+                    print("added dummy batch size as non first peer")
+                    metrics_dict["batch_size"] = -1
 
                 payload = {
                     "peer_id": current_peer_ticket,
@@ -938,7 +919,7 @@ async def main():
         # Cancel background tasks
         heartbeat_task.cancel()
         gateway_task.cancel()
-        LMCacheEngineBuilder.destroy(ENGINE_NAME)
+        # LMCacheEngineBuilder.destroy(ENGINE_NAME)
         # debug_monitor_task.cancel()
         try:
             await heartbeat_task
