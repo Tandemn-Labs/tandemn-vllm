@@ -113,6 +113,7 @@ class HeartbeatRequest(BaseModel):
     gpu_info: Optional[List[Dict[str, Any]]] = None
     total_free_vram_gb: Optional[float] = None
     timestamp: int
+    batch_size: Optional[int] = None
 
 
 # still has to change
@@ -256,6 +257,7 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
             "gpu_count": hb.gpu_count,
             "gpu_info": hb.gpu_info or [],
             "timestamp": datetime.fromtimestamp(hb.timestamp),
+            "batch_size": hb.batch_size,
         }
         # uncomment when we need to do things with the database
         # Update MongoDB (time-series) using existing helper
@@ -275,6 +277,11 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         )
         # Colored log
         _ = _get_peer_color(hb.peer_id)
+        try:
+            print("✅ Current Queue Size: ", hb.batch_size)
+        except Exception:
+            print("❌ Error printing batch size")
+            pass
         # print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
         # print(f"🔗 Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
 
@@ -360,12 +367,6 @@ async def get_peer_metrics_endpoint(peer_id: str, time_window: int = 300):
         return {"status": "error", "detail": str(e)}
 
 
-# @app.get("/ticket")
-# async def get_ticket():
-#     """Endpoint to retrieve the document sharing ticket"""
-#     return {"ticket": str(ticket)}
-
-
 @app.post("/estimate_model")
 async def estimate_model(request: ModelEstimationRequest):
     """
@@ -378,11 +379,6 @@ async def estimate_model(request: ModelEstimationRequest):
         Dictionary containing total parameters and estimated VRAM
     """
     try:
-        # config = await download_config(
-        #     request.model_id,
-        #     request.hf_token,
-        #     request.filename
-        # )
         total_params = estimate_parameters(request.model_id, request.hf_token)
         # Convert qbits to appropriate dtype string for the VRAM calculation
         dtype_map = {4: "int4", 8: "int8", 16: "float16", 32: "float32"}
