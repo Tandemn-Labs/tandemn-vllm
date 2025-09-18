@@ -818,11 +818,11 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
                 if batcher is not None:
                     print("Batcher is not None")
                     batch_size = batcher.get_queue_size()
-                    metrics_dict["batch_size"] = batch_size
+                    metrics_dict["current_queue_size"] = batch_size
                     print("Batch size: ", batch_size)
                 else:
                     print("added dummy batch size as non first peer")
-                    metrics_dict["batch_size"] = -1
+                    metrics_dict["current_queue_size"] = -1
 
                 payload = {
                     "peer_id": current_peer_ticket,

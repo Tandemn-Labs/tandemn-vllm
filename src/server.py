@@ -74,9 +74,11 @@ active_peer_ids = set()  # Currently active peer node_ids
 peer_last_seen = {}  # Track when each peer was last seen
 PEER_TIMEOUT = 30  # Seconds before considering a peer dead
 PEER_CLEANUP_INTERVAL = 5  # Seconds
+BATCHED_BUFFER_TIMEOUT = 30  # Seconds
+latest_effective_buffer_size = 0
 # Task tracking for background operations
 background_tasks = {}  # Dict to track running background tasks
-
+_loop_for_buffer_size_task = None
 # model_name -> Dict of metadata
 active_deployments = {}
 
@@ -113,7 +115,7 @@ class HeartbeatRequest(BaseModel):
     gpu_info: Optional[List[Dict[str, Any]]] = None
     total_free_vram_gb: Optional[float] = None
     timestamp: int
-    batch_size: Optional[int] = None
+    current_queue_size: Optional[int] = None
 
 
 # still has to change
@@ -257,7 +259,7 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
             "gpu_count": hb.gpu_count,
             "gpu_info": hb.gpu_info or [],
             "timestamp": datetime.fromtimestamp(hb.timestamp),
-            "batch_size": hb.batch_size,
+            "current_queue_size": hb.current_queue_size,
         }
         # uncomment when we need to do things with the database
         # Update MongoDB (time-series) using existing helper
@@ -277,13 +279,11 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         )
         # Colored log
         _ = _get_peer_color(hb.peer_id)
-        try:
-            print("✅ Current Queue Size: ", hb.batch_size)
-        except Exception:
-            print("❌ Error printing batch size")
-            pass
-        # print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
-        # print(f"🔗 Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
+        # try:
+        #     print("✅ Current Queue Size: ", hb.current_queue_size)
+        # except Exception:
+        #     print("❌ Error printing batch size")
+        #     pass
 
         return {
             "status": "ok",
@@ -1561,3 +1561,75 @@ async def client_batch_test(request: Request):
 
     for peer in pipeline:
         await asyncio.create_task(tensor_transport.send(peer, "request", payload))
+
+
+class InferenceRequestBatched(BaseModel):
+    model_name: str
+    path_of_csv: str
+    name_of_column: str
+    system_prompt: str
+    max_tokens: int = 2000
+    max_buffer_size: int = 1000
+    min_buffer_size: int = 500
+    starting_id: int = 0
+    dry_run: bool = False
+
+
+@app.post("/infer_batched")
+async def infer_batched(request: InferenceRequestBatched):
+    global active_deployments, active_inferences, _loop_for_buffer_size_task
+    # Check if model is deployed
+    if request.model_name not in active_deployments:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model {request.model_name} is not deployed",
+        )
+    else:
+        if _loop_for_buffer_size_task is None:
+            _loop_for_buffer_size_task = asyncio.create_task(_loop_for_buffer_size())
+        # Get the maximum current buffer size from all active peers
+        current_buffer_size = await get_current_buffer_size_from_peers()
+
+        if current_buffer_size < request.min_buffer_size:
+            samples_to_send_for_inference = (
+                request.max_buffer_size - current_buffer_size
+            )
+        else:
+            # do nothing
+            pass
+
+        print(f"📊 Max current buffer size from peers: {current_buffer_size}")
+        print(
+            f"🎯 Effective batch size for processing: {samples_to_send_for_inference}"
+        )
+
+    return
+
+
+async def _loop_for_buffer_size():
+    global latest_effective_buffer_size
+    while True:
+        print("🔄 Monitored the Effective Buffer Size")
+        latest_effective_buffer_size = await get_current_buffer_size_from_peers()
+        await asyncio.sleep(BATCHED_BUFFER_TIMEOUT)
+
+
+async def get_current_buffer_size_from_peers():
+    """
+    Background service to find the current_buffer_size for all peers and find the effective current buffer size.
+    This represents the current buffer size of the HEAD peer.
+    """
+    peer_current_buffer_sizes = []
+    effective_current_buffer_size = 0
+
+    # Check each active peer's latest current buffer size
+    for peer_id in active_peer_ids:
+        # Get the most recent metrics for this peer
+        metrics_history = await get_peer_metrics(peer_id, time_window=60)
+        latest_metrics = metrics_history[0]["metrics"]
+        current_buffer_size = latest_metrics.get("current_buffer_size", 1)
+        peer_current_buffer_sizes.append(current_buffer_size)
+        effective_current_buffer_size = max(peer_current_buffer_sizes)
+
+    print(f"🏆 Current buffer size across all peers: {effective_current_buffer_size}")
+    return effective_current_buffer_size
