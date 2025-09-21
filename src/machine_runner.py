@@ -155,6 +155,10 @@ async def unified_message_gateway():
                 elif name.lower() == "dispatch":
                     handle_dispatch_message(tensor)
 
+                # 7. Receive batch injection
+                elif name.lower() == "batch_inject":
+                    await handle_batch_inject_message(tensor)
+
                 # 4. UNKNOWN MESSAGE TYPE
                 else:
                     print(
@@ -576,13 +580,27 @@ async def handle_unknown_message(name: str, tensor):
 # Create batch in a separate thread
 # Inform downstream peers of new batch
 async def dispatch_batch(
-    batch_id: str, model_name: str, queue: List[req_batcher.Request]
+    batch_id: str,
+    model_name: str,
+    queue: List[req_batcher.Request],
+    file_id: str = None,
+    batch_number: int = None,
 ):
-    global start_inference_run, pipeline, batch_metadata, tensor_transport, batcher
+    global \
+        start_inference_run, \
+        pipeline, \
+        batch_metadata, \
+        tensor_transport, \
+        mass_batcher, \
+        batcher
 
     try:
         request_ids = [req.id for req in queue]
         batch_metadata[batch_id] = {"request_id": request_ids}
+        if file_id:  # this is for the mass batcher
+            batch_metadata[batch_id]["file_id"] = file_id
+        if batch_number:  # this is for the mass batcher
+            batch_metadata[batch_id]["batch_number"] = batch_number
 
         payload = {"batch_id": batch_id, "request_id": request_ids}
         payload = json.dumps(payload).encode()
@@ -609,15 +627,31 @@ async def dispatch_batch(
         formatted_prompts = apply_chat_template_on_peer(prompts, deployed_model)
 
         loop = asyncio.get_running_loop()
-        _ = loop.run_in_executor(
-            None,
-            start_inference_run,
-            batch_id,
-            pipeline,
-            formatted_prompts,
-            [SamplingParams(**req.sampling_params) for req in queue],
-            batcher,
-        )
+        if (
+            not file_id and not batch_number
+        ):  # this is when we are using the normal batcher (online inference)
+            _ = loop.run_in_executor(
+                None,
+                start_inference_run,
+                batch_id,
+                pipeline,
+                formatted_prompts,
+                [SamplingParams(**req.sampling_params) for req in queue],
+                batcher,
+            )
+        else:
+            # this is when we are using the mass batcher (offline inference)
+            _ = loop.run_in_executor(
+                None,
+                start_inference_run,
+                batch_id,
+                pipeline,
+                formatted_prompts,
+                [SamplingParams(**req.sampling_params) for req in queue],
+                mass_batcher,
+                file_id,
+                batch_number,
+            )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         print(results)
@@ -783,6 +817,70 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
 # report_deployment_completion moved to deployment_utils.py
 
 
+async def handle_batch_inject_message(tensor):
+    """Instead of a single request, we are handling a full batch of requests"""
+    global mass_batcher, pipeline, current_peer_ticket, batch_metadata
+
+    try:
+        msg = parse_json_from_tensor(tensor)
+
+        # 1. Extract the batch information
+        task_id = msg["task_id"]
+        all_prompts = msg["prompt"]
+        model = msg["model"]
+        sampling_params = msg["sampling_params"]
+        max_batch_size = msg["max_batch_size"]
+        file_id = msg["file_id"]
+        batch_number = msg["batch_number"]
+
+        # 2. Store them in a metadata
+        batch_metadata[task_id] = {
+            "task_id": task_id,  # task id
+            "all_prompts": all_prompts,  # all the prompts in one batch
+            "model": model,  # name of the model
+            "sampling_params": sampling_params,
+        }
+
+        # 3. The batching should only happen on the first peer
+        if pipeline and current_peer_ticket == pipeline[0]:
+            # add the requests to the req_batcher aka buffer
+            # this now contains a HUGE LIST OF PROMPTS, one for each line in the file
+            # Initialize batcher
+            if mass_batcher is None:
+                print("handle_request_message() index == 0, batcher is None")
+                print(
+                    f"THREAD - {threading.current_thread().name}, {threading.current_thread().ident}"
+                )
+                loop = asyncio.get_running_loop()
+                print(f"asyncio loop - {id(loop)}, {loop}")
+                mass_batcher = req_batcher.MassBatcher(
+                    model_name=model,
+                    max_req=max_batch_size,  # basically what needs to be taken by vllm worker at one tine
+                    process_req_fn=dispatch_batch,
+                    file_id=file_id,
+                    batch_number=batch_number,
+                )
+            # Add request to batcher, now with the mass batcher
+            # this is where the batching happens, so it will take a batch of max_batch_size prompts and send it to the dispatch_batch function
+            await asyncio.create_task(
+                mass_batcher.add(
+                    req_batcher.MassRequest(
+                        id=task_id,
+                        prompt=all_prompts,  # careful this now contains the list of all prompts
+                        model_name=model,
+                        sampling_params=sampling_params,
+                    )
+                )
+            )
+
+        else:
+            print(f"🔍 Batching on non-first peer {current_peer_ticket}")
+            print(f"🔍 Batch metadata: {batch_metadata[task_id]}")
+
+    except Exception:
+        raise
+
+
 def get_model_status() -> Dict[str, Any]:
     """Get current model deployment status."""
     global deployed_model, deployment_status
@@ -802,7 +900,7 @@ def get_model_status() -> Dict[str, Any]:
 
 async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0):
     """Send heartbeat to central server over HTTP and exit if server stops responding."""
-    global central_server_ticket, batcher
+    global central_server_ticket, mass_batcher
     consecutive_failures = 0
     max_failures = 30  # 30 seconds tolerance
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
@@ -815,14 +913,16 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
                 metrics = await asyncio.to_thread(get_system_metrics)
                 metrics_dict = format_metrics_for_db(metrics)
                 # _ = metrics_dict["total_free_vram_gb"]
-                if batcher is not None:
-                    print("Batcher is not None")
-                    batch_size = batcher.get_queue_size()
-                    metrics_dict["current_queue_size"] = batch_size
-                    print("Batch size: ", batch_size)
+                if mass_batcher is not None:
+                    print("Mass Batcher is not None")
+                    buffer_size = mass_batcher.get_queue_size()
+                    metrics_dict["current_buffer_size"] = buffer_size
+                    print("Batch size: ", buffer_size)
                 else:
-                    print("added dummy batch size as non first peer")
-                    metrics_dict["current_queue_size"] = -1
+                    print(
+                        "added dummy batch size as non first peer and mass batcher is None"
+                    )
+                    metrics_dict["current_buffer_size"] = -1
 
                 payload = {
                     "peer_id": current_peer_ticket,

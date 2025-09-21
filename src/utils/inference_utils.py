@@ -8,10 +8,9 @@ from typing import Any, Dict, List, Optional
 import httpx  # type: ignore
 import numpy as np
 import torch
-from vllm import LLM  # type: ignore
 
-from src.utils import req_batcher
 from src.utils.tensor_protocol_adapter import TensorTransport
+from vllm import LLM  # type: ignore
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
@@ -637,7 +636,10 @@ def register_inference_hooks(
         pipeline: List[str],
         input_text: List[str],
         sampling_params: Any,
-        batcher: req_batcher.Batcher,
+        # batcher: req_batcher.Batcher,
+        batcher: Any,  # can be either the normal batcher or the mass batcher
+        file_id: str = None,  # these are only for the mass batcher, hence optional
+        batch_number: int = None,  # these are only for the mass batcher, hence optional
     ):
         """The main inference runner"""
 
@@ -745,6 +747,29 @@ def register_inference_hooks(
                         prompts=input_text, sampling_params=sampling_params
                     )
 
+                # this is only for the mass batcher, hence optional
+                if file_id and batch_number:
+                    if is_last:
+                        # extract results for this batch
+                        results = [comp.outputs[0].text for comp in completions]
+                        # save to S3 using a callback
+                        asyncio.run_coroutine_threadsafe(
+                            save_results_to_s3(
+                                file_id=file_id,
+                                batch_id=batch_id,
+                                batch_number=batch_number,
+                                results=results,
+                            ),
+                            asyncio_loop,
+                        )
+                        # clear busy flag for MassBatcher
+                        if hasattr(batcher, "busy_clear"):
+                            asyncio.run_coroutine_threadsafe(
+                                batcher.busy_clear(), asyncio_loop
+                            )
+                        # skip streaming as it will straight up exit if we save to S3
+                    return
+
                 # If last peer, send final result to server
                 if is_last and completions:
                     final_text = [comp.outputs[0].text for comp in completions]
@@ -834,13 +859,52 @@ def register_inference_hooks(
                 cleanup_request_context(batch_id)
 
                 # Tell main thread to schedule next batch
-                if peer_id == pipeline[0]:
+                if peer_id == pipeline[0] and not (file_id and batch_number):
                     asyncio.run_coroutine_threadsafe(batcher.busy_clear(), asyncio_loop)
 
         return
 
     # return the start_inference_run function
     return start_inference_run
+
+
+async def save_results_to_s3(
+    batch_id: str, file_id: str, batch_number: int, results: List[str]
+):
+    """
+    Save results to S3 per batch
+    """
+    import json
+    import os
+    from datetime import datetime
+
+    # create a new path
+    safe_file_id = file_id.replace("\\", "_").replace("/", "_").replace(":", "")
+    S3_BUCKET = os.environ.get("S3_RESULTS_BUCKET", "tandemn-results")
+    s3_path = (
+        f"s3://{S3_BUCKET}/results/{safe_file_id}/batch_{batch_number}_{batch_id}.json"
+    )
+
+    result_data = {
+        "batch_id": batch_id,
+        "file_id": file_id,
+        "batch_number": batch_number,
+        "timestamp": datetime.utcnow().isoformat(),
+        "results": results,
+        "num_results": len(results),
+    }
+
+    # Use smart_open to save to S3
+    from smart_open import open
+
+    try:
+        with open(s3_path, "w") as f:
+            json.dump(result_data, f, indent=2)
+
+        print(f"✅ Saved batch {batch_number} with {len(results)} results to S3")
+    except Exception as e:
+        print(f"❌ Failed to save to S3: {e}")
+        raise
 
 
 # Cleans up data structures and sends failure to server

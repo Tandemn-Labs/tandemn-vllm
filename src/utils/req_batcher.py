@@ -2,12 +2,19 @@ import asyncio
 import time
 import uuid
 from collections.abc import Coroutine
-from typing import Any, Callable, Dict, NamedTuple
+from typing import Any, Callable, Dict, List, NamedTuple
 
 
 class Request(NamedTuple):
     id: str
     prompt: str
+    model_name: str
+    sampling_params: Dict[Any, Any]
+
+
+class MassRequest(NamedTuple):
+    id: str
+    prompt: List[str]
     model_name: str
     sampling_params: Dict[Any, Any]
 
@@ -156,3 +163,101 @@ class Batcher:
     def get_inflight_count(self) -> int:
         """Get number of inflight requests (for monitoring)"""
         return len(self._inflight)
+
+
+class MassBatcher:
+    def __init__(
+        self, model_name: str, max_req: int, process_fn, file_id: str, batch_number: int
+    ):
+        self.model_name = model_name
+        self.max_req = max_req
+        self.process_fn = process_fn
+        self.lock = asyncio.Lock()
+        self.queue = []
+        self.running = False
+        self.file_id = file_id
+        self.batch_number = batch_number
+        self.inflight = set()
+
+    async def add(self, mass_req: MassRequest) -> None:
+        async with self.lock:
+            # Convert MassRequest to individual Requests
+            # this esentially populates the PEER SIDE BUFFER with individual requests
+            for i, prompt in enumerate(mass_req.prompt):
+                individual_req = Request(
+                    id=f"{mass_req.id}_{i}",
+                    prompt=prompt,  # Single prompt
+                    model_name=mass_req.model_name,
+                    sampling_params=mass_req.sampling_params,
+                )
+                self.queue.append(individual_req)
+
+            print(f"MassBatcher queue size: {len(self.queue)} prompts")
+
+            # Process when we have enough individual prompts
+            # it will take a batch of max_req prompts and send it to the dispatch_batch function
+            if len(self.queue) >= self.max_req and not self.running:
+                print("MassBatcher add() - flushing out the first batch")
+                await self.flush_req()
+
+    # Clear the busy status - Will flush out another batch once the busy_clear is called from the inference thread
+    # Have to be super careful! This function is called from a different thread
+    async def busy_clear(self):
+        """Called from inference thread to clear busy status"""
+        async with self.lock:
+            self.running = False
+            print(f"MassBatcher busy_clear() - running: {self.running}")
+            # Send out batch as soon as the busy_clear is called
+            await self.flush_req()
+
+    async def flush_req(self) -> None:
+        """Flush out the batch"""
+        # take a batch out of the queue and remove from queue
+        if not self.queue:  # Add safety check
+            return
+        if self.running:  # Prevent concurrent flushes
+            return
+        queue = self.queue[: self.max_req].copy()
+        del self.queue[: self.max_req]
+        # process the batch
+        try:
+            task = asyncio.create_task(
+                self.process_fn(
+                    batch_id=str(uuid.uuid4()),
+                    model_name=self.model_name,
+                    queue=queue,
+                    file_id=self.file_id,  # only for the mass batcher
+                    batch_number=self.batch_number,  # only for the mass batcher
+                )
+            )
+            self.inflight.add(task)
+
+            def _done(t: asyncio.Task) -> None:
+                self.inflight.discard(t)
+                # Check if task had an exception
+                if t.exception():
+                    print(
+                        f"Warning: Task in mass batcher failed with exception: {t.exception()}"
+                    )
+
+            task.add_done_callback(_done)  # ? How does it work?
+
+            # Update busy status
+            self.running = True
+
+        except Exception as e:
+            print(f"Error creating task in mass batcher: {e}")
+
+            import traceback
+
+            traceback.print_exc()
+
+            # Re-queue the requests if task creation failed
+            self.queue.extend(queue)
+
+    async def shutdown(self) -> None:
+        async with self.lock:
+            self.running = False
+
+    def get_queue_size(self) -> int:
+        return len(self.queue)

@@ -17,3 +17,4 @@ huggingface_hub[hf_transfer]
 tensor-iroh
 boto3 
 mistral-common>=1.7.0
+smart_open
