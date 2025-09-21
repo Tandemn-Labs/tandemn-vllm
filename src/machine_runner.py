@@ -78,6 +78,7 @@ PEER_COLOR = COLORS[
 ]  # deterministic per host
 # Batcher for this peer only if first peer
 batcher = None
+mass_batcher = None
 MAX_TIME_PER_BATCH = 1  # Max time we want to wait to fill up batches (in seconds)
 pipeline = None
 
@@ -900,7 +901,7 @@ def get_model_status() -> Dict[str, Any]:
 
 async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0):
     """Send heartbeat to central server over HTTP and exit if server stops responding."""
-    global central_server_ticket, mass_batcher
+    global central_server_ticket, mass_batcher, batcher
     consecutive_failures = 0
     max_failures = 30  # 30 seconds tolerance
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
@@ -918,6 +919,11 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
                     buffer_size = mass_batcher.get_queue_size()
                     metrics_dict["current_buffer_size"] = buffer_size
                     print("Batch size: ", buffer_size)
+                # elif batcher is not None:
+                #     print("Batcher is not None")
+                #     buffer_size = batcher.get_queue_size()
+                #     metrics_dict["current_buffer_size"] = buffer_size
+                #     print("Batch size: ", buffer_size)
                 else:
                     print(
                         "added dummy batch size as non first peer and mass batcher is None"
