@@ -598,10 +598,11 @@ async def dispatch_batch(
     try:
         request_ids = [req.id for req in queue]
         batch_metadata[batch_id] = {"request_id": request_ids}
-        if file_id:  # this is for the mass batcher
+        if file_id and batch_number:  # this is for the mass batcher
             batch_metadata[batch_id]["file_id"] = file_id
-        if batch_number:  # this is for the mass batcher
             batch_metadata[batch_id]["batch_number"] = batch_number
+            # now to add the ACTUAL PROMPTS to the batch metadata
+            batch_metadata[batch_id]["requests"] = [req.prompt for req in queue]
 
         payload = {"batch_id": batch_id, "request_id": request_ids}
         payload = json.dumps(payload).encode()
