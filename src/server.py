@@ -120,7 +120,7 @@ class HeartbeatRequest(BaseModel):
     gpu_info: Optional[List[Dict[str, Any]]] = None
     total_free_vram_gb: Optional[float] = None
     timestamp: int
-    current_queue_size: Optional[int] = None
+    current_buffer_size: Optional[int] = None
 
 
 # still has to change
@@ -264,7 +264,7 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
             "gpu_count": hb.gpu_count,
             "gpu_info": hb.gpu_info or [],
             "timestamp": datetime.fromtimestamp(hb.timestamp),
-            "current_queue_size": hb.current_queue_size,
+            "current_buffer_size": hb.current_buffer_size,
         }
         # uncomment when we need to do things with the database
         # Update MongoDB (time-series) using existing helper
@@ -284,11 +284,11 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         )
         # Colored log
         _ = _get_peer_color(hb.peer_id)
-        # try:
-        #     print("✅ Current Queue Size: ", hb.current_queue_size)
-        # except Exception:
-        #     print("❌ Error printing batch size")
-        #     pass
+        try:
+            print("✅ Current Buffer Size: ", hb.current_buffer_size)
+        except Exception:
+            print("❌ Error printing batch size")
+            pass
 
         return {
             "status": "ok",
