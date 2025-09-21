@@ -12,6 +12,7 @@ db = client[MONGODB_DB_NAME]
 # Collection names
 PEERS_COLLECTION = "peers"
 METRICS_COLLECTION = "metrics"
+BATCH_PROCESSING_COLLECTION = "batch_processing"
 
 
 async def setup_collections():
@@ -39,6 +40,10 @@ async def setup_collections():
     # Create indexes for peers collection
     await db[PEERS_COLLECTION].create_index("peer_id", unique=True)
     await db[PEERS_COLLECTION].create_index("last_seen")
+    # create index for batch processing collection
+    await db[BATCH_PROCESSING_COLLECTION].create_index(
+        "file_id", unique=True, expireAfterSeconds=86400
+    )
 
 
 def has_significant_change(
@@ -234,3 +239,50 @@ async def get_peer_status(peer_id: str) -> Optional[Dict[str, Any]]:
         "last_seen": peer["last_seen"],
         "metrics": latest_metrics,
     }
+
+
+async def save_csv_processing_state_by_file_id(
+    file_id: str,
+    task_id: str,
+    new_state: Dict[str, Any],
+):
+    """
+    Save the processing state of a CSV file by file_id.
+    """
+    await db[BATCH_PROCESSING_COLLECTION].update_one(
+        {"task_id": task_id},
+        {
+            "$set": {
+                "file_id": file_id,
+                "task_id": task_id,
+                "next_byte_position": new_state["next_byte_position"],
+                "last_processed_line": new_state["last_processed_line"],
+                "batch_count": new_state["batch_count"],
+                "timestamp": datetime.utcnow(),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def get_csv_processing_state_by_file_id(
+    file_id: str, task_id: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Get the processing state of a CSV file by file_id.
+    """
+    # find the current state of the file
+    current_state = await db[BATCH_PROCESSING_COLLECTION].find_one(
+        {"file_id": file_id, "task_id": task_id}
+    )
+    # make the data structured if found
+    if current_state:
+        return {
+            "file_id": current_state["file_id"],
+            "task_id": current_state["task_id"],
+            "next_byte_position": current_state["next_byte_position"],
+            "last_processed_line": current_state["last_processed_line"],
+            "batch_count": current_state["batch_count"],
+        }
+    # else don't return anything
+    return None
