@@ -537,11 +537,32 @@ def handle_dispatch_message(tensor):
         msg = parse_dispatch_message(tensor)
         batch_id = msg["batch_id"]
         request_ids = msg["request_id"]
-        print(f"handle_dispatch_message - batch: {batch_id}, reqs: {request_ids}")
+        # Check if this is a mass batcher request
+        if "prompts" in msg and "sampling_params" in msg:
+            print(
+                f"📦 handle_dispatch_message MASS BATCHER - batch: {batch_id}, reqs: {request_ids} - MASS BATCHER"
+            )
+            # this is a mass batcher request, STORE the prompts locally
+            prompts = msg["prompts"]
+            sampling_params_list = msg["sampling_params"]
+            # add them to request_metadata
+            for i, req_id in enumerate(request_ids):
+                request_metadata[req_id] = {
+                    "prompt": prompts[i],
+                    "sampling_params": sampling_params_list[i],
+                }
+            batch_metadata[batch_id] = {"request_id": request_ids}
+        else:
+            print(
+                f"📦 handle_dispatch_message - batch: {batch_id}, reqs: {request_ids} - NORMAL BATCHER"
+            )
+            # Regular flow - data should already be in request_metadata
+            batch_metadata[batch_id] = {"request_id": request_ids}
+            prompts = [request_metadata[req]["prompt"] for req in request_ids]
+            # this is a normal batcher request
 
-        batch_metadata[batch_id] = {"request_id": request_ids}
-        # Apply chat template to convert messages to prompt strings
-        prompts = [request_metadata[req]["prompt"] for req in request_ids]
+        # # Apply chat template to convert messages to prompt strings
+        # prompts = [request_metadata[req]["prompt"] for req in request_ids]
         formatted_prompts = apply_chat_template_on_peer(prompts, deployed_model)
 
         loop = asyncio.get_running_loop()
@@ -598,13 +619,14 @@ async def dispatch_batch(
     try:
         request_ids = [req.id for req in queue]
         batch_metadata[batch_id] = {"request_id": request_ids}
+
+        payload = {"batch_id": batch_id, "request_id": request_ids}
         if file_id and batch_number:  # this is for the mass batcher
             batch_metadata[batch_id]["file_id"] = file_id
             batch_metadata[batch_id]["batch_number"] = batch_number
-            # now to add the ACTUAL PROMPTS to the batch metadata
-            batch_metadata[batch_id]["requests"] = [req.prompt for req in queue]
+            payload["prompts"] = [req.prompt for req in queue]
+            payload["sampling_params"] = [req.sampling_params for req in queue]
 
-        payload = {"batch_id": batch_id, "request_id": request_ids}
         payload = json.dumps(payload).encode()
         payload = np.frombuffer(payload, dtype=np.uint8)
 
