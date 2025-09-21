@@ -762,6 +762,7 @@ def register_inference_hooks(
                             ),
                             asyncio_loop,
                         )
+
                         # clear busy flag for MassBatcher
                         if hasattr(batcher, "busy_clear"):
                             asyncio.run_coroutine_threadsafe(
