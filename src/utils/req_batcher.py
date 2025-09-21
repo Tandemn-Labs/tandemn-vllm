@@ -167,11 +167,16 @@ class Batcher:
 
 class MassBatcher:
     def __init__(
-        self, model_name: str, max_req: int, process_fn, file_id: str, batch_number: int
+        self,
+        model_name: str,
+        max_req: int,
+        process_req_fn,
+        file_id: str,
+        batch_number: int,
     ):
         self.model_name = model_name
         self.max_req = max_req
-        self.process_fn = process_fn
+        self.process_req_fn = process_req_fn
         self.lock = asyncio.Lock()
         self.queue = []
         self.running = False
@@ -222,7 +227,7 @@ class MassBatcher:
         # process the batch
         try:
             task = asyncio.create_task(
-                self.process_fn(
+                self.process_req_fn(
                     batch_id=str(uuid.uuid4()),
                     model_name=self.model_name,
                     queue=queue,
