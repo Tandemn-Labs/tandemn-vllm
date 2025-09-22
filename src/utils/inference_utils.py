@@ -783,10 +783,7 @@ def register_inference_hooks(
                         )
 
                         # clear busy flag for MassBatcher
-                        if hasattr(batcher, "busy_clear"):
-                            asyncio.run_coroutine_threadsafe(
-                                batcher.busy_clear(), asyncio_loop
-                            )
+                        # NO LONGER NEEDED HERE - moved to first peer
                         # skip streaming as it will straight up exit if we save to S3
                     return
 
@@ -879,10 +876,12 @@ def register_inference_hooks(
                 cleanup_request_context(batch_id)
 
                 # Tell main thread to schedule next batch
-                if peer_id == pipeline[0] and not (
-                    file_id is not None and batch_number is not None
-                ):
-                    asyncio.run_coroutine_threadsafe(batcher.busy_clear(), asyncio_loop)
+                if peer_id == pipeline[0]:
+                    # For both online and offline batchers on first peer
+                    if hasattr(batcher, "busy_clear"):
+                        asyncio.run_coroutine_threadsafe(
+                            batcher.busy_clear(), asyncio_loop
+                        )
 
         return
 
