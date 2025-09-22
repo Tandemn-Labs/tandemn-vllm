@@ -621,7 +621,9 @@ async def dispatch_batch(
         batch_metadata[batch_id] = {"request_id": request_ids}
 
         payload = {"batch_id": batch_id, "request_id": request_ids}
-        if file_id and batch_number:  # this is for the mass batcher
+        if (
+            file_id is not None and batch_number is not None
+        ):  # this is for the mass batcher
             batch_metadata[batch_id]["file_id"] = file_id
             batch_metadata[batch_id]["batch_number"] = batch_number
             payload["prompts"] = [req.prompt for req in queue]
@@ -652,7 +654,7 @@ async def dispatch_batch(
 
         loop = asyncio.get_running_loop()
         if (
-            not file_id and not batch_number
+            file_id is None and batch_number is None
         ):  # this is when we are using the normal batcher (online inference)
             _ = loop.run_in_executor(
                 None,
