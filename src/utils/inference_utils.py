@@ -168,6 +168,10 @@ def register_inference_hooks(
     server_url: str = "http://{SERVER_IP}:8000",
     next_peer_ticket: Optional[str] = None,
     pipeline: Optional[List[str]] = None,
+    file_id: Optional[str] = None,  # this is only for the mass batcher, hence optional
+    batch_number: Optional[
+        int
+    ] = None,  # this is only for the mass batcher, hence optional
 ):
     """
     Create pre and post hooks for the inference pipeline, to transfer hidden states
@@ -502,7 +506,14 @@ def register_inference_hooks(
             pipeline = hook_context["pipeline"]
             peer_id = hook_context["peer_id"]
             server_url = hook_context["server_url"]
-
+            file_id = (
+                hook_context["file_id"] if hook_context.get("file_id") else None
+            )  # add file_id if it exists
+            batch_number = (
+                hook_context["batch_number"]
+                if hook_context.get("batch_number")
+                else None
+            )  # add batch_number if it exists
         to_return = None
 
         # print(
@@ -578,12 +589,18 @@ def register_inference_hooks(
             #     f"sampler_post_hook - parent_seq_id: {parent_seq_id}, curr_seq: {curr_seq}, tokens_return: {tokens_return}"
             # )
             # print(f"sampler-post-hook - tokens_str {tokens_str}")
-            asyncio.run_coroutine_threadsafe(
-                stream_token_to_server(
-                    batch_id=batch_id, tokens=tokens_return, server_url=server_url
-                ),
-                asyncio_loop,
-            )
+
+            if (
+                file_id is not None and batch_number is not None
+            ):  # this is for the mass batcher (offline inference)
+                pass
+            else:  # this is for the normal batcher (online inference)
+                asyncio.run_coroutine_threadsafe(
+                    stream_token_to_server(
+                        batch_id=batch_id, tokens=tokens_return, server_url=server_url
+                    ),
+                    asyncio_loop,
+                )
 
             # print("sampler-post-hook: last-peer, returned same sampler")
             to_return = output
@@ -687,6 +704,8 @@ def register_inference_hooks(
                         # pre-seed with model-reported sizes when available
                         "hidden_size": get_model_hidden_size(),
                         "server_url": server_url,
+                        "file_id": file_id,  # add file_id if it exists
+                        "batch_number": batch_number,  # add batch_number if it exists
                     }
 
                 # Get this peer's assigned layers
