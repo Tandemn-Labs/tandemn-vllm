@@ -531,7 +531,7 @@ async def handle_request_message(tensor):
 
 
 def handle_dispatch_message(tensor):
-    global request_metadata, batch_metadata, batcher
+    global request_metadata, batch_metadata, batcher, mass_batcher
 
     try:
         msg = parse_dispatch_message(tensor)
@@ -552,6 +552,8 @@ def handle_dispatch_message(tensor):
                     "sampling_params": sampling_params_list[i],
                 }
             batch_metadata[batch_id] = {"request_id": request_ids}
+            batch_metadata[batch_id]["file_id"] = msg["file_id"]
+            batch_metadata[batch_id]["batch_number"] = msg["batch_number"]
         else:
             print(
                 f"📦 handle_dispatch_message - batch: {batch_id}, reqs: {request_ids} - NORMAL BATCHER"
@@ -577,6 +579,8 @@ def handle_dispatch_message(tensor):
                 for req in request_ids
             ],
             batcher,
+            file_id=msg["file_id"] if msg.get("file_id") else None,
+            batch_number=msg["batch_number"] if msg.get("batch_number") else None,
         )
 
     except Exception:
@@ -628,6 +632,8 @@ async def dispatch_batch(
             batch_metadata[batch_id]["batch_number"] = batch_number
             payload["prompts"] = [req.prompt for req in queue]
             payload["sampling_params"] = [req.sampling_params for req in queue]
+            payload["file_id"] = file_id
+            payload["batch_number"] = batch_number
 
         payload = json.dumps(payload).encode()
         payload = np.frombuffer(payload, dtype=np.uint8)
@@ -656,6 +662,7 @@ async def dispatch_batch(
         if (
             file_id is None and batch_number is None
         ):  # this is when we are using the normal batcher (online inference)
+            print(f"🔍 Using normal batcher (online inference) for batch {batch_id}")
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,
@@ -667,6 +674,7 @@ async def dispatch_batch(
             )
         else:
             # this is when we are using the mass batcher (offline inference)
+            print(f"🔍 Using mass batcher (offline inference) for batch {batch_id}")
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,
