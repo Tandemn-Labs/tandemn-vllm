@@ -748,7 +748,7 @@ def register_inference_hooks(
                     )
 
                 # this is only for the mass batcher, hence optional
-                if file_id and batch_number:
+                if file_id is not None and batch_number is not None:
                     if is_last:
                         # extract results for this batch
                         results = [comp.outputs[0].text for comp in completions]
@@ -860,7 +860,9 @@ def register_inference_hooks(
                 cleanup_request_context(batch_id)
 
                 # Tell main thread to schedule next batch
-                if peer_id == pipeline[0] and not (file_id and batch_number):
+                if peer_id == pipeline[0] and not (
+                    file_id is not None and batch_number is not None
+                ):
                     asyncio.run_coroutine_threadsafe(batcher.busy_clear(), asyncio_loop)
 
         return
