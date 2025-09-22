@@ -1752,7 +1752,7 @@ async def process_chunk_from_s3(
             print("📍 Starting from beginning")
             s3_file.readline()
             # skip the header only on the first batch
-            print("📋 Header: ", s3_file.readline().strip())
+            # print("📋 Header: ", s3_file.readline().strip())
         # Read the file in chunks based on the next micro_batch_size
         # reset the lines_processed to 0
         lines_processed = 0
