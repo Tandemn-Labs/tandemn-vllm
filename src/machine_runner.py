@@ -579,8 +579,8 @@ def handle_dispatch_message(tensor):
                 for req in request_ids
             ],
             batcher,
-            file_id=msg["file_id"] if msg.get("file_id") else None,
-            batch_number=msg["batch_number"] if msg.get("batch_number") else None,
+            msg["file_id"] if msg.get("file_id") else None,
+            msg["batch_number"] if msg.get("batch_number") else None,
         )
 
     except Exception:
