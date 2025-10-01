@@ -168,10 +168,6 @@ def register_inference_hooks(
     server_url: str = "http://{SERVER_IP}:8000",
     next_peer_ticket: Optional[str] = None,
     pipeline: Optional[List[str]] = None,
-    file_id: Optional[str] = None,  # this is only for the mass batcher, hence optional
-    batch_number: Optional[
-        int
-    ] = None,  # this is only for the mass batcher, hence optional
 ):
     """
     Create pre and post hooks for the inference pipeline, to transfer hidden states

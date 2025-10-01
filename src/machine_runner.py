@@ -385,6 +385,11 @@ async def handle_inference_trigger_message(tensor):
                 pipeline,
                 input_text_list,
                 sampling_params,
+                None,  # batcher
+                None,  # file_id
+                None,  # batch_number
+                False,  # is_last_batch
+                None,  # original_prompts
             )
 
             print(f"✅ Inference started for request {batch_id}")
@@ -817,12 +822,6 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             next_peer_ticket=instructions.get("next_peer_ticket"),
             pipeline=instructions.get("pipeline"),
             tokenizer=tokenizer,
-            file_id=instructions.get("file_id")
-            if instructions.get("file_id")
-            else None,  # add file_id if it exists
-            batch_number=instructions.get("batch_number")
-            if instructions.get("batch_number")
-            else None,  # add batch_number if it exists
         )
 
         # print(type(deployed_model))
