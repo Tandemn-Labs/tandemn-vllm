@@ -268,5 +268,5 @@ class MassBatcher:
         return len(self.queue)
 
     def is_last_batch(self) -> bool:
-        """Check if this is the last batch (queue will be empty after flush)"""
-        return len(self.queue) <= self.max_req
+        """Check if this is the last batch (queue is now empty after flush)"""
+        return len(self.queue) == 0

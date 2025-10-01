@@ -168,6 +168,10 @@ def register_inference_hooks(
     server_url: str = "http://{SERVER_IP}:8000",
     next_peer_ticket: Optional[str] = None,
     pipeline: Optional[List[str]] = None,
+    file_id: Optional[str] = None,  # this is only for the mass batcher, hence optional
+    batch_number: Optional[
+        int
+    ] = None,  # this is only for the mass batcher, hence optional
 ):
     """
     Create pre and post hooks for the inference pipeline, to transfer hidden states
@@ -949,6 +953,15 @@ async def upload_accumulated_results_to_s3(file_id: str):
 
     safe_file_id = file_id.replace("\\", "_").replace("/", "_").replace(":", "")
     local_path = f"local_results/{safe_file_id}_results.csv"
+
+    # Safety check: only upload if file exists and has content
+    if not os.path.exists(local_path):
+        print(f"⚠️ No local results file found at {local_path}, skipping upload")
+        return
+
+    if os.path.getsize(local_path) == 0:
+        print("⚠️ Local results file is empty, skipping upload")
+        return
 
     S3_BUCKET = os.environ.get("S3_RESULTS_BUCKET", "tandemn-results")
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
