@@ -657,8 +657,6 @@ def register_inference_hooks(
         batcher: Any,  # can be either the normal batcher or the mass batcher
         file_id: str = None,  # these are only for the mass batcher, hence optional
         batch_number: int = None,  # these are only for the mass batcher, hence optional
-        is_last_batch: bool = False,  # flag to indicate if this is the last batch
-        original_prompts: List = None,  # original prompts before formatting, for saving
     ):
         """The main inference runner"""
 
