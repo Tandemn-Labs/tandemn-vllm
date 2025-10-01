@@ -38,6 +38,7 @@ from src.config.settings import DEFAULT_QBITS, SERVER_HOST
 from src.utils.db_utils import (
     PEERS_COLLECTION,
     cleanup_inactive_peers,
+    clear_batch_processing_state_for_file,
     get_active_peers,
     get_csv_processing_state_by_file_id,
     get_peer_metrics,
@@ -1619,6 +1620,10 @@ async def infer_batched(request: InferenceRequestBatched):
             status_code=404,
             detail=f"Model {request.model_name} is not deployed",
         )
+
+    # CLEAR OLD BATCH STATE FOR THIS FILE - ensures fresh start every time
+    await clear_batch_processing_state_for_file(request.path_of_csv)
+
     # create an entry in the batch_processing_tasks which tracks the state of
     # the batch in the background
     task_id = str(uuid.uuid4())
