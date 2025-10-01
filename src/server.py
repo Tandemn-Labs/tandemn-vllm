@@ -1589,6 +1589,7 @@ class InferenceRequestBatched(BaseModel):
     path_of_csv: str
     name_of_column: str
     system_prompt: str
+    delimiter: str = ","  # CSV delimiter (comma by default)
     max_buffer_size: int = 1000
     min_buffer_size: int = 500
     starting_id: int = 0
@@ -1659,6 +1660,8 @@ async def _process_batch_continuously(request, task_id, pipeline):
                 task_id,
                 num_samples_to_send_in_batch,
                 request.system_prompt,
+                request.name_of_column,
+                request.delimiter,
             )
 
             # break the infinite loop if there are no samples to send for inference
@@ -1722,7 +1725,12 @@ async def get_current_buffer_size_from_peers():
 
 
 async def process_chunk_from_s3(
-    file_id: str, task_id: str, micro_batch_size: int, system_prompt: str
+    file_id: str,
+    task_id: str,
+    micro_batch_size: int,
+    system_prompt: str,
+    column_name: str,
+    delimiter: str = ",",
 ):
     """
     1 - Find the Current State of the File
@@ -1732,6 +1740,8 @@ async def process_chunk_from_s3(
     3 - Return the chunk back to the /infer_batched endpoint
     4 - Update the current state of the file in the MongoDB Database
     """
+    import csv
+
     # 1 - Find the Current State of the File
     current_state = await get_csv_processing_state_by_file_id(file_id, task_id)
     if not current_state:
@@ -1743,43 +1753,57 @@ async def process_chunk_from_s3(
 
     # 2 - Read the File in Chunks based on the next batch_size
     # Open the file
-    with open(file_id, "r") as s3_file:
+    with open(file_id, "r", encoding="utf-8") as s3_file:
+        # Create CSV reader
+        csv_reader = csv.DictReader(s3_file, delimiter=delimiter)
+
+        # Get column names from header
+        if not csv_reader.fieldnames:
+            print("❌ No header found in CSV file")
+            return [], current_state
+
+        # Verify column exists
+        if column_name not in csv_reader.fieldnames:
+            print(
+                f"❌ Column '{column_name}' not found in CSV. Available columns: {csv_reader.fieldnames}"
+            )
+            return [], current_state
+
         # HACK: Seek to where we left off (skip if first batch)
         if current_state["next_byte_position"] > 0:
             print(f"📍 Seeking to byte {current_state['next_byte_position']}")
             s3_file.seek(current_state["next_byte_position"])
         else:
             print("📍 Starting from beginning")
-            s3_file.readline()
-            # skip the header only on the first batch
-            # print("📋 Header: ", s3_file.readline().strip())
+            print(f"📋 CSV columns: {csv_reader.fieldnames}")
+
         # Read the file in chunks based on the next micro_batch_size
-        # reset the lines_processed to 0
         lines_processed = 0
         prompts_to_send_for_inference = []
+
         while lines_processed < micro_batch_size:
-            # Get position BEFORE reading the line
-            # line_start_position = s3_file.tell()
-            # Read the raw line
-            raw_line = s3_file.readline()
-            # Check if we hit end of file
-            if not raw_line:
+            try:
+                row = next(csv_reader)
+            except StopIteration:
                 print("📄 Reached end of file!")
                 break
-            # Parse the CSV line manually (simple hack)
-            row = (
-                raw_line.strip().replace('"', "").split("\n")
-            )  # Super basic CSV parsing
+
+            # Get the value from the specified column
+            content = row.get(column_name, "")
+            if not content:
+                print(
+                    f"⚠️ Empty content in column '{column_name}' at line {current_state['last_processed_line'] + lines_processed}"
+                )
+                continue
+
             current_line = current_state["last_processed_line"] + lines_processed
-            print(
-                f"🔥Processing line {current_line}: {row[0]}..."
-            )  # Just show first 2 columns
-            # add all prompts in a list and return it
-            # add the system prompt to the first position
+            print(f"🔥 Processing line {current_line}: {content[:50]}...")
+
+            # Add prompt with system message and user content
             prompts_to_send_for_inference.append(
                 [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": row[0]},
+                    {"role": "user", "content": content},
                 ]
             )
 
@@ -1788,14 +1812,13 @@ async def process_chunk_from_s3(
         if lines_processed == 0:
             return [], current_state
 
-        # if there are lines processed, return the prompts to send for inference and the new state
         # Get the current byte position
         current_byte_position = s3_file.tell()
 
     # Save the current state of the file
     new_state = {
         "next_byte_position": current_byte_position,
-        "last_processed_line": current_line,
+        "last_processed_line": current_state["last_processed_line"] + lines_processed,
         "batch_count": current_state["batch_count"] + 1,
     }
     await save_csv_processing_state_by_file_id(file_id, task_id, new_state)
