@@ -1589,7 +1589,7 @@ class InferenceRequestBatched(BaseModel):
     path_of_csv: str
     name_of_column: str
     system_prompt: str
-    delimiter: str = ","  # CSV delimiter (comma by default)
+    delimiter: str = ","  # CSV delimiter, default comma
     max_buffer_size: int = 1000
     min_buffer_size: int = 500
     starting_id: int = 0
@@ -1733,15 +1733,14 @@ async def process_chunk_from_s3(
     delimiter: str = ",",
 ):
     """
-    1 - Find the Current State of the File
+    1 - Find the Current State of the File (including column index)
     2 - Read the File in Chunks based on the next micro_batch_size
       - For that, resume the file from the given byte_position (given by Database)
       - For that, seek the file to the given byte_position
-    3 - Return the chunk back to the /infer_batched endpoint
-    4 - Update the current state of the file in the MongoDB Database
+    3 - Extract only the specified column from each row
+    4 - Return the chunk back to the /infer_batched endpoint
+    5 - Update the current state of the file in the MongoDB Database
     """
-    import csv
-
     # 1 - Find the Current State of the File
     current_state = await get_csv_processing_state_by_file_id(file_id, task_id)
     if not current_state:
@@ -1749,65 +1748,73 @@ async def process_chunk_from_s3(
             "next_byte_position": 0,
             "last_processed_line": 0,
             "batch_count": 0,
+            "column_index": None,  # Store column index to avoid re-parsing header
         }
 
     # 2 - Read the File in Chunks based on the next batch_size
     # Open the file
     with open(file_id, "r", encoding="utf-8") as s3_file:
-        # Create CSV reader
-        csv_reader = csv.DictReader(s3_file, delimiter=delimiter)
-
-        # Get column names from header
-        if not csv_reader.fieldnames:
-            print("❌ No header found in CSV file")
-            return [], current_state
-
-        # Verify column exists
-        if column_name not in csv_reader.fieldnames:
-            print(
-                f"❌ Column '{column_name}' not found in CSV. Available columns: {csv_reader.fieldnames}"
-            )
-            return [], current_state
+        column_index = current_state.get("column_index")
 
         # HACK: Seek to where we left off (skip if first batch)
         if current_state["next_byte_position"] > 0:
             print(f"📍 Seeking to byte {current_state['next_byte_position']}")
             s3_file.seek(current_state["next_byte_position"])
         else:
-            print("📍 Starting from beginning")
-            print(f"📋 CSV columns: {csv_reader.fieldnames}")
+            print("📍 Starting from beginning - parsing header")
+            # Read and parse header to find column index
+            header_line = s3_file.readline()
+            header_columns = [
+                col.strip().strip('"') for col in header_line.strip().split(delimiter)
+            ]
+
+            try:
+                column_index = header_columns.index(column_name)
+                print(f"✅ Found column '{column_name}' at index {column_index}")
+                print(f"📋 Header columns: {header_columns}")
+            except ValueError:
+                raise ValueError(
+                    f"Column '{column_name}' not found in CSV header. Available columns: {header_columns}"
+                )
 
         # Read the file in chunks based on the next micro_batch_size
         lines_processed = 0
         prompts_to_send_for_inference = []
+        current_line = current_state["last_processed_line"]
 
         while lines_processed < micro_batch_size:
-            try:
-                row = next(csv_reader)
-            except StopIteration:
+            # Read the raw line
+            raw_line = s3_file.readline()
+
+            # Check if we hit end of file
+            if not raw_line:
                 print("📄 Reached end of file!")
                 break
 
-            # Get the value from the specified column
-            content = row.get(column_name, "")
-            if not content:
-                print(
-                    f"⚠️ Empty content in column '{column_name}' at line {current_state['last_processed_line'] + lines_processed}"
+            # Parse the CSV line using the specified delimiter
+            # Handle quoted fields by simple strip (works for most cases)
+            row = [col.strip().strip('"') for col in raw_line.strip().split(delimiter)]
+
+            # Extract only the specified column
+            if column_index < len(row):
+                column_value = row[column_index]
+                current_line += 1
+                print(f"🔥 Processing line {current_line}: {column_value[:50]}...")
+
+                # Add prompt to list with system prompt
+                prompts_to_send_for_inference.append(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": column_value},
+                    ]
                 )
-                continue
+                lines_processed += 1
+            else:
+                print(
+                    f"⚠️ Skipping malformed line {current_line + 1}: not enough columns"
+                )
+                current_line += 1
 
-            current_line = current_state["last_processed_line"] + lines_processed
-            print(f"🔥 Processing line {current_line}: {content[:50]}...")
-
-            # Add prompt with system message and user content
-            prompts_to_send_for_inference.append(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content},
-                ]
-            )
-
-            lines_processed += 1
         # if no lines processed, return the empty list and the current state
         if lines_processed == 0:
             return [], current_state
@@ -1818,8 +1825,9 @@ async def process_chunk_from_s3(
     # Save the current state of the file
     new_state = {
         "next_byte_position": current_byte_position,
-        "last_processed_line": current_state["last_processed_line"] + lines_processed,
+        "last_processed_line": current_line,
         "batch_count": current_state["batch_count"] + 1,
+        "column_index": column_index,  # Save column index for next batch
     }
     await save_csv_processing_state_by_file_id(file_id, task_id, new_state)
     print(f"🔄 Saved the current state of the file: {new_state}")
