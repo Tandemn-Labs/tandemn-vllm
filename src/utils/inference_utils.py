@@ -657,6 +657,8 @@ def register_inference_hooks(
         batcher: Any,  # can be either the normal batcher or the mass batcher
         file_id: str = None,  # these are only for the mass batcher, hence optional
         batch_number: int = None,  # these are only for the mass batcher, hence optional
+        is_last_batch: bool = False,  # flag to indicate if this is the last batch
+        original_prompts: List = None,  # original prompts before formatting, for saving
     ):
         """The main inference runner"""
 
@@ -771,20 +773,30 @@ def register_inference_hooks(
                     if is_last:
                         # extract results for this batch
                         results = [comp.outputs[0].text for comp in completions]
-                        # save to S3 using a callback
+                        # Use original_prompts if available, otherwise fall back to input_text
+                        prompts_to_save = (
+                            original_prompts if original_prompts else input_text
+                        )
+                        # save locally first
                         asyncio.run_coroutine_threadsafe(
-                            save_results_to_s3(
+                            append_results_locally(
                                 file_id=file_id,
-                                batch_id=batch_id,
                                 batch_number=batch_number,
+                                prompts=prompts_to_save,
                                 results=results,
                             ),
                             asyncio_loop,
                         )
 
-                        # clear busy flag for MassBatcher
-                        # NO LONGER NEEDED HERE - moved to first peer
-                        # skip streaming as it will straight up exit if we save to S3
+                        # If this is the last batch, upload accumulated file to S3
+                        if is_last_batch:
+                            print(
+                                "🏁 Last batch detected! Uploading accumulated results to S3..."
+                            )
+                            asyncio.run_coroutine_threadsafe(
+                                upload_accumulated_results_to_s3(file_id=file_id),
+                                asyncio_loop,
+                            )
                     return
 
                 # If last peer, send final result to server
@@ -889,42 +901,77 @@ def register_inference_hooks(
     return start_inference_run
 
 
-async def save_results_to_s3(
-    batch_id: str, file_id: str, batch_number: int, results: List[str]
+async def append_results_locally(
+    file_id: str, batch_number: int, prompts: List, results: List[str]
 ):
     """
-    Save results to S3 per batch
+    Append results to local CSV file per batch
     """
+    import csv
     import json
+    import os
+
+    # Create local results directory
+    os.makedirs("local_results", exist_ok=True)
+
+    # Create safe filename
+    safe_file_id = file_id.replace("\\", "_").replace("/", "_").replace(":", "")
+    local_path = f"local_results/{safe_file_id}_results.csv"
+
+    # Append to CSV (create if doesn't exist)
+    file_exists = os.path.exists(local_path)
+
+    try:
+        with open(local_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            # Write header if new file
+            if not file_exists:
+                writer.writerow(["batch_number", "prompt", "result"])
+            # Write rows
+            for prompt, result in zip(prompts, results):
+                # Convert prompt to string if it's a message list
+                if isinstance(prompt, list):
+                    prompt_str = json.dumps(prompt)
+                else:
+                    prompt_str = str(prompt)
+                writer.writerow([batch_number, prompt_str, result])
+
+        print(f"✅ Appended batch {batch_number} with {len(results)} results locally")
+    except Exception as e:
+        print(f"❌ Failed to append results locally: {e}")
+        raise
+
+
+async def upload_accumulated_results_to_s3(file_id: str):
+    """
+    Upload accumulated CSV file to S3 once all batches are done
+    """
     import os
     from datetime import datetime
 
-    # create a new path
-    safe_file_id = file_id.replace("\\", "_").replace("/", "_").replace(":", "")
-    S3_BUCKET = os.environ.get("S3_RESULTS_BUCKET", "tandemn-results")
-    s3_path = (
-        f"s3://{S3_BUCKET}/results/{safe_file_id}/batch_{batch_number}_{batch_id}.json"
-    )
-
-    result_data = {
-        "batch_id": batch_id,
-        "file_id": file_id,
-        "batch_number": batch_number,
-        "timestamp": datetime.utcnow().isoformat(),
-        "results": results,
-        "num_results": len(results),
-    }
-
-    # Use smart_open to save to S3
     from smart_open import open
 
-    try:
-        with open(s3_path, "w") as f:
-            json.dump(result_data, f, indent=2)
+    safe_file_id = file_id.replace("\\", "_").replace("/", "_").replace(":", "")
+    local_path = f"local_results/{safe_file_id}_results.csv"
 
-        print(f"✅ Saved batch {batch_number} with {len(results)} results to S3")
+    S3_BUCKET = os.environ.get("S3_RESULTS_BUCKET", "tandemn-results")
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    s3_path = f"s3://{S3_BUCKET}/results/{safe_file_id}_final_{timestamp}.csv"
+
+    try:
+        # Read local file and upload to S3
+        with open(local_path, "r", encoding="utf-8") as local_f:
+            with open(s3_path, "w", encoding="utf-8") as s3_f:
+                s3_f.write(local_f.read())
+
+        print(f"✅ Uploaded final accumulated results to S3: {s3_path}")
+
+        # Optionally clean up local file
+        # os.remove(local_path)
+        # print(f"🧹 Cleaned up local file: {local_path}")
+
     except Exception as e:
-        print(f"❌ Failed to save to S3: {e}")
+        print(f"❌ Failed to upload to S3: {e}")
         raise
 
 
