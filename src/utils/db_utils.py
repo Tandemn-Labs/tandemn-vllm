@@ -258,6 +258,7 @@ async def save_csv_processing_state_by_file_id(
                 "next_byte_position": new_state["next_byte_position"],
                 "last_processed_line": new_state["last_processed_line"],
                 "batch_count": new_state["batch_count"],
+                "column_index": new_state.get("column_index"),  # Save column index
                 "timestamp": datetime.utcnow(),
             }
         },
@@ -283,6 +284,7 @@ async def get_csv_processing_state_by_file_id(
             "next_byte_position": current_state["next_byte_position"],
             "last_processed_line": current_state["last_processed_line"],
             "batch_count": current_state["batch_count"],
+            "column_index": current_state.get("column_index"),  # Load column index
         }
     # else don't return anything
     return None

@@ -78,7 +78,7 @@ active_peer_ids = set()  # Currently active peer node_ids
 peer_last_seen = {}  # Track when each peer was last seen
 PEER_TIMEOUT = 30  # Seconds before considering a peer dead
 PEER_CLEANUP_INTERVAL = 5  # Seconds
-BATCHED_BUFFER_TIMEOUT = 30  # Seconds
+BATCHED_BUFFER_TIMEOUT = 10  # Seconds
 latest_effective_buffer_size = 0
 # Task tracking for background operations
 background_tasks = {}  # Dict to track running background tasks
