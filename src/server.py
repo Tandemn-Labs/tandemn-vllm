@@ -1631,6 +1631,11 @@ async def infer_batched(request: InferenceRequestBatched):
         "status": "queued",
         "request": request,
         "started_at": time.time(),
+        "progress": {
+            "lines_processed": 0,
+            "batches_sent": 0,
+            "current_buffer_size": 0,
+        },
     }
     # 1. Get the deployment map
     deployment_map = active_deployments[request.model_name]["deployment_map"]
@@ -1648,24 +1653,42 @@ async def infer_batched(request: InferenceRequestBatched):
     return {
         "status": "queued",
         "task_id": task_id,
-        "message": "Batch Processing Task Queued",
+        "message": "Batch Processing Task Queued - use /batch_task_status/{task_id} to monitor",
     }
 
 
 @app.get("/batch_task_status/{task_id}")
 async def get_batch_task_status(task_id: str):
-    """Get the status of a batch processing task"""
+    """Get real-time status and progress of a batch processing task"""
     if task_id not in batch_processing_tasks:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
     task = batch_processing_tasks[task_id]
+    progress = task.get("progress", {})
+
     response = {
         "task_id": task_id,
         "status": task.get("status", "unknown"),
         "started_at": task.get("started_at"),
-        "batch_state": task.get("batch_state"),
-        "error": task.get("error"),
+        "progress": {
+            "lines_processed": progress.get("lines_processed", 0),
+            "batches_sent": progress.get("batches_sent", 0),
+            "current_buffer_size": progress.get("current_buffer_size", 0),
+        },
     }
+
+    # Add error if failed
+    if task.get("error"):
+        response["error"] = task["error"]
+
+    # Add performance metrics if running
+    if task.get("started_at") and task.get("status") in ["processing", "completed"]:
+        elapsed = time.time() - task["started_at"]
+        lines = progress.get("lines_processed", 0)
+        response["performance"] = {
+            "elapsed_seconds": round(elapsed, 1),
+            "lines_per_second": round(lines / elapsed, 2) if elapsed > 0 else 0,
+        }
 
     return response
 
@@ -1674,6 +1697,9 @@ async def _process_batch_continuously(request, task_id, pipeline):
     global latest_effective_buffer_size
     print(f"🚀 Starting continuous batch processing for task {task_id}")
 
+    # Mark as processing
+    batch_processing_tasks[task_id]["status"] = "processing"
+
     while True:
         try:
             print(f"🔄 Monitored the Effective Buffer Size (task: {task_id})")
@@ -1681,6 +1707,11 @@ async def _process_batch_continuously(request, task_id, pipeline):
             latest_effective_buffer_size = await get_current_buffer_size_from_peers()
             print(
                 f"📊 Buffer: {latest_effective_buffer_size}, Min: {request.min_buffer_size}, Max: {request.max_buffer_size}"
+            )
+
+            # Update buffer size in progress
+            batch_processing_tasks[task_id]["progress"]["current_buffer_size"] = (
+                latest_effective_buffer_size
             )
 
             # check if the buffer size is below the threshold
@@ -1722,8 +1753,13 @@ async def _process_batch_continuously(request, task_id, pipeline):
                 # just to know what the max batch size is for vLLM
                 max_batch = active_deployments[request.model_name]["max_req_per_batch"]
 
-                # store the state of the batch that is being sent to the buffer
-                batch_processing_tasks[task_id]["batch_state"] = batch_state
+                # Update progress with latest state from MongoDB
+                batch_processing_tasks[task_id]["progress"].update(
+                    {
+                        "lines_processed": batch_state.get("last_processed_line", 0),
+                        "batches_sent": batch_state.get("batch_count", 0),
+                    }
+                )
 
                 # create the payload to send to the peers
                 payload = {
