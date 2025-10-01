@@ -554,6 +554,7 @@ def handle_dispatch_message(tensor):
             batch_metadata[batch_id] = {"request_id": request_ids}
             batch_metadata[batch_id]["file_id"] = msg["file_id"]
             batch_metadata[batch_id]["batch_number"] = msg["batch_number"]
+            batch_metadata[batch_id]["is_last_batch"] = msg.get("is_last_batch", False)
         else:
             print(
                 f"📦 handle_dispatch_message - batch: {batch_id}, reqs: {request_ids} - NORMAL BATCHER"
@@ -581,6 +582,8 @@ def handle_dispatch_message(tensor):
             batcher,
             msg["file_id"] if msg.get("file_id") else None,
             msg["batch_number"] if msg.get("batch_number") else None,
+            msg.get("is_last_batch", False),
+            prompts if msg.get("file_id") else None,  # original prompts for saving
         )
 
     except Exception:
@@ -634,6 +637,10 @@ async def dispatch_batch(
             payload["sampling_params"] = [req.sampling_params for req in queue]
             payload["file_id"] = file_id
             payload["batch_number"] = batch_number
+            # Check if this is the last batch
+            payload["is_last_batch"] = (
+                mass_batcher.is_last_batch() if mass_batcher else False
+            )
 
         payload = json.dumps(payload).encode()
         payload = np.frombuffer(payload, dtype=np.uint8)
@@ -671,10 +678,15 @@ async def dispatch_batch(
                 formatted_prompts,
                 [SamplingParams(**req.sampling_params) for req in queue],
                 batcher,
+                None,
+                None,
+                False,
+                None,
             )
         else:
             # this is when we are using the mass batcher (offline inference)
             print(f"🔍 Using mass batcher (offline inference) for batch {batch_id}")
+            is_last = mass_batcher.is_last_batch() if mass_batcher else False
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,
@@ -685,6 +697,8 @@ async def dispatch_batch(
                 mass_batcher,
                 file_id,
                 batch_number,
+                is_last,
+                prompts,  # original prompts for saving
             )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
