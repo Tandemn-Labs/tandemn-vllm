@@ -1622,7 +1622,11 @@ async def infer_batched(request: InferenceRequestBatched):
     # create an entry in the batch_processing_tasks which tracks the state of
     # the batch in the background
     task_id = str(uuid.uuid4())
-    batch_processing_tasks[task_id] = {"status": "queued", "request": request}
+    batch_processing_tasks[task_id] = {
+        "status": "queued",
+        "request": request,
+        "started_at": time.time(),
+    }
     # 1. Get the deployment map
     deployment_map = active_deployments[request.model_name]["deployment_map"]
     if not deployment_map:
@@ -1643,64 +1647,122 @@ async def infer_batched(request: InferenceRequestBatched):
     }
 
 
+@app.get("/batch_task_status/{task_id}")
+async def get_batch_task_status(task_id: str):
+    """Get the status of a batch processing task"""
+    if task_id not in batch_processing_tasks:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    task = batch_processing_tasks[task_id]
+    response = {
+        "task_id": task_id,
+        "status": task.get("status", "unknown"),
+        "started_at": task.get("started_at"),
+        "batch_state": task.get("batch_state"),
+        "error": task.get("error"),
+    }
+
+    return response
+
+
 async def _process_batch_continuously(request, task_id, pipeline):
     global latest_effective_buffer_size
+    print(f"🚀 Starting continuous batch processing for task {task_id}")
+
     while True:
-        print("🔄 Monitored the Effective Buffer Size")
-        # check the buffer size of the peers
-        latest_effective_buffer_size = await get_current_buffer_size_from_peers()
-        # check if the buffer size is below the threshold
-        if latest_effective_buffer_size < request.min_buffer_size:
-            num_samples_to_send_in_batch = (
-                request.max_buffer_size - latest_effective_buffer_size
-            )
-            # take the system prompt and the number of samples, and create the prompts to be sent
-            samples_to_send_for_inference, batch_state = await process_chunk_from_s3(
-                request.path_of_csv,
-                task_id,
-                num_samples_to_send_in_batch,
-                request.system_prompt,
-                request.name_of_column,
-                request.delimiter,
+        try:
+            print(f"🔄 Monitored the Effective Buffer Size (task: {task_id})")
+            # check the buffer size of the peers
+            latest_effective_buffer_size = await get_current_buffer_size_from_peers()
+            print(
+                f"📊 Buffer: {latest_effective_buffer_size}, Min: {request.min_buffer_size}, Max: {request.max_buffer_size}"
             )
 
-            # break the infinite loop if there are no samples to send for inference
-            if not samples_to_send_for_inference:
-                print("🔍 No samples to send for inference")
-                batch_processing_tasks[task_id]["status"] = "completed"
-                return
-            input_text = collect_messages(samples_to_send_for_inference, batched=True)
-            sampling_params = build_sampling_params(request)
+            # check if the buffer size is below the threshold
+            if latest_effective_buffer_size < request.min_buffer_size:
+                num_samples_to_send_in_batch = (
+                    request.max_buffer_size - latest_effective_buffer_size
+                )
+                print(
+                    f"📤 Sending {num_samples_to_send_in_batch} samples to fill buffer"
+                )
 
-            # just to know what the max batch size is for vLLM
-            max_batch = active_deployments[request.model_name]["max_req_per_batch"]
+                # take the system prompt and the number of samples, and create the prompts to be sent
+                (
+                    samples_to_send_for_inference,
+                    batch_state,
+                ) = await process_chunk_from_s3(
+                    request.path_of_csv,
+                    task_id,
+                    num_samples_to_send_in_batch,
+                    request.system_prompt,
+                    request.name_of_column,
+                    request.delimiter,
+                )
 
-            # store the state of the batch that is being sent to the buffer
-            batch_processing_tasks[task_id]["batch_state"] = batch_state
+                # break the infinite loop if there are no samples to send for inference
+                if not samples_to_send_for_inference:
+                    print("✅ No more samples to send - file processing completed!")
+                    batch_processing_tasks[task_id]["status"] = "completed"
+                    return
 
-            # create the payload to send to the peers
-            payload = {
-                "task_id": task_id,
-                "prompt": input_text,
-                "model": request.model_name,
-                "sampling_params": sampling_params,
-                "max_batch_size": max_batch,
-                "file_id": request.path_of_csv,
-                "batch_number": batch_state["batch_count"],
-            }
-            payload = json.dumps(payload).encode()
-            payload = np.frombuffer(payload, dtype=np.uint8)
+                print(
+                    f"✅ Loaded {len(samples_to_send_for_inference)} samples from CSV"
+                )
+                input_text = collect_messages(
+                    samples_to_send_for_inference, batched=True
+                )
+                sampling_params = build_sampling_params(request)
 
-            # send the payload to the peers
-            # only send it to the first peer, the rest of them really dont need the batch information
-            if not request.dry_run:
-                await tensor_transport.send(pipeline[0], "batch_inject", payload)
-                # update the batch count after sending it to the peers
-                batch_state["batch_count"] += 1
+                # just to know what the max batch size is for vLLM
+                max_batch = active_deployments[request.model_name]["max_req_per_batch"]
+
+                # store the state of the batch that is being sent to the buffer
+                batch_processing_tasks[task_id]["batch_state"] = batch_state
+
+                # create the payload to send to the peers
+                payload = {
+                    "task_id": task_id,
+                    "prompt": input_text,
+                    "model": request.model_name,
+                    "sampling_params": sampling_params,
+                    "max_batch_size": max_batch,
+                    "file_id": request.path_of_csv,
+                    "batch_number": batch_state["batch_count"],
+                }
+                payload = json.dumps(payload).encode()
+                payload = np.frombuffer(payload, dtype=np.uint8)
+
+                # send the payload to the peers
+                # only send it to the first peer, the rest of them really dont need the batch information
+                if not request.dry_run:
+                    print(
+                        f"📡 Sending batch {batch_state['batch_count']} to peer {pipeline[0][:8]}..."
+                    )
+                    await tensor_transport.send(pipeline[0], "batch_inject", payload)
+                    # update the batch count after sending it to the peers
+                    batch_state["batch_count"] += 1
+                    print(
+                        f"✅ Batch {batch_state['batch_count'] - 1} sent successfully"
+                    )
+                else:
+                    print(f"🔍 Dry run: Would have sent batch to peer {pipeline[0]}")
             else:
-                print(f"🔍 Dry run: Would have sent batch to peer {pipeline[0]}")
+                print(
+                    f"⏸️  Buffer is full enough ({latest_effective_buffer_size} >= {request.min_buffer_size}), waiting..."
+                )
 
-        await asyncio.sleep(BATCHED_BUFFER_TIMEOUT)
+            print(f"⏳ Sleeping for {BATCHED_BUFFER_TIMEOUT}s before next check...")
+            await asyncio.sleep(BATCHED_BUFFER_TIMEOUT)
+
+        except Exception as e:
+            print(f"❌ ERROR in _process_batch_continuously: {type(e).__name__}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            batch_processing_tasks[task_id]["status"] = "failed"
+            batch_processing_tasks[task_id]["error"] = str(e)
+            return
 
 
 async def get_current_buffer_size_from_peers():
@@ -1713,14 +1775,31 @@ async def get_current_buffer_size_from_peers():
 
     # Check each active peer's latest current buffer size
     for peer_id in active_peer_ids:
-        # Get the most recent metrics for this peer
-        metrics_history = await get_peer_metrics(peer_id, time_window=60)
-        latest_metrics = metrics_history[0]["metrics"]
-        current_buffer_size = latest_metrics.get("current_buffer_size", 1)
-        peer_current_buffer_sizes.append(current_buffer_size)
-        effective_current_buffer_size = max(peer_current_buffer_sizes)
+        try:
+            # Get the most recent metrics for this peer
+            metrics_history = await get_peer_metrics(peer_id, time_window=60)
+            if not metrics_history:
+                print(f"⚠️  No metrics found for peer {peer_id[:8]}...")
+                continue
 
-    print(f"🏆 Current buffer size across all peers: {effective_current_buffer_size}")
+            latest_metrics = metrics_history[0]["metrics"]
+            current_buffer_size = latest_metrics.get("current_buffer_size", -1)
+
+            # Only count positive buffer sizes (first peer in pipeline)
+            if current_buffer_size >= 0:
+                peer_current_buffer_sizes.append(current_buffer_size)
+                print(f"📊 Peer {peer_id[:8]}: buffer = {current_buffer_size}")
+        except Exception as e:
+            print(f"⚠️  Error getting metrics for peer {peer_id[:8]}: {e}")
+            continue
+
+    if peer_current_buffer_sizes:
+        effective_current_buffer_size = max(peer_current_buffer_sizes)
+    else:
+        effective_current_buffer_size = 0
+        print("⚠️  No valid buffer sizes found from any peer, defaulting to 0")
+
+    print(f"🏆 Effective buffer size across all peers: {effective_current_buffer_size}")
     return effective_current_buffer_size
 
 
