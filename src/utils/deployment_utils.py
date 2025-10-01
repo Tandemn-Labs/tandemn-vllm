@@ -633,16 +633,16 @@ def create_dynamic_vllm_model(
 
     # Apply the monkey patch
     import vllm.model_executor.models.utils as model_utils
-    # from vllm.config import KVTransferConfig
+    from vllm.config import KVTransferConfig
 
     original_make_layers = model_utils.make_layers
     model_utils.make_layers = _selective_make_layers
 
-    # ktc = KVTransferConfig(
-    #     kv_connector="LMCacheConnector",  # v0 connector
-    #     kv_role="kv_both",  # single process does store+retrieve
-    #     # For multi-process prefill/decode, use kv_producer/kv_consumer below
-    # )
+    ktc = KVTransferConfig(
+        kv_connector="LMCacheConnector",  # v0 connector
+        kv_role="kv_both",  # single process does store+retrieve
+        # For multi-process prefill/decode, use kv_producer/kv_consumer below
+    )
     # speculative_config = {
     #     "method": "ngram",
     #     "prompt_lookup_max": 5,
@@ -660,7 +660,7 @@ def create_dynamic_vllm_model(
             "gpu_memory_utilization": 0.9,
             "load_format": "dummy",
             "dtype": dtype or "float16",
-            # "kv_transfer_config": ktc,
+            "kv_transfer_config": ktc,
             "skip_tokenizer_init": False,
             "use_v2_block_manager": False,
             "max_model_len": 16400,
