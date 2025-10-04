@@ -389,6 +389,7 @@ async def handle_inference_trigger_message(tensor):
                 None,  # batch_number
                 False,  # is_last_batch
                 None,  # original_prompts
+                None,  # task_id not applicable for inference trigger
             )
 
             print(f"✅ Inference started for request {batch_id}")
@@ -588,6 +589,7 @@ def handle_dispatch_message(tensor):
             msg["batch_number"] if msg.get("batch_number") else None,
             msg.get("is_last_batch", False),
             prompts if msg.get("file_id") else None,  # original prompts for saving
+            None,  # task_id not applicable for dispatch messages
         )
 
     except Exception:
@@ -686,11 +688,14 @@ async def dispatch_batch(
                 None,
                 False,
                 None,
+                None,  # task_id not applicable for online inference
             )
         else:
             # this is when we are using the mass batcher (offline inference)
             print(f"🔍 Using mass batcher (offline inference) for batch {batch_id}")
             is_last = mass_batcher.is_last_batch() if mass_batcher else False
+            # For mass batcher, the first request_id is the task_id
+            task_id_to_pass = request_ids[0] if request_ids else None
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,
@@ -703,6 +708,7 @@ async def dispatch_batch(
                 batch_number,
                 is_last,
                 prompts,  # original prompts for saving
+                task_id_to_pass,  # pass task_id for S3 result tracking
             )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
