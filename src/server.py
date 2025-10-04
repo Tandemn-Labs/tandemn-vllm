@@ -8,7 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import boto3
 import numpy as np
+from botocore.exceptions import ClientError
 from colorama import Fore  # ADD
 from colorama import init as colorama_init
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -69,6 +71,9 @@ active_requests = {}  # Request ID -> Dict of metadata
 central_server_ticket = None
 
 logger = logging.getLogger(__name__)
+
+# Initialize S3 client for batch results
+s3_client = boto3.client("s3")
 
 
 # ? What is the difference between the following 3 peer lists?
@@ -1956,92 +1961,84 @@ async def process_chunk_from_s3(
 
 @app.get("/get_results/{task_id}")
 async def get_results(task_id: str):
-    """
-    Download final results file
-    """
-    try:
-        if task_id not in batch_processing_tasks:
-            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    """Download final results file from S3"""
+    # Validate task exists
+    if task_id not in batch_processing_tasks:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
-        task = batch_processing_tasks[task_id]
-        if task.get("status") != "completed":
-            raise HTTPException(
-                status_code=400, detail=f"Task {task_id} is not completed yet"
-            )
-
-        # get original request
-        request_data = task.get("request")
-        if not request_data:
-            raise HTTPException(
-                status_code=404, detail="Original request data not found"
-            )
-
-        # make s3 path
-        original_file_path = request_data.path_of_csv
-        safe_file_id = (
-            original_file_path.replace("\\", "_").replace("/", "_").replace(":", "")
+    task = batch_processing_tasks[task_id]
+    if task.get("status") != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task status: {task.get('status')}. Only completed tasks have results.",
         )
 
-        S3_RESULTS_BUCKET = os.environ.get("S3_RESULTS_BUCKET", "tandemn-results")
+    # Get original file path
+    request_data = task.get("request")
+    if not request_data:
+        raise HTTPException(status_code=404, detail="Request data not found")
 
-        # find the matching result file
-        import boto3
-        from botocore.exceptions import ClientError
+    # Transform path to safe filename (matches inference_utils.py logic)
+    original_file_path = request_data.path_of_csv
+    safe_file_id = (
+        original_file_path.replace("\\", "_").replace("/", "_").replace(":", "")
+    )
 
-        s3_client = boto3.client("s3")
+    # Construct S3 search prefix
+    S3_RESULTS_BUCKET = os.environ.get("S3_RESULTS_BUCKET", "tandemn-results")
+    prefix = f"results/{safe_file_id}_final_"
 
-        try:
-            prefix = f"results/{safe_file_id}_final_"
-            response = s3_client.list_objects_v2(
-                Bucket=S3_RESULTS_BUCKET, Prefix=prefix
+    print(f"🔍 Searching S3 for: s3://{S3_RESULTS_BUCKET}/{prefix}*")
+
+    try:
+        # Search for result files
+        response = s3_client.list_objects_v2(Bucket=S3_RESULTS_BUCKET, Prefix=prefix)
+
+        if "Contents" not in response:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No results found. Searched: s3://{S3_RESULTS_BUCKET}/{prefix}*",
             )
 
-            if "Contents" not in response:
-                raise HTTPException(
-                    status_code=404, detail="Results file not found in S3"
-                )
-
-            csv_files = [
-                obj for obj in response["Contents"] if obj["Key"].endswith(".csv")
-            ]
-
-            if not csv_files:
-                raise HTTPException(status_code=404, detail="No CSV results file found")
-
-            # most recent file (in case of multiple)
-            latest_file = max(csv_files, key=lambda x: x["LastModified"])
-            s3_key = latest_file["Key"]
-
-            # signed URL
-            signed_url = s3_client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": S3_RESULTS_BUCKET, "Key": s3_key},
-                ExpiresIn=3600,  # 1 hour
+        # Filter CSV files
+        csv_files = [obj for obj in response["Contents"] if obj["Key"].endswith(".csv")]
+        if not csv_files:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Found files but none are CSV. Searched: {prefix}*",
             )
 
-            return {
-                "download_url": signed_url,
-                "filename": s3_key.split("/")[-1],
-                "file_size": latest_file["Size"],
-                "last_modified": latest_file["LastModified"].isoformat(),
-            }
+        # Get most recent file
+        latest_file = max(csv_files, key=lambda x: x["LastModified"])
+        s3_key = latest_file["Key"]
 
-        except ClientError as e:
-            error_code = e.response["Error"]["Code"]
-            if error_code == "NoSuchBucket":
-                raise HTTPException(
-                    status_code=404, detail=f"S3 bucket '{S3_RESULTS_BUCKET}' not found"
-                )
-            elif error_code == "AccessDenied":
-                raise HTTPException(
-                    status_code=403, detail="Access denied to S3 bucket"
-                )
-            else:
-                raise HTTPException(status_code=500, detail=f"S3 error: {error_code}")
+        print(f"✅ Found result file: s3://{S3_RESULTS_BUCKET}/{s3_key}")
+
+        # Generate presigned URL
+        signed_url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_RESULTS_BUCKET, "Key": s3_key},
+            ExpiresIn=3600,  # 1 hour
+        )
+
+        return {
+            "download_url": signed_url,
+            "filename": s3_key.split("/")[-1],
+            "file_size": latest_file["Size"],
+            "last_modified": latest_file["LastModified"].isoformat(),
+        }
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code == "NoSuchBucket":
+            raise HTTPException(
+                status_code=404, detail=f"S3 bucket not found: {S3_RESULTS_BUCKET}"
+            )
+        elif error_code == "AccessDenied":
+            raise HTTPException(status_code=403, detail="Access denied to S3")
+        raise HTTPException(status_code=500, detail=f"S3 error: {error_code}")
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Error retrieving results: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
