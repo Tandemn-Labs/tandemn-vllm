@@ -573,6 +573,10 @@ def handle_dispatch_message(tensor):
         # prompts = [request_metadata[req]["prompt"] for req in request_ids]
         formatted_prompts = apply_chat_template_on_peer(prompts, deployed_model)
 
+        # Extract task_id from dispatch message if this is mass batcher
+        task_id_from_dispatch = msg.get("task_id") if msg.get("file_id") else None
+        print(f"📋 Non-first peer received batch with task_id: {task_id_from_dispatch}")
+
         loop = asyncio.get_running_loop()
         _ = loop.run_in_executor(
             None,
@@ -589,7 +593,7 @@ def handle_dispatch_message(tensor):
             msg["batch_number"] if msg.get("batch_number") else None,
             msg.get("is_last_batch", False),
             prompts if msg.get("file_id") else None,  # original prompts for saving
-            None,  # task_id not applicable for dispatch messages
+            task_id_from_dispatch,  # Get task_id from dispatch payload
         )
 
     except Exception:
@@ -634,15 +638,22 @@ async def dispatch_batch(
         batch_metadata[batch_id] = {"request_id": request_ids}
 
         payload = {"batch_id": batch_id, "request_id": request_ids}
-        if (
-            file_id is not None and batch_number is not None
-        ):  # this is for the mass batcher
+
+        # For mass batcher, extract task_id (which is stored as request_ids[0])
+        task_id_for_payload = None
+        if file_id is not None and batch_number is not None:
+            # This is the mass batcher case
+            task_id_for_payload = request_ids[0] if request_ids else None
             batch_metadata[batch_id]["file_id"] = file_id
             batch_metadata[batch_id]["batch_number"] = batch_number
+            batch_metadata[batch_id]["task_id"] = (
+                task_id_for_payload  # Store for later use
+            )
             payload["prompts"] = [req.prompt for req in queue]
             payload["sampling_params"] = [req.sampling_params for req in queue]
             payload["file_id"] = file_id
             payload["batch_number"] = batch_number
+            payload["task_id"] = task_id_for_payload  # Pass to other peers!
             # Check if this is the last batch
             payload["is_last_batch"] = (
                 mass_batcher.is_last_batch() if mass_batcher else False
@@ -695,7 +706,8 @@ async def dispatch_batch(
             print(f"🔍 Using mass batcher (offline inference) for batch {batch_id}")
             is_last = mass_batcher.is_last_batch() if mass_batcher else False
             # For mass batcher, the first request_id is the task_id
-            task_id_to_pass = request_ids[0] if request_ids else None
+            task_id_to_pass = task_id_for_payload  # Use the extracted task_id
+            print(f"📋 First peer dispatching batch with task_id: {task_id_to_pass}")
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,

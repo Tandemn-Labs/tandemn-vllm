@@ -1966,6 +1966,11 @@ async def batch_upload_complete(request: Request):
     task_id = data.get("task_id")
     s3_path = data.get("s3_path")
 
+    print("📡 Received upload notification:")
+    print(f"   Task ID: {task_id}")
+    print(f"   S3 Path: {s3_path}")
+    print(f"   Known tasks: {list(batch_processing_tasks.keys())}")
+
     if not task_id or not s3_path:
         raise HTTPException(status_code=400, detail="task_id and s3_path required")
 
@@ -1973,8 +1978,9 @@ async def batch_upload_complete(request: Request):
         batch_processing_tasks[task_id]["s3_result_path"] = s3_path
         print(f"✅ Stored S3 result path for task {task_id}: {s3_path}")
         return {"status": "success", "message": "S3 path recorded"}
-
-    return {"status": "warning", "message": "Task not found but path recorded"}
+    else:
+        print(f"⚠️ Task {task_id} not found in batch_processing_tasks!")
+        return {"status": "warning", "message": "Task not found but path recorded"}
 
 
 @app.get("/get_results/{task_id}")
