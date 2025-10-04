@@ -659,6 +659,7 @@ def register_inference_hooks(
         batch_number: int = None,  # these are only for the mass batcher, hence optional
         is_last_batch: bool = False,  # flag to indicate if this is the last batch
         original_prompts: List = None,  # original prompts before formatting, for saving
+        task_id: str = None,  # task_id for tracking batch processing jobs
     ):
         """The main inference runner"""
 
@@ -793,8 +794,14 @@ def register_inference_hooks(
                             print(
                                 "🏁 Last batch detected! Uploading accumulated results to S3..."
                             )
+                            # Use task_id if provided, otherwise fall back to batch_id
+                            upload_task_id = task_id if task_id else batch_id
                             asyncio.run_coroutine_threadsafe(
-                                upload_accumulated_results_to_s3(file_id=file_id),
+                                upload_accumulated_results_to_s3(
+                                    file_id=file_id,
+                                    task_id=upload_task_id,
+                                    server_url=server_url,
+                                ),
                                 asyncio_loop,
                             )
                     return
@@ -942,9 +949,12 @@ async def append_results_locally(
         raise
 
 
-async def upload_accumulated_results_to_s3(file_id: str):
+async def upload_accumulated_results_to_s3(
+    file_id: str, task_id: str, server_url: str
+) -> Optional[str]:
     """
-    Upload accumulated CSV file to S3 once all batches are done
+    Upload accumulated CSV file to S3 once all batches are done.
+    Returns the S3 path if successful, None otherwise.
     """
     import os
     from datetime import datetime
@@ -957,11 +967,11 @@ async def upload_accumulated_results_to_s3(file_id: str):
     # Safety check: only upload if file exists and has content
     if not os.path.exists(local_path):
         print(f"⚠️ No local results file found at {local_path}, skipping upload")
-        return
+        return None
 
     if os.path.getsize(local_path) == 0:
         print("⚠️ Local results file is empty, skipping upload")
-        return
+        return None
 
     S3_BUCKET = os.environ.get("S3_RESULTS_BUCKET", "tandemn-results")
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -975,13 +985,26 @@ async def upload_accumulated_results_to_s3(file_id: str):
 
         print(f"✅ Uploaded final accumulated results to S3: {s3_path}")
 
+        # Notify server that upload is complete
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{server_url}/batch_upload_complete",
+                    json={"task_id": task_id, "s3_path": s3_path},
+                )
+                print(f"✅ Notified server of upload completion for task {task_id}")
+        except Exception as e:
+            print(f"⚠️ Failed to notify server of upload completion: {e}")
+
         # Optionally clean up local file
         # os.remove(local_path)
         # print(f"🧹 Cleaned up local file: {local_path}")
 
+        return s3_path
+
     except Exception as e:
         print(f"❌ Failed to upload to S3: {e}")
-        raise
+        return None
 
 
 # Cleans up data structures and sends failure to server
