@@ -796,6 +796,9 @@ def register_inference_hooks(
                             )
                             # Use task_id if provided, otherwise fall back to batch_id
                             upload_task_id = task_id if task_id else batch_id
+                            print(
+                                f"🔍 Uploading with task_id: {upload_task_id} (original: {task_id}, batch: {batch_id})"
+                            )
                             asyncio.run_coroutine_threadsafe(
                                 upload_accumulated_results_to_s3(
                                     file_id=file_id,
@@ -992,7 +995,7 @@ async def upload_accumulated_results_to_s3(
                     f"{server_url}/batch_upload_complete",
                     json={"task_id": task_id, "s3_path": s3_path},
                 )
-                print(f"✅ Notified server of upload completion for task {task_id}")
+                print(f"✅ Notified server of S3 upload for task_id: {task_id}")
         except Exception as e:
             print(f"⚠️ Failed to notify server of upload completion: {e}")
 
