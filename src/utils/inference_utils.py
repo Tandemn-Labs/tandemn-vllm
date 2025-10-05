@@ -999,9 +999,9 @@ async def upload_accumulated_results_to_s3(
         except Exception as e:
             print(f"⚠️ Failed to notify server of upload completion: {e}")
 
-        # Optionally clean up local file
-        # os.remove(local_path)
-        # print(f"🧹 Cleaned up local file: {local_path}")
+        # Clean up local file after successful upload
+        os.remove(local_path)
+        print(f"🧹 Cleaned up local file: {local_path}")
 
         return s3_path
 
