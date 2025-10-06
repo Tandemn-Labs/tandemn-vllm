@@ -8,10 +8,9 @@ from typing import Any, Dict, List, Optional
 import httpx  # type: ignore
 import numpy as np
 import torch
-from vllm import LLM  # type: ignore
 
-from src.utils import req_batcher
 from src.utils.tensor_protocol_adapter import TensorTransport
+from vllm import LLM  # type: ignore
 
 # This global dictionary holds the actual tensor data, not futures
 # Key: request_id (str)
@@ -169,6 +168,10 @@ def register_inference_hooks(
     server_url: str = "http://{SERVER_IP}:8000",
     next_peer_ticket: Optional[str] = None,
     pipeline: Optional[List[str]] = None,
+    file_id: Optional[str] = None,  # this is only for the mass batcher, hence optional
+    batch_number: Optional[
+        int
+    ] = None,  # this is only for the mass batcher, hence optional
 ):
     """
     Create pre and post hooks for the inference pipeline, to transfer hidden states
@@ -503,7 +506,14 @@ def register_inference_hooks(
             pipeline = hook_context["pipeline"]
             peer_id = hook_context["peer_id"]
             server_url = hook_context["server_url"]
-
+            file_id = (
+                hook_context["file_id"] if hook_context.get("file_id") else None
+            )  # add file_id if it exists
+            batch_number = (
+                hook_context["batch_number"]
+                if hook_context.get("batch_number")
+                else None
+            )  # add batch_number if it exists
         to_return = None
 
         # print(
@@ -579,12 +589,18 @@ def register_inference_hooks(
             #     f"sampler_post_hook - parent_seq_id: {parent_seq_id}, curr_seq: {curr_seq}, tokens_return: {tokens_return}"
             # )
             # print(f"sampler-post-hook - tokens_str {tokens_str}")
-            asyncio.run_coroutine_threadsafe(
-                stream_token_to_server(
-                    batch_id=batch_id, tokens=tokens_return, server_url=server_url
-                ),
-                asyncio_loop,
-            )
+
+            if (
+                file_id is not None and batch_number is not None
+            ):  # this is for the mass batcher (offline inference)
+                pass
+            else:  # this is for the normal batcher (online inference)
+                asyncio.run_coroutine_threadsafe(
+                    stream_token_to_server(
+                        batch_id=batch_id, tokens=tokens_return, server_url=server_url
+                    ),
+                    asyncio_loop,
+                )
 
             # print("sampler-post-hook: last-peer, returned same sampler")
             to_return = output
@@ -637,7 +653,13 @@ def register_inference_hooks(
         pipeline: List[str],
         input_text: List[str],
         sampling_params: Any,
-        batcher: req_batcher.Batcher,
+        # batcher: req_batcher.Batcher,
+        batcher: Any,  # can be either the normal batcher or the mass batcher
+        file_id: str = None,  # these are only for the mass batcher, hence optional
+        batch_number: int = None,  # these are only for the mass batcher, hence optional
+        is_last_batch: bool = False,  # flag to indicate if this is the last batch
+        original_prompts: List = None,  # original prompts before formatting, for saving
+        task_id: str = None,  # task_id for tracking batch processing jobs
     ):
         """The main inference runner"""
 
@@ -685,6 +707,8 @@ def register_inference_hooks(
                         # pre-seed with model-reported sizes when available
                         "hidden_size": get_model_hidden_size(),
                         "server_url": server_url,
+                        "file_id": file_id,  # add file_id if it exists
+                        "batch_number": batch_number,  # add batch_number if it exists
                     }
 
                 # Get this peer's assigned layers
@@ -744,6 +768,46 @@ def register_inference_hooks(
                     completions = llm.generate(
                         prompts=input_text, sampling_params=sampling_params
                     )
+
+                # this is only for the mass batcher, hence optional
+                if file_id is not None and batch_number is not None:
+                    if is_last:
+                        # extract results for this batch
+                        results = [comp.outputs[0].text for comp in completions]
+                        # Use original_prompts if available, otherwise fall back to input_text
+                        prompts_to_save = (
+                            original_prompts if original_prompts else input_text
+                        )
+                        # save locally first
+                        asyncio.run_coroutine_threadsafe(
+                            append_results_locally(
+                                file_id=file_id,
+                                batch_number=batch_number,
+                                prompts=prompts_to_save,
+                                results=results,
+                            ),
+                            asyncio_loop,
+                        )
+
+                        # If this is the last batch, upload accumulated file to S3
+                        if is_last_batch:
+                            print(
+                                "🏁 Last batch detected! Uploading accumulated results to S3..."
+                            )
+                            # Use task_id if provided, otherwise fall back to batch_id
+                            upload_task_id = task_id if task_id else batch_id
+                            print(
+                                f"🔍 Uploading with task_id: {upload_task_id} (original: {task_id}, batch: {batch_id})"
+                            )
+                            asyncio.run_coroutine_threadsafe(
+                                upload_accumulated_results_to_s3(
+                                    file_id=file_id,
+                                    task_id=upload_task_id,
+                                    server_url=server_url,
+                                ),
+                                asyncio_loop,
+                            )
+                    return
 
                 # If last peer, send final result to server
                 if is_last and completions:
@@ -835,12 +899,115 @@ def register_inference_hooks(
 
                 # Tell main thread to schedule next batch
                 if peer_id == pipeline[0]:
-                    asyncio.run_coroutine_threadsafe(batcher.busy_clear(), asyncio_loop)
+                    # For both online and offline batchers on first peer
+                    if hasattr(batcher, "busy_clear"):
+                        asyncio.run_coroutine_threadsafe(
+                            batcher.busy_clear(), asyncio_loop
+                        )
 
         return
 
     # return the start_inference_run function
     return start_inference_run
+
+
+async def append_results_locally(
+    file_id: str, batch_number: int, prompts: List, results: List[str]
+):
+    """
+    Append results to local CSV file per batch
+    """
+    import csv
+    import json
+    import os
+
+    # Create local results directory
+    os.makedirs("local_results", exist_ok=True)
+
+    # Create safe filename
+    safe_file_id = file_id.replace("\\", "_").replace("/", "_").replace(":", "")
+    local_path = f"local_results/{safe_file_id}_results.csv"
+
+    # Append to CSV (create if doesn't exist)
+    file_exists = os.path.exists(local_path)
+
+    try:
+        with open(local_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            # Write header if new file
+            if not file_exists:
+                writer.writerow(["batch_number", "prompt", "result"])
+            # Write rows
+            for prompt, result in zip(prompts, results):
+                # Convert prompt to string if it's a message list
+                if isinstance(prompt, list):
+                    prompt_str = json.dumps(prompt)
+                else:
+                    prompt_str = str(prompt)
+                writer.writerow([batch_number, prompt_str, result])
+
+        print(f"✅ Appended batch {batch_number} with {len(results)} results locally")
+    except Exception as e:
+        print(f"❌ Failed to append results locally: {e}")
+        raise
+
+
+async def upload_accumulated_results_to_s3(
+    file_id: str, task_id: str, server_url: str
+) -> Optional[str]:
+    """
+    Upload accumulated CSV file to S3 once all batches are done.
+    Returns the S3 path if successful, None otherwise.
+    """
+    import os
+    from datetime import datetime
+
+    from smart_open import open
+
+    safe_file_id = file_id.replace("\\", "_").replace("/", "_").replace(":", "")
+    local_path = f"local_results/{safe_file_id}_results.csv"
+
+    # Safety check: only upload if file exists and has content
+    if not os.path.exists(local_path):
+        print(f"⚠️ No local results file found at {local_path}, skipping upload")
+        return None
+
+    if os.path.getsize(local_path) == 0:
+        print("⚠️ Local results file is empty, skipping upload")
+        return None
+
+    S3_BUCKET = os.environ.get("S3_RESULTS_BUCKET", "tandemn-results")
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    s3_path = f"s3://{S3_BUCKET}/results/{safe_file_id}_final_{timestamp}.csv"
+
+    try:
+        # Read local file and upload to S3
+        with open(local_path, "r", encoding="utf-8") as local_f:
+            with open(s3_path, "w", encoding="utf-8") as s3_f:
+                s3_f.write(local_f.read())
+
+        print(f"✅ Uploaded final accumulated results to S3: {s3_path}")
+
+        # Notify server that upload is complete
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{server_url}/batch_upload_complete",
+                    json={"task_id": task_id, "s3_path": s3_path},
+                )
+                print(f"✅ Notified server of S3 upload for task_id: {task_id}")
+        except Exception as e:
+            print(f"⚠️ Failed to notify server of upload completion: {e}")
+
+        # Clean up local file after successful upload
+        os.remove(local_path)
+        print(f"🧹 Cleaned up local file: {local_path}")
+
+        return s3_path
+
+    except Exception as e:
+        print(f"❌ Failed to upload to S3: {e}")
+        return None
 
 
 # Cleans up data structures and sends failure to server

@@ -8,7 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import boto3
 import numpy as np
+from botocore.exceptions import ClientError
 from colorama import Fore  # ADD
 from colorama import init as colorama_init
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -32,12 +34,17 @@ from src.utils.tensor_protocol_adapter import TensorTransport
 # Ensure accelerated downloads from Hugging Face hub are enabled for this process
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
+from smart_open import open
+
 from src.config.settings import DEFAULT_QBITS, SERVER_HOST
 from src.utils.db_utils import (
     PEERS_COLLECTION,
     cleanup_inactive_peers,
+    clear_batch_processing_state_for_file,
     get_active_peers,
+    get_csv_processing_state_by_file_id,
     get_peer_metrics,
+    save_csv_processing_state_by_file_id,
     setup_collections,
     update_peer_metrics,
 )
@@ -65,6 +72,9 @@ central_server_ticket = None
 
 logger = logging.getLogger(__name__)
 
+# Initialize S3 client for batch results
+s3_client = boto3.client("s3")
+
 
 # ? What is the difference between the following 3 peer lists?
 peer_table: Dict[str, str] = {}
@@ -74,9 +84,12 @@ active_peer_ids = set()  # Currently active peer node_ids
 peer_last_seen = {}  # Track when each peer was last seen
 PEER_TIMEOUT = 30  # Seconds before considering a peer dead
 PEER_CLEANUP_INTERVAL = 5  # Seconds
+BATCHED_BUFFER_TIMEOUT = 10  # Seconds
+latest_effective_buffer_size = 0
 # Task tracking for background operations
 background_tasks = {}  # Dict to track running background tasks
-
+batch_processing_tasks = {}
+_process_batch_continuously = None
 # model_name -> Dict of metadata
 active_deployments = {}
 
@@ -113,6 +126,7 @@ class HeartbeatRequest(BaseModel):
     gpu_info: Optional[List[Dict[str, Any]]] = None
     total_free_vram_gb: Optional[float] = None
     timestamp: int
+    current_buffer_size: Optional[int] = None
 
 
 # still has to change
@@ -256,6 +270,7 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
             "gpu_count": hb.gpu_count,
             "gpu_info": hb.gpu_info or [],
             "timestamp": datetime.fromtimestamp(hb.timestamp),
+            "current_buffer_size": hb.current_buffer_size,
         }
         # uncomment when we need to do things with the database
         # Update MongoDB (time-series) using existing helper
@@ -275,8 +290,11 @@ async def heartbeat_endpoint(hb: HeartbeatRequest, request: Request):
         )
         # Colored log
         _ = _get_peer_color(hb.peer_id)
-        # print(f"{color}💓 HB from {hb.peer_id[:6]} @ {peer_ip} | CPU {hb.cpu:.1f}% RAM {hb.ram:.1f}% VRAM {hb.total_free_vram_gb:.1f} GB {Style.RESET_ALL}")
-        # print(f"🔗 Active peers: {len(active_peer_ids)} ({list(peer_table.keys())})")
+        try:
+            print("✅ Current Buffer Size: ", hb.current_buffer_size)
+        except Exception:
+            print("❌ Error printing batch size")
+            pass
 
         return {
             "status": "ok",
@@ -360,12 +378,6 @@ async def get_peer_metrics_endpoint(peer_id: str, time_window: int = 300):
         return {"status": "error", "detail": str(e)}
 
 
-# @app.get("/ticket")
-# async def get_ticket():
-#     """Endpoint to retrieve the document sharing ticket"""
-#     return {"ticket": str(ticket)}
-
-
 @app.post("/estimate_model")
 async def estimate_model(request: ModelEstimationRequest):
     """
@@ -378,11 +390,6 @@ async def estimate_model(request: ModelEstimationRequest):
         Dictionary containing total parameters and estimated VRAM
     """
     try:
-        # config = await download_config(
-        #     request.model_id,
-        #     request.hf_token,
-        #     request.filename
-        # )
         total_params = estimate_parameters(request.model_id, request.hf_token)
         # Convert qbits to appropriate dtype string for the VRAM calculation
         dtype_map = {4: "int4", 8: "int8", 16: "float16", 32: "float32"}
@@ -1050,6 +1057,7 @@ async def deployment_complete(data: DeploymentCompleteData):
         raise HTTPException(404, f"No deployment found for model {data.model_name}")
 
     status_map = active_deployments[data.model_name]["completion_status"]
+    # this is where i am storing what the max can be digested by vllm workers at one time in the pipeline
     max_req_map = active_deployments[data.model_name]["max_req_in_batch"]
     if data.peer_id not in status_map:
         raise HTTPException(400, f"Peer {data.peer_id} not in deployment")
@@ -1274,14 +1282,29 @@ async def streaming(request: StreamingRequest):
 
 
 # Helper function to generate a large string prompt from messages object passed in OpenAI API
-def collect_messages(messages: List[Dict]):
+def collect_messages(messages: List[Dict], batched: bool = False):
     # Only keeps 'user', 'assistant', 'developer', 'system' messages
     # role_whitelist = ["user", "assistant", "developer", "system"]
 
-    # to_return = ""
-    # for msg in messages:
-    # if msg["role"] in role_whitelist:
-    # to_return += msg["content"] + " "
+    if batched:
+        normalized_batched = []
+        for prompt in messages:
+            normalized = []
+            for p in prompt:
+                role = p.get("role", "").strip().lower()
+                content = p.get("content", "")
+
+                if role == "developer":
+                    role = "system"
+                if role in ("system", "assistant", "user", "tool"):
+                    normalized.append({"role": role, "content": content})
+                else:
+                    print(f"❌ Skipping message with role: {role}")
+
+            normalized_batched.append(normalized)
+
+        return normalized_batched
+
     normalized = []
     for m in messages:
         role = m.get("role", "").strip().lower()
@@ -1565,3 +1588,505 @@ async def client_batch_test(request: Request):
 
     for peer in pipeline:
         await asyncio.create_task(tensor_transport.send(peer, "request", payload))
+
+
+class InferenceRequestBatched(BaseModel):
+    model_name: str
+    path_of_csv: str
+    name_of_column: str
+    system_prompt: str
+    delimiter: str = ","  # CSV delimiter, default comma
+    max_buffer_size: int = 1000
+    min_buffer_size: int = 500
+    starting_id: int = 0
+    dry_run: bool = False
+    max_completion_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    min_tokens: Optional[int] = None
+    seed: Optional[int] = None
+    frequency_penalty: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    n: Optional[int] = 1
+    eos_token_id: Optional[List[int]] = None
+    stop: Optional[List[str]] = None
+    path_to_save_results: Optional[str] = None
+
+
+@app.post("/infer_batched")
+async def infer_batched(request: InferenceRequestBatched):
+    global active_deployments, active_inferences, _process_batch_continuously
+    # Check if model is deployed
+    if request.model_name not in active_deployments:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model {request.model_name} is not deployed",
+        )
+
+    # CLEAR OLD BATCH STATE FOR THIS FILE - ensures fresh start every time
+    await clear_batch_processing_state_for_file(request.path_of_csv)
+
+    # create an entry in the batch_processing_tasks which tracks the state of
+    # the batch in the background
+    task_id = str(uuid.uuid4())
+    batch_processing_tasks[task_id] = {
+        "status": "queued",
+        "request": request,
+        "started_at": time.time(),
+        "progress": {
+            "lines_processed": 0,
+            "batches_sent": 0,
+            "current_buffer_size": 0,
+        },
+    }
+    # 1. Get the deployment map
+    deployment_map = active_deployments[request.model_name]["deployment_map"]
+    if not deployment_map:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No deployment map found for model {request.model_name}",
+        )
+    # 2. Get the pipeline from the active deployments
+    pipeline = list(deployment_map.keys())
+    # this is a coroutine in the asyncio loop by adding it to the queue but it doesnt wait
+    # if _process_batch_continuously is not None:
+    asyncio.create_task(_process_batch_continuously(request, task_id, pipeline))
+
+    return {
+        "status": "queued",
+        "task_id": task_id,
+        "message": "Batch Processing Task Queued - use /batch_task_status/{task_id} to monitor",
+    }
+
+
+@app.get("/batch_task_status/{task_id}")
+async def get_batch_task_status(task_id: str):
+    """Get real-time status and progress of a batch processing task"""
+    if task_id not in batch_processing_tasks:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    task = batch_processing_tasks[task_id]
+    progress = task.get("progress", {})
+
+    response = {
+        "task_id": task_id,
+        "status": task.get("status", "unknown"),
+        "started_at": task.get("started_at"),
+        "progress": {
+            "lines_processed": progress.get("lines_processed", 0),
+            "batches_sent": progress.get("batches_sent", 0),
+            "current_buffer_size": progress.get("current_buffer_size", 0),
+        },
+    }
+
+    # Add error if failed
+    if task.get("error"):
+        response["error"] = task["error"]
+
+    # Add performance metrics if running
+    if task.get("started_at") and task.get("status") in ["processing", "completed"]:
+        elapsed = time.time() - task["started_at"]
+        lines = progress.get("lines_processed", 0)
+        response["performance"] = {
+            "elapsed_seconds": round(elapsed, 1),
+            "lines_per_second": round(lines / elapsed, 2) if elapsed > 0 else 0,
+        }
+
+    return response
+
+
+async def _process_batch_continuously(request, task_id, pipeline):
+    global latest_effective_buffer_size
+    print(f"🚀 Starting continuous batch processing for task {task_id}")
+
+    # Mark as processing
+    batch_processing_tasks[task_id]["status"] = "processing"
+
+    while True:
+        try:
+            print(f"🔄 Monitored the Effective Buffer Size (task: {task_id})")
+            # check the buffer size of the peers
+            latest_effective_buffer_size = await get_current_buffer_size_from_peers()
+            print(
+                f"📊 Buffer: {latest_effective_buffer_size}, Min: {request.min_buffer_size}, Max: {request.max_buffer_size}"
+            )
+
+            # Update buffer size in progress
+            batch_processing_tasks[task_id]["progress"]["current_buffer_size"] = (
+                latest_effective_buffer_size
+            )
+
+            # check if the buffer size is below the threshold
+            if latest_effective_buffer_size < request.min_buffer_size:
+                num_samples_to_send_in_batch = (
+                    request.max_buffer_size - latest_effective_buffer_size
+                )
+                print(
+                    f"📤 Sending {num_samples_to_send_in_batch} samples to fill buffer"
+                )
+
+                # take the system prompt and the number of samples, and create the prompts to be sent
+                (
+                    samples_to_send_for_inference,
+                    batch_state,
+                ) = await process_chunk_from_s3(
+                    request.path_of_csv,
+                    task_id,
+                    num_samples_to_send_in_batch,
+                    request.system_prompt,
+                    request.name_of_column,
+                    request.delimiter,
+                )
+
+                # break the infinite loop if there are no samples to send for inference
+                if not samples_to_send_for_inference:
+                    print("✅ No more samples to send - file processing completed!")
+                    batch_processing_tasks[task_id]["status"] = "completed"
+                    return
+
+                print(
+                    f"✅ Loaded {len(samples_to_send_for_inference)} samples from CSV"
+                )
+                input_text = collect_messages(
+                    samples_to_send_for_inference, batched=True
+                )
+                sampling_params = build_sampling_params(request)
+
+                # just to know what the max batch size is for vLLM
+                max_batch = active_deployments[request.model_name]["max_req_per_batch"]
+
+                # Update progress with latest state from MongoDB
+                batch_processing_tasks[task_id]["progress"].update(
+                    {
+                        "lines_processed": batch_state.get("last_processed_line", 0),
+                        "batches_sent": batch_state.get("batch_count", 0),
+                    }
+                )
+
+                # create the payload to send to the peers
+                payload = {
+                    "task_id": task_id,
+                    "prompt": input_text,
+                    "model": request.model_name,
+                    "sampling_params": sampling_params,
+                    "max_batch_size": max_batch,
+                    "file_id": request.path_of_csv,
+                    "batch_number": batch_state["batch_count"],
+                }
+                payload = json.dumps(payload).encode()
+                payload = np.frombuffer(payload, dtype=np.uint8)
+
+                # send the payload to the peers
+                # only send it to the first peer, the rest of them really dont need the batch information
+                if not request.dry_run:
+                    print(
+                        f"📡 Sending batch {batch_state['batch_count']} to peer {pipeline[0][:8]}..."
+                    )
+                    await tensor_transport.send(pipeline[0], "batch_inject", payload)
+                    # update the batch count after sending it to the peers
+                    batch_state["batch_count"] += 1
+                    print(
+                        f"✅ Batch {batch_state['batch_count'] - 1} sent successfully"
+                    )
+                else:
+                    print(f"🔍 Dry run: Would have sent batch to peer {pipeline[0]}")
+            else:
+                print(
+                    f"⏸️  Buffer is full enough ({latest_effective_buffer_size} >= {request.min_buffer_size}), waiting..."
+                )
+
+            print(f"⏳ Sleeping for {BATCHED_BUFFER_TIMEOUT}s before next check...")
+            await asyncio.sleep(BATCHED_BUFFER_TIMEOUT)
+
+        except Exception as e:
+            print(f"❌ ERROR in _process_batch_continuously: {type(e).__name__}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            batch_processing_tasks[task_id]["status"] = "failed"
+            batch_processing_tasks[task_id]["error"] = str(e)
+            return
+
+
+async def get_current_buffer_size_from_peers():
+    """
+    Background service to find the current_buffer_size for all peers and find the effective current buffer size.
+    This represents the current buffer size of the HEAD peer.
+    """
+    peer_current_buffer_sizes = []
+    effective_current_buffer_size = 0
+
+    # Check each active peer's latest current buffer size
+    for peer_id in active_peer_ids:
+        try:
+            # Get the most recent metrics for this peer
+            metrics_history = await get_peer_metrics(peer_id, time_window=60)
+            if not metrics_history:
+                print(f"⚠️  No metrics found for peer {peer_id[:8]}...")
+                continue
+
+            latest_metrics = metrics_history[0]["metrics"]
+            current_buffer_size = latest_metrics.get("current_buffer_size", -1)
+
+            # Only count positive buffer sizes (first peer in pipeline)
+            if current_buffer_size >= 0:
+                peer_current_buffer_sizes.append(current_buffer_size)
+                print(f"📊 Peer {peer_id[:8]}: buffer = {current_buffer_size}")
+        except Exception as e:
+            print(f"⚠️  Error getting metrics for peer {peer_id[:8]}: {e}")
+            continue
+
+    if peer_current_buffer_sizes:
+        effective_current_buffer_size = max(peer_current_buffer_sizes)
+    else:
+        effective_current_buffer_size = 0
+        print("⚠️  No valid buffer sizes found from any peer, defaulting to 0")
+
+    print(f"🏆 Effective buffer size across all peers: {effective_current_buffer_size}")
+    return effective_current_buffer_size
+
+
+async def process_chunk_from_s3(
+    file_id: str,
+    task_id: str,
+    micro_batch_size: int,
+    system_prompt: str,
+    column_name: str,
+    delimiter: str = ",",
+):
+    """
+    1 - Find the Current State of the File (including column index)
+    2 - Read the File in Chunks based on the next micro_batch_size
+      - For that, resume the file from the given byte_position (given by Database)
+      - For that, seek the file to the given byte_position
+    3 - Extract only the specified column from each row
+    4 - Return the chunk back to the /infer_batched endpoint
+    5 - Update the current state of the file in the MongoDB Database
+    """
+    # 1 - Find the Current State of the File
+    current_state = await get_csv_processing_state_by_file_id(file_id, task_id)
+    if not current_state:
+        current_state = {
+            "next_byte_position": 0,
+            "last_processed_line": 0,
+            "batch_count": 0,
+            "column_index": None,  # Store column index to avoid re-parsing header
+        }
+
+    # 2 - Read the File in Chunks based on the next batch_size
+    # Open the file
+    with open(file_id, "r", encoding="utf-8") as s3_file:
+        column_index = current_state.get("column_index")
+
+        # HACK: Seek to where we left off (skip if first batch)
+        if current_state["next_byte_position"] > 0:
+            print(f"📍 Seeking to byte {current_state['next_byte_position']}")
+            s3_file.seek(current_state["next_byte_position"])
+        else:
+            print("📍 Starting from beginning - parsing header")
+            # Read and parse header to find column index
+            header_line = s3_file.readline()
+            header_columns = [
+                col.strip().strip('"') for col in header_line.strip().split(delimiter)
+            ]
+
+            try:
+                column_index = header_columns.index(column_name)
+                print(f"✅ Found column '{column_name}' at index {column_index}")
+                print(f"📋 Header columns: {header_columns}")
+            except ValueError:
+                raise ValueError(
+                    f"Column '{column_name}' not found in CSV header. Available columns: {header_columns}"
+                )
+
+        # Read the file in chunks based on the next micro_batch_size
+        lines_processed = 0
+        prompts_to_send_for_inference = []
+        current_line = current_state["last_processed_line"]
+
+        while lines_processed < micro_batch_size:
+            # Read the raw line
+            raw_line = s3_file.readline()
+
+            # Check if we hit end of file
+            if not raw_line:
+                print("📄 Reached end of file!")
+                break
+
+            # Parse the CSV line using the specified delimiter
+            # Handle quoted fields by simple strip (works for most cases)
+            row = [col.strip().strip('"') for col in raw_line.strip().split(delimiter)]
+
+            # Extract only the specified column
+            if column_index < len(row):
+                column_value = row[column_index]
+                current_line += 1
+                print(f"🔥 Processing line {current_line}: {column_value[:50]}...")
+
+                # Add prompt to list with system prompt
+                prompts_to_send_for_inference.append(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": column_value},
+                    ]
+                )
+                lines_processed += 1
+            else:
+                print(
+                    f"⚠️ Skipping malformed line {current_line + 1}: not enough columns"
+                )
+                current_line += 1
+
+        # if no lines processed, return the empty list and the current state
+        if lines_processed == 0:
+            return [], current_state
+
+        # Get the current byte position
+        current_byte_position = s3_file.tell()
+
+    # Save the current state of the file
+    new_state = {
+        "next_byte_position": current_byte_position,
+        "last_processed_line": current_line,
+        "batch_count": current_state["batch_count"] + 1,
+        "column_index": column_index,  # Save column index for next batch
+    }
+    await save_csv_processing_state_by_file_id(file_id, task_id, new_state)
+    print(f"🔄 Saved the current state of the file: {new_state}")
+    return prompts_to_send_for_inference, new_state
+
+
+@app.post("/batch_upload_complete")
+async def batch_upload_complete(request: Request):
+    """Endpoint for peers to notify when batch results are uploaded to S3"""
+    data = await request.json()
+    task_id = data.get("task_id")
+    s3_path = data.get("s3_path")
+
+    print(f"📡 Upload notification - Task: {task_id}, S3: {s3_path}")
+
+    if not task_id or not s3_path:
+        raise HTTPException(status_code=400, detail="task_id and s3_path required")
+
+    if task_id in batch_processing_tasks:
+        batch_processing_tasks[task_id]["s3_result_path"] = s3_path
+        print(f"✅ Stored S3 result path for task {task_id}: {s3_path}")
+        return {"status": "success", "message": "S3 path recorded"}
+    else:
+        # This shouldn't happen with the fix
+        print(f"⚠️ Unknown task_id: {task_id}")
+        return {"status": "warning", "message": "Task not found"}
+
+
+@app.get("/get_results/{task_id}")
+async def get_results(task_id: str):
+    """Download final results file from S3"""
+    # Validate task exists
+    if task_id not in batch_processing_tasks:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    task = batch_processing_tasks[task_id]
+    if task.get("status") != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task status: {task.get('status')}. Only completed tasks have results.",
+        )
+
+    # Try to get stored S3 path first (most reliable)
+    s3_full_path = task.get("s3_result_path")
+
+    if s3_full_path:
+        # Parse the S3 path
+        if s3_full_path.startswith("s3://"):
+            path_parts = s3_full_path[5:].split("/", 1)
+            S3_RESULTS_BUCKET = path_parts[0]
+            s3_key = path_parts[1] if len(path_parts) > 1 else ""
+            print(f"✅ Using stored S3 path: {s3_full_path}")
+        else:
+            raise HTTPException(status_code=500, detail="Invalid S3 path format")
+    else:
+        # Fall back to searching (old behavior)
+        print(f"⚠️ No stored S3 path for task {task_id}, falling back to search")
+
+        request_data = task.get("request")
+        if not request_data:
+            raise HTTPException(status_code=404, detail="Request data not found")
+
+        original_file_path = request_data.path_of_csv
+        safe_file_id = (
+            original_file_path.replace("\\", "_").replace("/", "_").replace(":", "")
+        )
+
+        S3_RESULTS_BUCKET = os.environ.get("S3_RESULTS_BUCKET", "tandemn-results")
+        prefix = f"results/{safe_file_id}_final_"
+
+        print(f"🔍 Searching S3 for: s3://{S3_RESULTS_BUCKET}/{prefix}*")
+
+        try:
+            response = s3_client.list_objects_v2(
+                Bucket=S3_RESULTS_BUCKET, Prefix=prefix
+            )
+
+            if "Contents" not in response:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No results found. Searched: s3://{S3_RESULTS_BUCKET}/{prefix}*",
+                )
+
+            csv_files = [
+                obj for obj in response["Contents"] if obj["Key"].endswith(".csv")
+            ]
+            if not csv_files:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Found files but none are CSV. Searched: {prefix}*",
+                )
+
+            latest_file = max(csv_files, key=lambda x: x["LastModified"])
+            s3_key = latest_file["Key"]
+            print(f"✅ Found result file via search: s3://{S3_RESULTS_BUCKET}/{s3_key}")
+
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code == "NoSuchBucket":
+                raise HTTPException(
+                    status_code=404, detail=f"S3 bucket not found: {S3_RESULTS_BUCKET}"
+                )
+            elif error_code == "AccessDenied":
+                raise HTTPException(status_code=403, detail="Access denied to S3")
+            raise HTTPException(status_code=500, detail=f"S3 error: {error_code}")
+
+    # Generate presigned URL for download
+    try:
+        # Get file metadata
+        head_response = s3_client.head_object(Bucket=S3_RESULTS_BUCKET, Key=s3_key)
+
+        # Generate presigned URL
+        signed_url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_RESULTS_BUCKET, "Key": s3_key},
+            ExpiresIn=3600,  # 1 hour
+        )
+
+        return {
+            "download_url": signed_url,
+            "filename": s3_key.split("/")[-1],
+            "file_size": head_response["ContentLength"],
+            "last_modified": head_response["LastModified"].isoformat(),
+        }
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code == "NoSuchKey":
+            raise HTTPException(
+                status_code=404, detail=f"File not found in S3: {s3_key}"
+            )
+        elif error_code == "AccessDenied":
+            raise HTTPException(status_code=403, detail="Access denied to S3")
+        raise HTTPException(status_code=500, detail=f"S3 error: {error_code}")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -11,7 +11,7 @@ chunk_size: 512  # Increase from 256 for better batching efficiency
 
 # === STORAGE BACKEND OPTIMIZATION ===
 local_device: "cpu"  # CPU is good for your distributed setup
-max_local_cache_size: 15  # Increase from 5GB to 20GB for more cache hits
+max_local_cache_size: 30  # Increase from 5GB to 20GB for more cache hits
 
 # === SERIALIZATION OPTIMIZATION ===
 remote_serde: "cachegen"  # Keep cachegen - it's the most efficient

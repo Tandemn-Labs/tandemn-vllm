@@ -75,12 +75,9 @@ COLORS = [Fore.CYAN, Fore.MAGENTA, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
 PEER_COLOR = COLORS[
     int(socket.gethostname().__hash__()) % len(COLORS)
 ]  # deterministic per host
-PEER_COLOR = COLORS[
-    int(socket.gethostname().__hash__()) % len(COLORS)
-]  # deterministic per host
-
 # Batcher for this peer only if first peer
 batcher = None
+mass_batcher = None
 MAX_TIME_PER_BATCH = 1  # Max time we want to wait to fill up batches (in seconds)
 pipeline = None
 
@@ -157,6 +154,10 @@ async def unified_message_gateway():
                 # 6. Receive batch information
                 elif name.lower() == "dispatch":
                     handle_dispatch_message(tensor)
+
+                # 7. Receive batch injection
+                elif name.lower() == "batch_inject":
+                    await handle_batch_inject_message(tensor)
 
                 # 4. UNKNOWN MESSAGE TYPE
                 else:
@@ -246,7 +247,6 @@ def apply_chat_template_on_peer(messages, deployed_model) -> str:
             UserMessage,
         )
         from mistral_common.protocol.instruct.request import ChatCompletionRequest
-
         from vllm.inputs import TokensPrompt
 
         formatted_prompts = []
@@ -377,10 +377,6 @@ async def handle_inference_trigger_message(tensor):
 
             print("�� Starting inference run in background thread...")
 
-            # print(
-            #     f"THREAD - {threading.current_thread().name}, {threading.current_thread().ident}"
-            # )
-            # print(f"LOOP - {id(loop)}, {loop}")
             _ = loop.run_in_executor(
                 None,
                 start_inference_run,
@@ -388,6 +384,12 @@ async def handle_inference_trigger_message(tensor):
                 pipeline,
                 input_text_list,
                 sampling_params,
+                None,  # batcher
+                None,  # file_id
+                None,  # batch_number
+                False,  # is_last_batch
+                None,  # original_prompts
+                None,  # task_id not applicable for inference trigger
             )
 
             print(f"✅ Inference started for request {batch_id}")
@@ -422,31 +424,12 @@ async def handle_inference_data_message(name: str, tensor):
         # )
 
         if message_type == "combined":
-            # if hasattr(tensor, "numpy"):
-            #     # PyTorch tensor - convert to numpy
-            #     arr = tensor.numpy()
-            # else:
-            #     # Already numpy
-            #     arr = tensor
-
             # Unpickle the combined tensor
             combined_tensor = pickle.loads(tensor.numpy().tobytes())
 
             hidden_state = combined_tensor[0]
             residual = combined_tensor[1]
             positions = combined_tensor[2]
-
-            # print(
-            #     f"✅ Stored both hidden_state and residual and positions for {request_id} step {step_idx}"
-            # )
-
-            # # Unstack the combined tensor
-            # if tensor.shape[0] != 2:
-            #     print(f"❌ Invalid combined tensor shape: {tensor.shape}")
-            #     return
-
-            # hidden_state = tensor[0]
-            # residual = tensor[1]
 
             # Store in INFERENCE_CONTEXT
             with CONTEXT_LOCK:
@@ -553,18 +536,49 @@ async def handle_request_message(tensor):
 
 
 def handle_dispatch_message(tensor):
-    global request_metadata, batch_metadata, batcher
+    global request_metadata, batch_metadata, batcher, mass_batcher
 
     try:
         msg = parse_dispatch_message(tensor)
         batch_id = msg["batch_id"]
         request_ids = msg["request_id"]
-        print(f"handle_dispatch_message - batch: {batch_id}, reqs: {request_ids}")
+        # Check if this is a mass batcher request
+        if "prompts" in msg and "sampling_params" in msg:
+            print(
+                f"📦 handle_dispatch_message MASS BATCHER - batch: {batch_id}, reqs: {request_ids} - MASS BATCHER"
+            )
+            # this is a mass batcher request, STORE the prompts locally
+            prompts = msg["prompts"]
+            sampling_params_list = msg["sampling_params"]
+            # add them to request_metadata
+            for i, req_id in enumerate(request_ids):
+                request_metadata[req_id] = {
+                    "prompt": prompts[i],
+                    "sampling_params": sampling_params_list[i],
+                }
+            batch_metadata[batch_id] = {"request_id": request_ids}
+            batch_metadata[batch_id]["file_id"] = msg["file_id"]
+            batch_metadata[batch_id]["batch_number"] = msg["batch_number"]
+            batch_metadata[batch_id]["is_last_batch"] = msg.get("is_last_batch", False)
+        else:
+            print(
+                f"📦 handle_dispatch_message - batch: {batch_id}, reqs: {request_ids} - NORMAL BATCHER"
+            )
+            # Regular flow - data should already be in request_metadata
+            batch_metadata[batch_id] = {"request_id": request_ids}
+            prompts = [request_metadata[req]["prompt"] for req in request_ids]
+            # this is a normal batcher request
 
-        batch_metadata[batch_id] = {"request_id": request_ids}
-        # Apply chat template to convert messages to prompt strings
-        prompts = [request_metadata[req]["prompt"] for req in request_ids]
+        # # Apply chat template to convert messages to prompt strings
+        # prompts = [request_metadata[req]["prompt"] for req in request_ids]
         formatted_prompts = apply_chat_template_on_peer(prompts, deployed_model)
+
+        # Extract task_id from dispatch message if this is mass batcher
+        task_id_from_dispatch = msg.get("task_id") if msg.get("file_id") else None
+        if task_id_from_dispatch:
+            print(
+                f"📋 Non-first peer received batch with ORIGINAL task_id: {task_id_from_dispatch}"
+            )
 
         loop = asyncio.get_running_loop()
         _ = loop.run_in_executor(
@@ -578,6 +592,11 @@ def handle_dispatch_message(tensor):
                 for req in request_ids
             ],
             batcher,
+            msg["file_id"] if msg.get("file_id") else None,
+            msg["batch_number"] if msg.get("batch_number") else None,
+            msg.get("is_last_batch", False),
+            prompts if msg.get("file_id") else None,  # original prompts for saving
+            task_id_from_dispatch,  # Get task_id from dispatch payload
         )
 
     except Exception:
@@ -603,15 +622,50 @@ async def handle_unknown_message(name: str, tensor):
 # Create batch in a separate thread
 # Inform downstream peers of new batch
 async def dispatch_batch(
-    batch_id: str, model_name: str, queue: List[req_batcher.Request]
+    batch_id: str,
+    model_name: str,
+    queue: List[req_batcher.Request],
+    file_id: str = None,
+    batch_number: int = None,
 ):
-    global start_inference_run, pipeline, batch_metadata, tensor_transport, batcher
+    global \
+        start_inference_run, \
+        pipeline, \
+        batch_metadata, \
+        tensor_transport, \
+        mass_batcher, \
+        batcher
 
     try:
         request_ids = [req.id for req in queue]
         batch_metadata[batch_id] = {"request_id": request_ids}
 
         payload = {"batch_id": batch_id, "request_id": request_ids}
+
+        # For mass batcher, extract ORIGINAL task_id (remove any suffix)
+        task_id_for_payload = None
+        if file_id is not None and batch_number is not None:
+            # Extract original task_id by removing the _index suffix
+            first_req_id = request_ids[0] if request_ids else None
+            if first_req_id and "_" in first_req_id:
+                # Remove the _0, _1, etc suffix to get original task_id
+                task_id_for_payload = first_req_id.rsplit("_", 1)[0]
+            else:
+                task_id_for_payload = first_req_id
+
+            batch_metadata[batch_id]["file_id"] = file_id
+            batch_metadata[batch_id]["batch_number"] = batch_number
+            batch_metadata[batch_id]["task_id"] = task_id_for_payload
+            payload["prompts"] = [req.prompt for req in queue]
+            payload["sampling_params"] = [req.sampling_params for req in queue]
+            payload["file_id"] = file_id
+            payload["batch_number"] = batch_number
+            payload["task_id"] = task_id_for_payload  # Pass ORIGINAL to other peers!
+            # Check if this is the last batch
+            payload["is_last_batch"] = (
+                mass_batcher.is_last_batch() if mass_batcher else False
+            )
+
         payload = json.dumps(payload).encode()
         payload = np.frombuffer(payload, dtype=np.uint8)
 
@@ -636,15 +690,47 @@ async def dispatch_batch(
         formatted_prompts = apply_chat_template_on_peer(prompts, deployed_model)
 
         loop = asyncio.get_running_loop()
-        _ = loop.run_in_executor(
-            None,
-            start_inference_run,
-            batch_id,
-            pipeline,
-            formatted_prompts,
-            [SamplingParams(**req.sampling_params) for req in queue],
-            batcher,
-        )
+        if (
+            file_id is None and batch_number is None
+        ):  # this is when we are using the normal batcher (online inference)
+            print(f"🔍 Using normal batcher (online inference) for batch {batch_id}")
+            _ = loop.run_in_executor(
+                None,
+                start_inference_run,
+                batch_id,
+                pipeline,
+                formatted_prompts,
+                [SamplingParams(**req.sampling_params) for req in queue],
+                batcher,
+                None,
+                None,
+                False,
+                None,
+                None,  # task_id not applicable for online inference
+            )
+        else:
+            # this is when we are using the mass batcher (offline inference)
+            print(f"🔍 Using mass batcher (offline inference) for batch {batch_id}")
+            is_last = mass_batcher.is_last_batch() if mass_batcher else False
+            # Use the ORIGINAL task_id extracted above
+            task_id_to_pass = task_id_for_payload
+            print(
+                f"📋 First peer dispatching batch with ORIGINAL task_id: {task_id_to_pass}"
+            )
+            _ = loop.run_in_executor(
+                None,
+                start_inference_run,
+                batch_id,
+                pipeline,
+                formatted_prompts,
+                [SamplingParams(**req.sampling_params) for req in queue],
+                mass_batcher,
+                file_id,
+                batch_number,
+                is_last,
+                prompts,  # original prompts for saving
+                task_id_to_pass,  # pass task_id for S3 result tracking
+            )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         print(results)
@@ -762,6 +848,12 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
             next_peer_ticket=instructions.get("next_peer_ticket"),
             pipeline=instructions.get("pipeline"),
             tokenizer=tokenizer,
+            file_id=instructions.get("file_id")
+            if instructions.get("file_id")
+            else None,  # add file_id if it exists
+            batch_number=instructions.get("batch_number")
+            if instructions.get("batch_number")
+            else None,  # add batch_number if it exists
         )
 
         # print(type(deployed_model))
@@ -810,6 +902,70 @@ async def deploy_model_from_instructions(instructions: Dict[str, Any]) -> bool:
 # report_deployment_completion moved to deployment_utils.py
 
 
+async def handle_batch_inject_message(tensor):
+    """Instead of a single request, we are handling a full batch of requests"""
+    global mass_batcher, pipeline, current_peer_ticket, batch_metadata
+
+    try:
+        msg = parse_json_from_tensor(tensor)
+
+        # 1. Extract the batch information
+        task_id = msg["task_id"]
+        all_prompts = msg["prompt"]
+        model = msg["model"]
+        sampling_params = msg["sampling_params"]
+        max_batch_size = msg["max_batch_size"]
+        file_id = msg["file_id"]
+        batch_number = msg["batch_number"]
+
+        # 2. Store them in a metadata
+        batch_metadata[task_id] = {
+            "task_id": task_id,  # task id
+            "all_prompts": all_prompts,  # all the prompts in one batch
+            "model": model,  # name of the model
+            "sampling_params": sampling_params,
+        }
+
+        # 3. The batching should only happen on the first peer
+        if pipeline and current_peer_ticket == pipeline[0]:
+            # add the requests to the req_batcher aka buffer
+            # this now contains a HUGE LIST OF PROMPTS, one for each line in the file
+            # Initialize batcher
+            if mass_batcher is None:
+                print("handle_request_message() index == 0, batcher is None")
+                print(
+                    f"THREAD - {threading.current_thread().name}, {threading.current_thread().ident}"
+                )
+                loop = asyncio.get_running_loop()
+                print(f"asyncio loop - {id(loop)}, {loop}")
+                mass_batcher = req_batcher.MassBatcher(
+                    model_name=model,
+                    max_req=max_batch_size,  # basically what needs to be taken by vllm worker at one tine
+                    process_req_fn=dispatch_batch,
+                    file_id=file_id,
+                    batch_number=batch_number,
+                )
+            # Add request to batcher, now with the mass batcher
+            # this is where the batching happens, so it will take a batch of max_batch_size prompts and send it to the dispatch_batch function
+            await asyncio.create_task(
+                mass_batcher.add(
+                    req_batcher.MassRequest(
+                        id=task_id,
+                        prompt=all_prompts,  # careful this now contains the list of all prompts
+                        model_name=model,
+                        sampling_params=sampling_params,
+                    )
+                )
+            )
+
+        else:
+            print(f"🔍 Batching on non-first peer {current_peer_ticket}")
+            print(f"🔍 Batch metadata: {batch_metadata[task_id]}")
+
+    except Exception:
+        raise
+
+
 def get_model_status() -> Dict[str, Any]:
     """Get current model deployment status."""
     global deployed_model, deployment_status
@@ -829,9 +985,9 @@ def get_model_status() -> Dict[str, Any]:
 
 async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0):
     """Send heartbeat to central server over HTTP and exit if server stops responding."""
-    global central_server_ticket
+    global central_server_ticket, mass_batcher, batcher
     consecutive_failures = 0
-    max_failures = 30  # 10 seconds tolerance
+    max_failures = 30  # 30 seconds tolerance
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/heartbeat"
     server_added = False
 
@@ -841,7 +997,22 @@ async def http_heartbeat_loop(current_peer_ticket: str, interval_s: float = 1.0)
                 # Offload potentially blocking metrics collection
                 metrics = await asyncio.to_thread(get_system_metrics)
                 metrics_dict = format_metrics_for_db(metrics)
-                _ = metrics_dict["total_free_vram_gb"]
+                # _ = metrics_dict["total_free_vram_gb"]
+                if mass_batcher is not None:
+                    print("Mass Batcher is not None")
+                    buffer_size = mass_batcher.get_queue_size()
+                    metrics_dict["current_buffer_size"] = buffer_size
+                    print("Batch size: ", buffer_size)
+                # elif batcher is not None:
+                #     print("Batcher is not None")
+                #     buffer_size = batcher.get_queue_size()
+                #     metrics_dict["current_buffer_size"] = buffer_size
+                #     print("Batch size: ", buffer_size)
+                else:
+                    print(
+                        "added dummy batch size as non first peer and mass batcher is None"
+                    )
+                    metrics_dict["current_buffer_size"] = -1
 
                 payload = {
                     "peer_id": current_peer_ticket,
