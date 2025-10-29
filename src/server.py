@@ -377,6 +377,13 @@ async def get_peer_metrics_endpoint(peer_id: str, time_window: int = 300):
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
+@app.get("/deployments")
+async def list_deployments():
+    """Get list of all currently deployed models"""
+    return {
+        "deployed_models": list(active_deployments.keys()),
+        "deployment_details": active_deployments
+    }
 
 @app.post("/estimate_model")
 async def estimate_model(request: ModelEstimationRequest):
