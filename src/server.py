@@ -381,8 +381,10 @@ async def get_peer_metrics_endpoint(peer_id: str, time_window: int = 300):
 async def list_deployments():
     """Get list of all currently deployed models"""
     return {
-        "deployed_models": list(active_deployments.keys()),
-        "deployment_details": active_deployments
+        "deployments": [
+            {"model_name": name, "status": details.get("status", "unknown")}
+            for name, details in active_deployments.items()
+        ]
     }
 
 @app.post("/estimate_model")
