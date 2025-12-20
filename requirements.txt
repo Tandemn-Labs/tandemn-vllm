@@ -19,6 +19,7 @@ transformers<4.54.0
 torch
 accelerate
 aiofiles
+colorama
 vllm==0.9.2
 tensor-iroh
 huggingface_hub[hf_transfer]
